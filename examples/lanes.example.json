@@ -1,0 +1,18 @@
+{
+  "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/ACCOUNT/spotbatch-work",
+  "instance_types": ["c6i.large", "c6a.large", "m6i.large", "m6a.large"],
+  "lanes": [
+    {
+      "name": "us-west-2-x86-primary",
+      "region": "us-west-2",
+      "batch_job_queue": "arn:aws:batch:us-west-2:ACCOUNT:job-queue/spotbatch-cpu-spot-queue",
+      "job_definition": "arn:aws:batch:us-west-2:ACCOUNT:job-definition/spotbatch-worker:1",
+      "job_name_prefix": "my-run-worker",
+      "max_workers": 128,
+      "messages_per_worker": 4,
+      "vcpus": 2,
+      "memory": 4096,
+      "min_placement_score": 7
+    }
+  ]
+}
