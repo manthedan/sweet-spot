@@ -2,6 +2,8 @@
 
 Durable AWS Batch + SQS + S3 job runner for cheap Spot compute.
 
+Canonical display/package name: `aws-batch-job-runner`. The installed CLI remains `spotbatch`; older local clones may still use the directory name `aws-spot-batch-runner`.
+
 This project packages a reliability pattern for large retryable AWS Batch jobs:
 
 ```text
@@ -53,6 +55,7 @@ Each SQS message is a JSON object:
   "run_id": "hello-001",
   "task_id": "task-000001",
   "command": ["python", "/app/hello_worker.py"],
+  "timeout_seconds": 3600,
   "output_s3": "s3://my-bucket/runs/hello-001/shards/task-000001.txt",
   "summary_s3": "s3://my-bucket/runs/hello-001/summaries/task-000001.summary.json",
   "done_s3": "s3://my-bucket/runs/hello-001/done/task-000001.done.json"
@@ -69,9 +72,10 @@ SPOTBATCH_OUTPUT_PATH     local path to write if output_s3 should be uploaded by
 SPOTBATCH_OUTPUT_S3
 SPOTBATCH_SUMMARY_S3
 SPOTBATCH_DONE_S3
+SPOTBATCH_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 86400)
 ```
 
-If `output_s3` is present and `SPOTBATCH_OUTPUT_PATH` exists after the command exits successfully, the framework uploads it. The done marker is uploaded last.
+If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. The done marker is uploaded last.
 
 ## CLI quickstart
 

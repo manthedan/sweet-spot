@@ -96,6 +96,7 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
         {"name": "SPOTBATCH_MAX_MESSAGES", "value": str(args.messages_per_worker)},
         {"name": "SPOTBATCH_VISIBILITY_TIMEOUT", "value": str(args.visibility_timeout)},
         {"name": "SPOTBATCH_HEARTBEAT_SECONDS", "value": str(args.heartbeat_seconds)},
+        {"name": "SPOTBATCH_TASK_TIMEOUT_SECONDS", "value": str(args.task_timeout_seconds)},
     ]
     base_env.extend(args.env or [])
     overrides: dict[str, Any] = {"environment": base_env}
@@ -251,9 +252,10 @@ def main() -> int:
     p.add_argument("--max-messages", type=int, default=int(os.environ.get("SPOTBATCH_MAX_MESSAGES", "1")))
     p.add_argument("--visibility-timeout", type=int, default=int(os.environ.get("SPOTBATCH_VISIBILITY_TIMEOUT", "1800")))
     p.add_argument("--heartbeat-seconds", type=int, default=int(os.environ.get("SPOTBATCH_HEARTBEAT_SECONDS", "300")))
+    p.add_argument("--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", "86400")), help="Default per-task command timeout when a task omits timeout_seconds")
     p.add_argument("--wait-time", type=int, default=10)
     p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SPOTBATCH_WORK_DIR", "/tmp/spotbatch-work")))
-    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir))
+    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds))
 
     p = sub.add_parser("enqueue-jsonl")
     p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
@@ -277,6 +279,7 @@ def main() -> int:
     p.add_argument("--memory", type=int)
     p.add_argument("--visibility-timeout", type=int, default=1800)
     p.add_argument("--heartbeat-seconds", type=int, default=300)
+    p.add_argument("--task-timeout-seconds", type=float, default=86400, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
     p.add_argument("--submit", action="store_true")
