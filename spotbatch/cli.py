@@ -13,7 +13,7 @@ from typing import Any, Iterable
 import boto3
 
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
-from .s3util import s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
+from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
 from .worker import default_done_s3, run_worker
 
 
@@ -690,6 +690,67 @@ def cmd_watch_job(args: argparse.Namespace) -> int:
         time.sleep(args.interval_seconds)
 
 
+def _validate_s3_delete_prefix(prefix: str, *, min_prefix_chars: int) -> tuple[str, str]:
+    bucket, key = parse_s3_uri(prefix)
+    key = key.strip("/")
+    if not key or len(key) < min_prefix_chars:
+        raise SystemExit(f"refusing dangerous S3 prefix {prefix!r}; require at least {min_prefix_chars} key characters")
+    if "*" in key or ".." in key.split("/"):
+        raise SystemExit(f"refusing suspicious S3 prefix {prefix!r}")
+    return bucket, key.rstrip("/") + "/"
+
+
+def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
+    bucket, prefix_key = _validate_s3_delete_prefix(args.prefix, min_prefix_chars=args.min_prefix_chars)
+    if args.delete and args.confirm_prefix != args.prefix:
+        raise SystemExit("--delete requires --confirm-prefix exactly matching --prefix")
+    if args.batch_size <= 0 or args.batch_size > 1000:
+        raise SystemExit("--batch-size must be in 1..1000")
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    s3 = session.client("s3", region_name=args.region)
+    artifact_dir = args.artifact_dir or Path("artifacts") / "s3-delete-prefix" / utc_stamp()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    status_path = artifact_dir / "s3_delete_prefix_status.json"
+    listed = deleted = 0
+    batches = 0
+    examples: list[str] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    batch: list[dict[str, str]] = []
+
+    def flush() -> None:
+        nonlocal batch, deleted, batches
+        if not batch:
+            return
+        batches += 1
+        if args.delete:
+            resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
+            errors = resp.get("Errors") or []
+            if errors:
+                raise RuntimeError(f"S3 DeleteObjects reported {len(errors)} errors; first={errors[0]!r}")
+            deleted += len(batch)
+        batch = []
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix_key):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            listed += 1
+            if len(examples) < 20:
+                examples.append(key)
+            batch.append({"Key": key})
+            if len(batch) >= args.batch_size:
+                flush()
+        status_path.write_text(json.dumps({"schema": "spotbatch.s3_delete_prefix_status.v1", "updated_at": iso_now(), "prefix": args.prefix, "delete": bool(args.delete), "listed": listed, "deleted": deleted, "batches": batches, "examples": examples}, indent=2, sort_keys=True) + "\n")
+    flush()
+    marker_s3 = None
+    if args.delete and args.completion_marker_s3:
+        marker_s3 = args.completion_marker_s3
+        s3_upload_text(s3, json.dumps({"schema": "spotbatch.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "deleted": deleted}, indent=2, sort_keys=True) + "\n", marker_s3)
+    summary = {"schema": "spotbatch.s3_delete_prefix_summary.v1", "finished_at": iso_now(), "prefix": args.prefix, "bucket": bucket, "key_prefix": prefix_key, "delete": bool(args.delete), "listed": listed, "deleted": deleted, "batches": batches, "completion_marker_s3": marker_s3, "status_json": str(status_path), "examples": examples}
+    status_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
 def _parse_body(msg: dict[str, Any]) -> dict[str, Any]:
     try:
         body = json.loads(msg.get("Body", "{}"))
@@ -865,6 +926,18 @@ def main() -> int:
     p.add_argument("--interval-seconds", type=float, default=30.0)
     p.add_argument("--max-seconds", type=float, default=0.0)
     p.set_defaults(func=cmd_watch_job)
+
+    p = sub.add_parser("s3-delete-prefix")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--prefix", required=True, help="s3://bucket/prefix/ to inspect or delete")
+    p.add_argument("--delete", action="store_true", help="actually delete objects; default is dry-run")
+    p.add_argument("--confirm-prefix", default="", help="must exactly match --prefix when --delete is set")
+    p.add_argument("--min-prefix-chars", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=1000)
+    p.add_argument("--artifact-dir", type=Path)
+    p.add_argument("--completion-marker-s3")
+    p.set_defaults(func=cmd_s3_delete_prefix)
 
     p = sub.add_parser("dlq")
     p.add_argument("--dlq-url", required=True)

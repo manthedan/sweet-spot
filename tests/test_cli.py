@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
 
 
 class CanaryTests(unittest.TestCase):
@@ -184,6 +184,57 @@ class BatchOperatorTests(unittest.TestCase):
             ],
         }
         self.assertEqual(_job_log_stream(job), "attempt-2")
+
+
+class S3DeletePrefixTests(unittest.TestCase):
+    def test_delete_prefix_rejects_bucket_root(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "dangerous"):
+            _validate_s3_delete_prefix("s3://bucket/", min_prefix_chars=8)
+
+    def test_delete_prefix_normalizes_safe_prefix(self) -> None:
+        self.assertEqual(_validate_s3_delete_prefix("s3://bucket/runs/old-run", min_prefix_chars=8), ("bucket", "runs/old-run/"))
+
+    def test_delete_prefix_fails_on_delete_object_errors_before_marker(self) -> None:
+        class Paginator:
+            def paginate(self, **kwargs):
+                yield {"Contents": [{"Key": "runs/old-run/a"}]}
+
+        class S3:
+            marker_written = False
+
+            def get_paginator(self, name):
+                return Paginator()
+
+            def delete_objects(self, **kwargs):
+                return {"Errors": [{"Key": "runs/old-run/a", "Code": "AccessDenied"}]}
+
+            def put_object(self, **kwargs):
+                self.marker_written = True
+                return {}
+
+        class Session:
+            def __init__(self, s3):
+                self.s3 = s3
+
+            def client(self, service, region_name=None):
+                return self.s3
+
+        s3 = S3()
+        with tempfile.TemporaryDirectory() as tmp:
+            args = types.SimpleNamespace(
+                prefix="s3://bucket/runs/old-run/",
+                min_prefix_chars=8,
+                delete=True,
+                confirm_prefix="s3://bucket/runs/old-run/",
+                batch_size=1000,
+                profile=None,
+                region=None,
+                artifact_dir=Path(tmp),
+                completion_marker_s3="s3://bucket/markers/done.json",
+            )
+            with patch("spotbatch.cli.boto3.Session", return_value=Session(s3)), self.assertRaisesRegex(RuntimeError, "DeleteObjects"):
+                cmd_s3_delete_prefix(args)
+        self.assertFalse(s3.marker_written)
 
 
 class SupervisorPlanningTests(unittest.TestCase):
