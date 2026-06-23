@@ -14,7 +14,7 @@ import boto3
 
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
-from .worker import default_done_s3, run_worker
+from .worker import SAFE_TASK_TIMEOUT_SECONDS, default_done_s3, run_worker, validate_worker_timing
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -280,6 +280,10 @@ def _submit_worker_jobs(
 def cmd_submit_workers(args: argparse.Namespace) -> int:
     if not args.sqs_queue_url:
         raise SystemExit("missing --sqs-queue-url or SPOTBATCH_SQS_QUEUE_URL")
+    try:
+        validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     sqs = boto3.client("sqs")
     batch = boto3.client("batch")
     depth = queue_depth(sqs, args.sqs_queue_url)
@@ -352,6 +356,10 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
         raise SystemExit("missing --sqs-queue-url or SPOTBATCH_SQS_QUEUE_URL")
     if args.stop_on_dlq and not args.dlq_url:
         raise SystemExit("--stop-on-dlq requires --dlq-url")
+    try:
+        validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     sqs = session.client("sqs", region_name=args.region)
     batch = session.client("batch", region_name=args.region)
@@ -614,6 +622,34 @@ def _job_log_stream(job: dict[str, Any]) -> str | None:
     return str(stream) if stream else None
 
 
+def _container_log_group(container: dict[str, Any] | None) -> str | None:
+    options = (((container or {}).get("logConfiguration") or {}).get("options") or {})
+    group = options.get("awslogs-group")
+    return str(group) if group else None
+
+
+def _job_log_group(job: dict[str, Any]) -> str | None:
+    attempts = job.get("attempts") or []
+    for attempt in reversed(attempts):
+        group = _container_log_group(attempt.get("container"))
+        if group:
+            return group
+        for task_prop in reversed(attempt.get("taskProperties") or []):
+            for container in reversed(task_prop.get("containers") or []):
+                group = _container_log_group(container)
+                if group:
+                    return group
+    group = _container_log_group(job.get("container"))
+    if group:
+        return group
+    for task_prop in (((job.get("ecsProperties") or {}).get("taskProperties")) or []):
+        for container in task_prop.get("containers") or []:
+            group = _container_log_group(container)
+            if group:
+                return group
+    return None
+
+
 def _describe_one_job(batch, job_id: str) -> dict[str, Any]:
     jobs = batch.describe_jobs(jobs=[job_id]).get("jobs", [])
     if not jobs:
@@ -668,23 +704,26 @@ def cmd_describe_job(args: argparse.Namespace) -> int:
     return 0
 
 
-def _log_stream_from_args(session, args: argparse.Namespace) -> str:
+def _log_target_from_args(session, args: argparse.Namespace) -> tuple[str, str]:
     if args.log_stream:
-        return args.log_stream
+        log_group = args.log_group or "/aws/batch/job"
+        return args.log_stream, log_group
     if not args.job_id:
         raise SystemExit("logs requires --log-stream or --job-id")
     batch = session.client("batch", region_name=args.region)
-    stream = _job_log_stream(_describe_one_job(batch, args.job_id))
+    job = _describe_one_job(batch, args.job_id)
+    stream = _job_log_stream(job)
     if not stream:
         raise SystemExit(f"job has no log stream yet: {args.job_id}")
-    return stream
+    log_group = args.log_group or _job_log_group(job) or "/aws/batch/job"
+    return stream, log_group
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     logs = session.client("logs", region_name=args.region)
-    stream = _log_stream_from_args(session, args)
-    kwargs: dict[str, Any] = {"logGroupName": args.log_group, "logStreamName": stream, "limit": args.limit, "startFromHead": args.start_from_head or bool(args.next_token)}
+    stream, log_group = _log_target_from_args(session, args)
+    kwargs: dict[str, Any] = {"logGroupName": log_group, "logStreamName": stream, "limit": args.limit, "startFromHead": args.start_from_head or bool(args.next_token)}
     if args.next_token:
         kwargs["nextToken"] = args.next_token
     resp = logs.get_log_events(**kwargs)
@@ -694,7 +733,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
         if args.filter_regex and not re.search(args.filter_regex, msg):
             continue
         events.append({"timestamp": ev.get("timestamp"), "message": msg})
-    print(json.dumps({"schema": "spotbatch.logs.v1", "checked_at": iso_now(), "log_group": args.log_group, "log_stream": stream, "count": len(events), "nextForwardToken": resp.get("nextForwardToken"), "events": events[-args.tail :] if args.tail else events}, indent=2, sort_keys=True))
+    print(json.dumps({"schema": "spotbatch.logs.v1", "checked_at": iso_now(), "log_group": log_group, "log_stream": stream, "count": len(events), "nextForwardToken": resp.get("nextForwardToken"), "events": events[-args.tail :] if args.tail else events}, indent=2, sort_keys=True))
     return 0
 
 
@@ -826,7 +865,7 @@ def main() -> int:
     p.add_argument("--max-messages", type=int, default=int(os.environ.get("SPOTBATCH_MAX_MESSAGES", "1")))
     p.add_argument("--visibility-timeout", type=int, default=int(os.environ.get("SPOTBATCH_VISIBILITY_TIMEOUT", "1800")))
     p.add_argument("--heartbeat-seconds", type=int, default=int(os.environ.get("SPOTBATCH_HEARTBEAT_SECONDS", "300")))
-    p.add_argument("--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", "86400")), help="Default per-task command timeout when a task omits timeout_seconds")
+    p.add_argument("--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", str(SAFE_TASK_TIMEOUT_SECONDS))), help="Default per-task command timeout when a task omits timeout_seconds")
     p.add_argument("--wait-time", type=int, default=10)
     p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SPOTBATCH_WORK_DIR", "/tmp/spotbatch-work")))
     p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds))
@@ -863,7 +902,7 @@ def main() -> int:
     p.add_argument("--memory", type=int)
     p.add_argument("--visibility-timeout", type=int, default=1800)
     p.add_argument("--heartbeat-seconds", type=int, default=300)
-    p.add_argument("--task-timeout-seconds", type=float, default=86400, help="Default per-task command timeout to pass to workers")
+    p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
     p.add_argument("--submit", action="store_true")
@@ -894,7 +933,7 @@ def main() -> int:
     p.add_argument("--memory", type=int)
     p.add_argument("--visibility-timeout", type=int, default=1800)
     p.add_argument("--heartbeat-seconds", type=int, default=300)
-    p.add_argument("--task-timeout-seconds", type=float, default=86400, help="Default per-task command timeout to pass to workers")
+    p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
     p.add_argument("--submit", action="store_true")
@@ -935,7 +974,7 @@ def main() -> int:
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--job-id")
-    p.add_argument("--log-group", default="/aws/batch/job")
+    p.add_argument("--log-group", help="CloudWatch log group; with --job-id, defaults to the job definition log group when discoverable")
     p.add_argument("--log-stream")
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--tail", type=int, default=0)

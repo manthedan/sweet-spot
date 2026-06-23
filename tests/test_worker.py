@@ -25,7 +25,7 @@ if "botocore.exceptions" not in sys.modules:
     exceptions.ClientError = ClientError
     sys.modules["botocore.exceptions"] = exceptions
 
-from spotbatch.worker import run_task
+from spotbatch.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, run_task, validate_worker_timing
 
 
 class RunTaskTests(unittest.TestCase):
@@ -167,6 +167,61 @@ class RunTaskTests(unittest.TestCase):
              mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "positive finite"):
                 run_task(task, s3=object(), work_root=Path(tmp))
+
+    def test_rejects_timeouts_above_sqs_safe_cap(self) -> None:
+        task = {
+            "run_id": "run-1",
+            "task_id": "too-long",
+            "timeout_seconds": SAFE_TASK_TIMEOUT_SECONDS + 1,
+            "command": [sys.executable, "-c", "pass"],
+            "done_s3": "s3://bucket/run/done/too-long.done.json",
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+            with self.assertRaisesRegex(ValueError, "SQS 12h visibility"):
+                run_task(task, s3=object(), work_root=Path(tmp))
+
+    def test_rejects_reserved_task_env_overrides(self) -> None:
+        task = {
+            "run_id": "run-1",
+            "task_id": "bad-env",
+            "command": [sys.executable, "-c", "pass"],
+            "env": {"SPOTBATCH_DONE_S3": "s3://evil/done"},
+            "done_s3": "s3://bucket/run/done/bad-env.done.json",
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+            with self.assertRaisesRegex(ValueError, "reserved prefix"):
+                run_task(task, s3=object(), work_root=Path(tmp))
+
+    def test_worker_timing_validation_rejects_bad_heartbeat_relationships(self) -> None:
+        with self.assertRaisesRegex(ValueError, "less than visibility_timeout"):
+            validate_worker_timing(visibility_timeout=300, heartbeat_seconds=300, task_timeout_seconds=60)
+        with self.assertRaisesRegex(ValueError, "visibility_timeout"):
+            validate_worker_timing(visibility_timeout=43201, heartbeat_seconds=300, task_timeout_seconds=60)
+
+    def test_heartbeat_failure_emits_structured_stderr(self) -> None:
+        class SQS:
+            def change_message_visibility(self, **kwargs):
+                raise RuntimeError("lease lost")
+
+        class Stop:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, seconds: int) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _heartbeat(SQS(), "queue-url", "receipt", 30, 1, Stop())
+        event = json.loads(err.getvalue())
+        self.assertEqual(event["schema"], "spotbatch.heartbeat_error.v1")
+        self.assertEqual(event["error"], "lease lost")
 
     def test_successful_task_cleans_up_background_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

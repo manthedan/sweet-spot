@@ -1,0 +1,98 @@
+# Miser / SpotBatch production-hardening roadmap
+
+This roadmap tracks the static-review findings that separate the current runner from a production-quality, portfolio-ready distributed work system.
+
+Current positioning:
+
+> Miser is a durable, at-least-once AWS Batch Spot runner for trusted, idempotent, embarrassingly parallel workloads.
+
+Do **not** claim arbitrary-job safety, exactly-once side effects, or globally optimal cost until the relevant milestones below are complete and measured.
+
+## Milestone 1 — correctness and trust-boundary hotfixes
+
+Goal: remove the sharpest correctness hazards without redesigning the commit protocol.
+
+- [x] Cap task execution below SQS's 12-hour visibility ceiling, preferably at 11 hours or less.
+- [x] Validate `0 < heartbeat_seconds < visibility_timeout <= 43200`.
+- [x] Reject default or per-task timeouts above the safe cap.
+- [x] Emit structured heartbeat/lease-renewal failure events instead of swallowing errors silently.
+- [x] Document that the queue is a trusted control plane and tasks must be idempotent.
+- [x] Reject task environment keys that can override framework/AWS/ECS state (`SPOTBATCH_*`, `AWS_*`, `ECS_*`).
+- [x] Fix the README/log tooling mismatch around the OpenTofu log group.
+- [x] Add focused tests for timeout caps, heartbeat validation, reserved env rejection, and log-group behavior.
+
+## Milestone 2 — atomic attempt/commit protocol
+
+Goal: tolerate duplicate delivery and concurrent execution without canonical output/marker overwrite.
+
+- [ ] Define a canonical task hash over stable task fields.
+- [ ] Assign every execution an immutable attempt ID.
+- [ ] Support attempt-scoped output, summary, and log paths.
+- [ ] Record output size and SHA-256 in the completion marker.
+- [ ] Publish the canonical done marker with S3 conditional write (`If-None-Match: *`).
+- [ ] Treat a 412/precondition failure as "another attempt won"; read and validate the winning marker before deleting SQS.
+- [ ] Validate existing marker schema, run ID, task ID, task hash, output URI, size, and checksum before skipping.
+- [ ] Add tests for simultaneous duplicate delivery, stale/corrupt markers, and interruption between every commit step.
+
+## Milestone 3 — IAM and input model hardening
+
+Goal: make the trust boundary explicit and least-privileged.
+
+- [ ] Add a versioned task model/schema for enqueue and worker validation.
+- [ ] Detect duplicate task IDs before enqueue/finalize.
+- [ ] Enforce allowed S3 input/output prefixes.
+- [ ] Narrow worker IAM to required queue and configured bucket/prefix resources.
+- [ ] Remove unused worker permissions, including unnecessary `sqs:SendMessage` and invalid `s3:HeadObject` action.
+- [ ] Consider named workload profiles (`job_type`) for common trusted commands instead of unrestricted command arrays.
+- [ ] Use separate queues/task roles for workloads with different data access.
+
+## Milestone 4 — live observability and diagnostics
+
+Goal: preserve diagnostics during Spot interruption and make operators faster.
+
+- [ ] Stream child stdout/stderr to container logs for CloudWatch visibility.
+- [ ] Keep bounded ring buffers for summary tails instead of reading whole log files.
+- [ ] Cap per-task log bytes and support redaction patterns.
+- [ ] Emit structured JSON events for lease renewal, retry, timeout, upload, commit, and skip decisions.
+- [ ] Add `spotbatch doctor` to validate queue/DLQ/S3 permissions, job definition, log group, timeouts, architecture, and quotas.
+- [ ] Add CloudWatch dashboard and alarms for queue age, DLQ depth, Batch failures, and stalled runnable jobs.
+
+## Milestone 5 — scale/cost correctness
+
+Goal: make finalization and cleanup scale and make cost claims defensible.
+
+- [ ] Stream finalizer JSONL instead of loading all tasks/records in memory.
+- [ ] Reject duplicate task IDs during finalization and repair generation.
+- [ ] Validate marker contents and output checksums during finalization.
+- [ ] Reduce HEAD-per-task cost with partitioned manifests, listings, or a durable state index.
+- [ ] Add explicit versioned-bucket cleanup mode (`--include-versions`) plus lifecycle-policy guidance.
+- [ ] Replace manual DLQ send-then-delete redrive with native SQS redrive APIs where possible.
+
+## Milestone 6 — reproducible production deployment
+
+Goal: make the infrastructure demonstrably reproducible and safer by default.
+
+- [ ] Add CI for tests, linting, typing, `tofu fmt`, `tofu validate`, and provider-lock verification.
+- [ ] Commit the OpenTofu provider lock file and constrain provider versions.
+- [ ] Pin Python dependencies and base image digest.
+- [ ] Run worker containers as an unprivileged user.
+- [ ] Add image provenance/SBOM generation and container scanning.
+- [ ] Provide a production topology option with dedicated no-ingress security group, explicit subnet mode, IMDSv2, encryption, cost tags, budget ceiling, and automatic teardown guidance.
+- [ ] Set DLQ retention longer than source queue retention and narrow the redrive allow policy.
+
+## Milestone 7 — measured cost-optimization proof
+
+Goal: turn the Spot scout/lane manager into a measured controller and publish an honest case study.
+
+- [ ] Have workers emit instance type, architecture, Region/AZ, image digest, startup delay, useful units completed, useful compute seconds, bytes transferred, retry/interruption status, attempt count, and discarded compute seconds.
+- [ ] Teach `spot_scout` and lane manager to optimize expected total cost, not just instance price.
+- [ ] Include compute, interruption replay, startup overhead, cross-region transfer, NAT/endpoints, S3/SQS/CloudWatch, storage, and On-Demand repair costs.
+- [ ] Publish an anonymized machine-readable run manifest and short case study comparing Spot vs On-Demand under a fixed deadline and completeness target.
+
+## Identity cleanup
+
+Pick one public identity and make the others subordinate. Preferred framing:
+
+> **Miser — a cost-aware AWS Batch Spot work runner.**
+
+Use `spotbatch` as the CLI name, but explain that relationship once and remove stale names from prominent docs.

@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
 
 
 class CanaryTests(unittest.TestCase):
@@ -161,13 +161,25 @@ class FakeLogsClient:
         return {"events": [], "nextForwardToken": "next"}
 
 
+class FakeBatchClient:
+    def __init__(self, job: dict[str, object]) -> None:
+        self.job = job
+
+    def describe_jobs(self, *, jobs):
+        return {"jobs": [self.job]}
+
+
 class FakeLogSession:
-    def __init__(self, logs_client: FakeLogsClient) -> None:
+    def __init__(self, logs_client: FakeLogsClient, batch_client: FakeBatchClient | None = None) -> None:
         self.logs_client = logs_client
+        self.batch_client = batch_client
 
     def client(self, service: str, region_name=None):
-        assert service == "logs"
-        return self.logs_client
+        if service == "logs":
+            return self.logs_client
+        if service == "batch" and self.batch_client is not None:
+            return self.batch_client
+        raise AssertionError(service)
 
 
 class BatchOperatorTests(unittest.TestCase):
@@ -202,6 +214,36 @@ class BatchOperatorTests(unittest.TestCase):
             ],
         }
         self.assertEqual(_job_log_stream(job), "attempt-2")
+
+    def test_job_log_group_reads_batch_log_configuration(self) -> None:
+        job = {"container": {"logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}}}}
+        self.assertEqual(_job_log_group(job), "/aws/batch/miser")
+
+    def test_logs_discovers_job_log_group_when_omitted(self) -> None:
+        logs = FakeLogsClient()
+        job = {
+            "jobId": "job-1",
+            "container": {
+                "logStreamName": "stream-1",
+                "logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}},
+            },
+        }
+        args = types.SimpleNamespace(
+            profile=None,
+            region=None,
+            log_stream=None,
+            job_id="job-1",
+            log_group=None,
+            limit=10,
+            start_from_head=False,
+            next_token=None,
+            filter_regex=None,
+            tail=0,
+        )
+        session = FakeLogSession(logs, FakeBatchClient(job))
+        with patch("spotbatch.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cmd_logs(args), 0)
+        self.assertEqual(logs.kwargs["logGroupName"], "/aws/batch/miser")
 
 
 class S3DeletePrefixTests(unittest.TestCase):

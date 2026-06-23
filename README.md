@@ -1,8 +1,8 @@
-# aws-batch-job-runner
+# Miser
 
-Durable AWS Batch + SQS + S3 job runner for cheap Spot compute.
+Miser is a cost-aware AWS Batch Spot work runner for trusted, idempotent, embarrassingly parallel workloads.
 
-Canonical display/package name: `aws-batch-job-runner`. The installed CLI remains `spotbatch`; older local clones may still use the directory name `aws-spot-batch-runner`.
+The installed CLI is `spotbatch`. Older docs and package metadata may still refer to the original package name, `aws-batch-job-runner`.
 
 This project packages a reliability pattern for large retryable AWS Batch jobs:
 
@@ -17,6 +17,8 @@ SQS task message
 ```
 
 If a Spot host dies before ack, SQS visibility timeout returns the task. If a task repeatedly fails, SQS redrives it to the DLQ.
+
+Miser is an at-least-once runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent, or use `task_id` as their own idempotency key for external side effects.
 
 ## What it is
 
@@ -72,10 +74,14 @@ SPOTBATCH_OUTPUT_PATH     local path to write if output_s3 should be uploaded by
 SPOTBATCH_OUTPUT_S3
 SPOTBATCH_SUMMARY_S3
 SPOTBATCH_DONE_S3
-SPOTBATCH_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 86400)
+SPOTBATCH_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 39600 / 11h)
 ```
 
 If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. The done marker is uploaded last.
+
+Task-provided `env` keys may not start with `SPOTBATCH_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
+
+Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much shorter shards, and checkpoint/split work that cannot fit safely under the default 11-hour cap.
 
 ## CLI quickstart
 
@@ -140,6 +146,7 @@ spotbatch finalize \
 spotbatch jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001
 spotbatch describe-job --job-id AWS_BATCH_JOB_ID
 spotbatch logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERROR'
+# If --job-id is provided and --log-group is omitted, spotbatch uses the job's awslogs-group when AWS Batch reports it.
 spotbatch watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
 
 # dry-run a guarded S3 prefix cleanup; add --delete and exact --confirm-prefix to mutate

@@ -1,12 +1,15 @@
 # Reliability contract
 
-`aws-batch-job-runner` / `spotbatch` is designed for AWS Spot interruption.
+Miser / `spotbatch` is designed for trusted, idempotent AWS Batch Spot work.
+
+The SQS queue is a trusted control plane. A queued task chooses the worker command, so queue producers must be trusted and commands must be safe to run at least once. Miser does not make arbitrary external side effects exactly-once.
 
 Worker algorithm:
 
 ```text
 receive SQS message
 parse task JSON
+validate heartbeat/visibility/timeouts below SQS hard limits
 if done_s3 exists:
   delete message
   exit/sleep for next message
@@ -25,10 +28,13 @@ only then delete SQS message
 Failure behavior:
 
 - Spot host terminated before delete: SQS visibility timeout expires; task is retried.
+- The worker caps task timeouts below SQS's 12-hour maximum visibility window; longer work must be checkpointed or split.
+- Heartbeat/lease-renewal failures are emitted as structured stderr JSON events.
 - Command fails or times out: worker does not delete message; task is retried.
 - Expected output missing for a task with `output_s3`: worker writes no done marker, does not delete the message, and the task is retried.
 - Output exists without done marker: task is considered incomplete and will be reprocessed.
 - Repeated poison task: SQS redrive policy moves message to DLQ.
+- Task-provided environment variables may not override reserved `SPOTBATCH_*`, `AWS_*`, or `ECS_*` names.
 
 Why done markers are the source of truth:
 

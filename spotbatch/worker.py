@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile as _tempfile
 import threading
 import time
@@ -19,6 +20,11 @@ from .aws_batch import iso_now
 from .s3util import s3_exists, s3_upload_file, s3_upload_text
 
 
+SQS_MAX_VISIBILITY_SECONDS = 12 * 60 * 60
+SAFE_TASK_TIMEOUT_SECONDS = 11 * 60 * 60
+RESERVED_TASK_ENV_PREFIXES = ("SPOTBATCH_", "AWS_", "ECS_")
+
+
 def _tail(s: str, n: int = 12000) -> str:
     return s[-n:]
 
@@ -29,7 +35,7 @@ def _task_dir_prefix(task_id: str) -> str:
     return f"{slug[:48]}-{digest}-"
 
 
-def _timeout_seconds(task: dict[str, Any], default_timeout_seconds: float) -> float:
+def _timeout_seconds(task: dict[str, Any], default_timeout_seconds: float, *, max_timeout_seconds: float = SAFE_TASK_TIMEOUT_SECONDS) -> float:
     raw = task.get("timeout_seconds", default_timeout_seconds)
     try:
         timeout = float(raw)
@@ -37,7 +43,30 @@ def _timeout_seconds(task: dict[str, Any], default_timeout_seconds: float) -> fl
         raise ValueError("timeout_seconds must be a positive number") from exc
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout_seconds must be a positive finite number")
+    if timeout > max_timeout_seconds:
+        raise ValueError(f"timeout_seconds must be <= {max_timeout_seconds:g}s to stay below the SQS 12h visibility limit")
     return timeout
+
+
+def validate_worker_timing(*, visibility_timeout: int, heartbeat_seconds: int, task_timeout_seconds: float) -> None:
+    if visibility_timeout <= 0 or visibility_timeout > SQS_MAX_VISIBILITY_SECONDS:
+        raise ValueError(f"visibility_timeout must be in 1..{SQS_MAX_VISIBILITY_SECONDS} seconds")
+    if heartbeat_seconds <= 0 or heartbeat_seconds >= visibility_timeout:
+        raise ValueError("heartbeat_seconds must be positive and less than visibility_timeout")
+    _timeout_seconds({}, task_timeout_seconds)
+
+
+def _task_env_overrides(task: dict[str, Any]) -> dict[str, str]:
+    raw = task.get("env") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("task env must be an object mapping string keys to values")
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k)
+        if any(key.startswith(prefix) for prefix in RESERVED_TASK_ENV_PREFIXES):
+            raise ValueError(f"task env key {key!r} uses a reserved prefix")
+        out[key] = str(v)
+    return out
 
 
 def default_done_s3(task: dict[str, Any]) -> str:
@@ -64,9 +93,16 @@ def _heartbeat(sqs, queue_url: str, receipt_handle: str, timeout: int, every: in
                 ReceiptHandle=receipt_handle,
                 VisibilityTimeout=timeout,
             )
-        except Exception:
-            # Best effort; if this fails, SQS will make the task visible again.
-            pass
+        except Exception as exc:
+            print(json.dumps({
+                "schema": "spotbatch.heartbeat_error.v1",
+                "checked_at": iso_now(),
+                "queue_url": queue_url,
+                "visibility_timeout": timeout,
+                "heartbeat_seconds": every,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def run_task(
@@ -74,7 +110,7 @@ def run_task(
     *,
     s3,
     work_root: Path,
-    default_timeout_seconds: float = 24 * 60 * 60,
+    default_timeout_seconds: float = SAFE_TASK_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     run_id = str(task.get("run_id", ""))
     task_id = str(task.get("task_id", ""))
@@ -115,8 +151,7 @@ def run_task(
             "SPOTBATCH_SUMMARY_S3": summary_s3,
             "SPOTBATCH_DONE_S3": done_s3,
         })
-        for k, v in dict(task.get("env") or {}).items():
-            env[str(k)] = str(v)
+        env.update(_task_env_overrides(task))
 
         started = time.time()
         stdout_path = task_dir / "stdout.txt"
@@ -226,6 +261,7 @@ def run_worker(
     work_dir: Path,
     task_timeout_seconds: float,
 ) -> int:
+    validate_worker_timing(visibility_timeout=visibility_timeout, heartbeat_seconds=heartbeat_seconds, task_timeout_seconds=task_timeout_seconds)
     sqs = boto3.client("sqs")
     s3 = boto3.client("s3")
     work_dir.mkdir(parents=True, exist_ok=True)
