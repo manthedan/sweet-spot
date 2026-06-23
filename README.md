@@ -52,6 +52,9 @@ ruff format --check .
 ruff check .
 mypy spotbatch
 python -m unittest discover -s tests -v
+
+# full local release closeout (also runs OpenTofu checks when tofu is installed)
+scripts/verify_release.sh
 ```
 
 ## Minimal task schema
@@ -231,6 +234,16 @@ spotbatch-lane-manager --config lanes.json
 Runtime and dev dependency lock files (`requirements.lock`, `requirements-dev.lock`) pin the Python dependency graph used by Docker and CI. The worker Dockerfile pins its Python base image by digest and drops to an unprivileged `spotbatch` user. CI runs unit tests, Ruff formatting/linting, typing, OpenTofu lock/fmt/validate checks, and a container build with SBOM/provenance attestations plus Trivy scanning.
 
 See `infra/opentofu/README.md`.
+
+## Cost case studies and release hygiene
+
+- `docs/cost_model.md` explains worker telemetry, expected-total-cost pool ranking, and cost-aware lane allocation.
+- `examples/run_manifest.example.json` is the machine-readable shape for anonymized run/cost evidence.
+- `docs/case_study_template.md` is the companion prose template for public Spot vs On-Demand comparisons when Cost Explorer data is unavailable or private.
+- `scripts/verify_release.sh` runs the local closeout checks that mirror CI-critical gates.
+- `docs/release_checklist.md` covers branch protection, action pin updates, and release/tag hygiene.
+- `SECURITY.md` documents the trusted-workload threat model and reporting process.
+- `CHANGELOG.md` tracks unreleased production-hardening changes.
 
 ## License
 

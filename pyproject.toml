@@ -1,7 +1,7 @@
 [project]
 name = "aws-batch-job-runner"
 version = "0.1.0"
-description = "SpotBatch: durable AWS Batch + SQS + S3 runner for cheap Spot compute jobs."
+description = "SpotBatch: durable AWS Batch + SQS + S3 runner for cost-aware Spot workloads."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
