@@ -48,6 +48,7 @@ pip install --constraint requirements.lock -e .
 
 # optional local closeout checks used by CI
 pip install --constraint requirements-dev.lock -e '.[dev]'
+ruff format --check .
 ruff check .
 mypy spotbatch
 python -m unittest discover -s tests -v
@@ -219,7 +220,7 @@ spotbatch-lane-manager --config lanes.json
 - CloudWatch dashboard and baseline alarms for queue age, DLQ depth, Batch failures, and runnable-job stalls
 - optional monthly AWS Budget alerts
 
-Runtime and dev dependency lock files (`requirements.lock`, `requirements-dev.lock`) pin the Python dependency graph used by Docker and CI. The worker Dockerfile pins its Python base image by digest and drops to an unprivileged `spotbatch` user. CI runs unit tests, linting, typing, OpenTofu lock/fmt/validate checks, and a container build with SBOM/provenance attestations plus Trivy scanning.
+Runtime and dev dependency lock files (`requirements.lock`, `requirements-dev.lock`) pin the Python dependency graph used by Docker and CI. The worker Dockerfile pins its Python base image by digest and drops to an unprivileged `spotbatch` user. CI runs unit tests, Ruff formatting/linting, typing, OpenTofu lock/fmt/validate checks, and a container build with SBOM/provenance attestations plus Trivy scanning.
 
 See `infra/opentofu/README.md`.
 

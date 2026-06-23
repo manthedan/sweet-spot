@@ -40,12 +40,14 @@ def active_jobs(batch, job_queue: str, job_name_prefix: str) -> list[dict[str, A
             for job in page.get("jobSummaryList", []):
                 if job_name_prefix and not str(job.get("jobName", "")).startswith(job_name_prefix):
                     continue
-                jobs.append({
-                    "jobId": job.get("jobId"),
-                    "jobName": job.get("jobName"),
-                    "status": status,
-                    "createdAt": job.get("createdAt"),
-                })
+                jobs.append(
+                    {
+                        "jobId": job.get("jobId"),
+                        "jobName": job.get("jobName"),
+                        "status": status,
+                        "createdAt": job.get("createdAt"),
+                    }
+                )
     return jobs
 
 

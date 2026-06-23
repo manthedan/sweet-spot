@@ -25,6 +25,7 @@ Example config:
   ]
 }
 """
+
 from __future__ import annotations
 
 import argparse
@@ -149,30 +150,38 @@ def main() -> int:
         to_submit = max(0, desired_for_lane - active)
         remaining = max(0, remaining - max(active, desired_for_lane))
         submitted = submit_jobs(batch, lane, sqs_queue_url, to_submit, dry_run=not args.submit)
-        lane_reports.append({
-            "name": lane.get("name"),
-            "region": lane["region"],
-            "placement_score": score,
-            "min_placement_score": min_score,
-            "eligible": eligible,
-            "active": active,
-            "max_workers": max_workers,
-            "desired_for_lane": desired_for_lane,
-            "to_submit": to_submit,
-            "submitted_count": len(submitted),
-            "submitted": submitted[:20],
-        })
+        lane_reports.append(
+            {
+                "name": lane.get("name"),
+                "region": lane["region"],
+                "placement_score": score,
+                "min_placement_score": min_score,
+                "eligible": eligible,
+                "active": active,
+                "max_workers": max_workers,
+                "desired_for_lane": desired_for_lane,
+                "to_submit": to_submit,
+                "submitted_count": len(submitted),
+                "submitted": submitted[:20],
+            }
+        )
 
-    print(json.dumps({
-        "schema": "spotbatch.spot_lane_manager.v1",
-        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "submit": bool(args.submit),
-        "queue_depth": depth,
-        "backlog_used_for_sizing": backlog,
-        "target_workers": target_workers,
-        "remaining_unallocated": remaining,
-        "lanes": lane_reports,
-    }, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema": "spotbatch.spot_lane_manager.v1",
+                "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "submit": bool(args.submit),
+                "queue_depth": depth,
+                "backlog_used_for_sizing": backlog,
+                "target_workers": target_workers,
+                "remaining_unallocated": remaining,
+                "lanes": lane_reports,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

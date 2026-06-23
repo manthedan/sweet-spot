@@ -157,16 +157,22 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
             if resp.get("Failed"):
                 raise RuntimeError(f"send_message_batch failed: {resp['Failed']}")
             sent += len(resp.get("Successful", []))
-    print(json.dumps({
-        "schema": "spotbatch.enqueue_summary.v1",
-        "checked_at": iso_now(),
-        "queue_url": args.queue_url,
-        "task_count": len(tasks),
-        "sent": sent,
-        "submitted": bool(args.submit),
-        "allowed_s3_prefixes": list(allowed_s3_prefixes),
-        "tasks_jsonl": str(tasks_out),
-    }, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema": "spotbatch.enqueue_summary.v1",
+                "checked_at": iso_now(),
+                "queue_url": args.queue_url,
+                "task_count": len(tasks),
+                "sent": sent,
+                "submitted": bool(args.submit),
+                "allowed_s3_prefixes": list(allowed_s3_prefixes),
+                "tasks_jsonl": str(tasks_out),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -235,7 +241,22 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
         "expected_done_s3": [_done_marker_or_none(t) for t in canary_tasks],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"schema": "spotbatch.derive_canary_summary.v1", "run_id": effective_run_id, "requested_run_id": args.run_id, "task_count": len(canary_tasks), "selected_indices": selected, "canary_tasks_jsonl": str(canary_tasks_path), "canary_manifest": str(manifest_path), "dlq_probe_task_jsonl": str(bad_task_path) if bad_task_path else None}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema": "spotbatch.derive_canary_summary.v1",
+                "run_id": effective_run_id,
+                "requested_run_id": args.run_id,
+                "task_count": len(canary_tasks),
+                "selected_indices": selected,
+                "canary_tasks_jsonl": str(canary_tasks_path),
+                "canary_manifest": str(manifest_path),
+                "dlq_probe_task_jsonl": str(bad_task_path) if bad_task_path else None,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -371,20 +392,26 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
             retry_attempts=args.retry_attempts,
         )
 
-    print(json.dumps({
-        "schema": "spotbatch.worker_submitter_summary.v1",
-        "checked_at": iso_now(),
-        "submit": bool(args.submit),
-        "queue_depth": depth,
-        "backlog_used_for_sizing": backlog,
-        "messages_per_worker": args.messages_per_worker,
-        "raw_desired_workers": raw_desired,
-        "active_matching_workers": len(active),
-        "to_submit": to_submit,
-        "submitted_count": len(submitted),
-        "submitted": submitted,
-        "active_examples": active[:20],
-    }, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema": "spotbatch.worker_submitter_summary.v1",
+                "checked_at": iso_now(),
+                "submit": bool(args.submit),
+                "queue_depth": depth,
+                "backlog_used_for_sizing": backlog,
+                "messages_per_worker": args.messages_per_worker,
+                "raw_desired_workers": raw_desired,
+                "active_matching_workers": len(active),
+                "to_submit": to_submit,
+                "submitted_count": len(submitted),
+                "submitted": submitted,
+                "active_examples": active[:20],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -604,11 +631,13 @@ class _S3ExistenceIndex:
 def _finalizer_existence_index(args: argparse.Namespace, s3) -> _S3ExistenceIndex | None:
     prefixes = list(getattr(args, "preload_s3_prefix", None) or [])
     if getattr(args, "use_listing_index", False):
-        prefixes.extend([
-            s3_join(args.output_prefix, "done"),
-            s3_join(args.output_prefix, "shards"),
-            s3_join(args.output_prefix, "summaries"),
-        ])
+        prefixes.extend(
+            [
+                s3_join(args.output_prefix, "done"),
+                s3_join(args.output_prefix, "shards"),
+                s3_join(args.output_prefix, "summaries"),
+            ]
+        )
     if not prefixes:
         return None
     index = _S3ExistenceIndex(s3, prefixes)
@@ -717,7 +746,19 @@ def _check_task(s3, task: dict[str, Any], existence_index: _S3ExistenceIndex | N
         state = "missing_output"
     elif output_exists and not marker_valid:
         state = "output_without_done"
-    return {"task_id": task.get("task_id"), "output_s3": output_s3, "logical_output_s3": logical_output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "marker_valid": marker_valid, "output_exists": output_exists, "summary_exists": summary_exists, "state": state, "marker_validation_error": marker_validation_error}
+    return {
+        "task_id": task.get("task_id"),
+        "output_s3": output_s3,
+        "logical_output_s3": logical_output_s3,
+        "summary_s3": summary_s3,
+        "done_s3": done_s3,
+        "done_exists": done_exists,
+        "marker_valid": marker_valid,
+        "output_exists": output_exists,
+        "summary_exists": summary_exists,
+        "state": state,
+        "marker_validation_error": marker_validation_error,
+    }
 
 
 def _repair_task_for_record(task: dict[str, Any], record: dict[str, Any], repair_suffix: str) -> dict[str, Any]:
@@ -826,7 +867,12 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             process_record(task, record, status_f, repair_f, outputs_f)
             next_to_emit += 1
 
-    with status_path.open("w", encoding="utf-8") as status_f, repair_path.open("w", encoding="utf-8") as repair_f, outputs_path.open("w", encoding="utf-8") as outputs_f, cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
+    with (
+        status_path.open("w", encoding="utf-8") as status_f,
+        repair_path.open("w", encoding="utf-8") as repair_f,
+        outputs_path.open("w", encoding="utf-8") as outputs_f,
+        cf.ThreadPoolExecutor(max_workers=args.workers) as ex,
+    ):
         for line_no, task in enumerate(_iter_tasks_for_finalizer(args, s3), start=1):
             task_id = str(task.get("task_id") or "")
             if task_id in seen_task_ids:
@@ -892,13 +938,42 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             s3_upload_file(s3, repair_path, repair_s3, "application/jsonl")
 
     if args.publish_ready and not final_manifest["complete"] and not args.allow_incomplete_ready:
-        print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "outputs_manifest": str(outputs_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": None, "refused_ready": True}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    **{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]},
+                    "final_manifest": str(final_path),
+                    "repair_tasks": str(repair_path),
+                    "task_status": str(status_path),
+                    "outputs_manifest": str(outputs_path),
+                    "final_manifest_s3": final_s3 if args.upload else None,
+                    "ready_s3": None,
+                    "refused_ready": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 2
 
     if args.upload and args.publish_ready:
         ready = {"schema": "spotbatch.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
         s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
-    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "outputs_manifest": str(outputs_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": ready_s3 if args.publish_ready and args.upload else None}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                **{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]},
+                "final_manifest": str(final_path),
+                "repair_tasks": str(repair_path),
+                "task_status": str(status_path),
+                "outputs_manifest": str(outputs_path),
+                "final_manifest_s3": final_s3 if args.upload else None,
+                "ready_s3": ready_s3 if args.publish_ready and args.upload else None,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 2 if args.require_complete and not final_manifest["complete"] else 0
 
 
@@ -922,7 +997,7 @@ def _job_log_stream(job: dict[str, Any]) -> str | None:
 
 
 def _container_log_group(container: dict[str, Any] | None) -> str | None:
-    options = (((container or {}).get("logConfiguration") or {}).get("options") or {})
+    options = ((container or {}).get("logConfiguration") or {}).get("options") or {}
     group = options.get("awslogs-group")
     return str(group) if group else None
 
@@ -941,7 +1016,7 @@ def _job_log_group(job: dict[str, Any]) -> str | None:
     group = _container_log_group(job.get("container"))
     if group:
         return group
-    for task_prop in (((job.get("ecsProperties") or {}).get("taskProperties")) or []):
+    for task_prop in ((job.get("ecsProperties") or {}).get("taskProperties")) or []:
         for container in task_prop.get("containers") or []:
             group = _container_log_group(container)
             if group:
@@ -1032,7 +1107,21 @@ def cmd_logs(args: argparse.Namespace) -> int:
         if args.filter_regex and not re.search(args.filter_regex, msg):
             continue
         events.append({"timestamp": ev.get("timestamp"), "message": msg})
-    print(json.dumps({"schema": "spotbatch.logs.v1", "checked_at": iso_now(), "log_group": log_group, "log_stream": stream, "count": len(events), "nextForwardToken": resp.get("nextForwardToken"), "events": events[-args.tail :] if args.tail else events}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema": "spotbatch.logs.v1",
+                "checked_at": iso_now(),
+                "log_group": log_group,
+                "log_stream": stream,
+                "count": len(events),
+                "nextForwardToken": resp.get("nextForwardToken"),
+                "events": events[-args.tail :] if args.tail else events,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -1044,7 +1133,15 @@ def cmd_watch_job(args: argparse.Namespace) -> int:
     while True:
         job = _describe_one_job(batch, args.job_id)
         status = str(job.get("status"))
-        last_report = {"schema": "spotbatch.watch_job.v1", "checked_at": iso_now(), "jobId": job.get("jobId"), "jobName": job.get("jobName"), "status": status, "statusReason": job.get("statusReason"), "logStreamName": _job_log_stream(job)}
+        last_report = {
+            "schema": "spotbatch.watch_job.v1",
+            "checked_at": iso_now(),
+            "jobId": job.get("jobId"),
+            "jobName": job.get("jobName"),
+            "status": status,
+            "statusReason": job.get("statusReason"),
+            "logStreamName": _job_log_stream(job),
+        }
         print(json.dumps(last_report, indent=2, sort_keys=True))
         if status in {"SUCCEEDED", "FAILED"}:
             return 0 if status == "SUCCEEDED" else 2
@@ -1114,13 +1211,55 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
             batch.append(entry)
             if len(batch) >= args.batch_size:
                 flush()
-        status_path.write_text(json.dumps({"schema": "spotbatch.s3_delete_prefix_status.v1", "updated_at": iso_now(), "prefix": args.prefix, "delete": bool(args.delete), "include_versions": bool(getattr(args, "include_versions", False)), "listed": listed, "deleted": deleted, "delete_markers": delete_markers, "batches": batches, "examples": examples}, indent=2, sort_keys=True) + "\n")
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema": "spotbatch.s3_delete_prefix_status.v1",
+                    "updated_at": iso_now(),
+                    "prefix": args.prefix,
+                    "delete": bool(args.delete),
+                    "include_versions": bool(getattr(args, "include_versions", False)),
+                    "listed": listed,
+                    "deleted": deleted,
+                    "delete_markers": delete_markers,
+                    "batches": batches,
+                    "examples": examples,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     flush()
     marker_s3 = None
     if args.delete and args.completion_marker_s3:
         marker_s3 = args.completion_marker_s3
-        s3_upload_text(s3, json.dumps({"schema": "spotbatch.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "include_versions": bool(getattr(args, "include_versions", False)), "deleted": deleted}, indent=2, sort_keys=True) + "\n", marker_s3)
-    summary = {"schema": "spotbatch.s3_delete_prefix_summary.v1", "finished_at": iso_now(), "prefix": args.prefix, "bucket": bucket, "key_prefix": prefix_key, "delete": bool(args.delete), "include_versions": bool(getattr(args, "include_versions", False)), "listed": listed, "deleted": deleted, "delete_markers": delete_markers, "batches": batches, "completion_marker_s3": marker_s3, "status_json": str(status_path), "examples": examples}
+        s3_upload_text(
+            s3,
+            json.dumps(
+                {"schema": "spotbatch.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "include_versions": bool(getattr(args, "include_versions", False)), "deleted": deleted},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            marker_s3,
+        )
+    summary = {
+        "schema": "spotbatch.s3_delete_prefix_summary.v1",
+        "finished_at": iso_now(),
+        "prefix": args.prefix,
+        "bucket": bucket,
+        "key_prefix": prefix_key,
+        "delete": bool(args.delete),
+        "include_versions": bool(getattr(args, "include_versions", False)),
+        "listed": listed,
+        "deleted": deleted,
+        "delete_markers": delete_markers,
+        "batches": batches,
+        "completion_marker_s3": marker_s3,
+        "status_json": str(status_path),
+        "examples": examples,
+    }
     status_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
@@ -1157,14 +1296,34 @@ def cmd_dlq(args: argparse.Namespace) -> int:
         if getattr(args, "max_messages_per_second", None):
             kwargs["MaxNumberOfMessagesPerSecond"] = args.max_messages_per_second
         resp = sqs.start_message_move_task(**kwargs)
-        print(json.dumps({"schema": "spotbatch.dlq_redrive_summary.v1", "checked_at": iso_now(), "native_redrive": True, "source_arn": kwargs["SourceArn"], "destination_arn": kwargs.get("DestinationArn"), "task_handle": resp.get("TaskHandle"), "max_messages_per_second": kwargs.get("MaxNumberOfMessagesPerSecond")}, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "schema": "spotbatch.dlq_redrive_summary.v1",
+                    "checked_at": iso_now(),
+                    "native_redrive": True,
+                    "source_arn": kwargs["SourceArn"],
+                    "destination_arn": kwargs.get("DestinationArn"),
+                    "task_handle": resp.get("TaskHandle"),
+                    "max_messages_per_second": kwargs.get("MaxNumberOfMessagesPerSecond"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
     scanned = matched = moved = 0
     by_run: Counter[str] = Counter()
     by_schema: Counter[str] = Counter()
     examples: list[dict[str, Any]] = []
     while scanned < args.max_messages:
-        resp = sqs.receive_message(QueueUrl=args.dlq_url, MaxNumberOfMessages=min(10, args.max_messages - scanned), WaitTimeSeconds=args.wait_time, VisibilityTimeout=args.visibility_timeout, AttributeNames=["ApproximateReceiveCount", "SentTimestamp"])
+        resp = sqs.receive_message(
+            QueueUrl=args.dlq_url,
+            MaxNumberOfMessages=min(10, args.max_messages - scanned),
+            WaitTimeSeconds=args.wait_time,
+            VisibilityTimeout=args.visibility_timeout,
+            AttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
+        )
         messages = resp.get("Messages", [])
         if not messages:
             break
@@ -1186,7 +1345,23 @@ def cmd_dlq(args: argparse.Namespace) -> int:
                     sqs.send_message(QueueUrl=args.queue_url, MessageBody=msg.get("Body", ""))
                     sqs.delete_message(QueueUrl=args.dlq_url, ReceiptHandle=msg["ReceiptHandle"])
                     moved += 1
-    print(json.dumps({"schema": "spotbatch.dlq_summary.v1", "checked_at": iso_now(), "apply": bool(args.apply), "scanned": scanned, "matched": matched, "moved": moved, "by_run": dict(by_run.most_common()), "by_schema": dict(by_schema.most_common()), "examples": examples}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "schema": "spotbatch.dlq_summary.v1",
+                "checked_at": iso_now(),
+                "apply": bool(args.apply),
+                "scanned": scanned,
+                "matched": matched,
+                "moved": moved,
+                "by_run": dict(by_run.most_common()),
+                "by_schema": dict(by_schema.most_common()),
+                "examples": examples,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -1216,20 +1391,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     discovered_log_group = args.log_group
 
     if args.queue_url:
+
         def check_queue() -> dict[str, Any]:
             sqs = session.client("sqs", region_name=args.region)
             attrs = sqs.get_queue_attributes(QueueUrl=args.queue_url, AttributeNames=["All"]).get("Attributes", {})
-            return {"queue_url": args.queue_url, "attributes": {k: attrs.get(k) for k in ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateAgeOfOldestMessage", "VisibilityTimeout", "RedrivePolicy"] if k in attrs}}
+            return {
+                "queue_url": args.queue_url,
+                "attributes": {k: attrs.get(k) for k in ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateAgeOfOldestMessage", "VisibilityTimeout", "RedrivePolicy"] if k in attrs},
+            }
+
         checks.append(_doctor_check("sqs_work_queue", check_queue))
 
     if args.dlq_url:
+
         def check_dlq() -> dict[str, Any]:
             sqs = session.client("sqs", region_name=args.region)
             attrs = sqs.get_queue_attributes(QueueUrl=args.dlq_url, AttributeNames=["All"]).get("Attributes", {})
             return {"dlq_url": args.dlq_url, "attributes": {k: attrs.get(k) for k in ["ApproximateNumberOfMessages", "MessageRetentionPeriod"] if k in attrs}}
+
         checks.append(_doctor_check("sqs_dlq", check_dlq))
 
     if args.job_queue:
+
         def check_job_queue() -> dict[str, Any]:
             batch = session.client("batch", region_name=args.region)
             queues = batch.describe_job_queues(jobQueues=[args.job_queue]).get("jobQueues", [])
@@ -1239,9 +1422,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if queue.get("state") != "ENABLED" or queue.get("status") not in {"VALID", None}:
                 raise RuntimeError(f"job queue not ready: state={queue.get('state')} status={queue.get('status')}")
             return {"jobQueueName": queue.get("jobQueueName"), "state": queue.get("state"), "status": queue.get("status"), "computeEnvironmentOrder": queue.get("computeEnvironmentOrder")}
+
         checks.append(_doctor_check("batch_job_queue", check_job_queue))
 
     if args.job_definition:
+
         def check_job_definition() -> dict[str, Any]:
             nonlocal discovered_log_group
             batch = session.client("batch", region_name=args.region)
@@ -1252,11 +1437,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             container = job_def.get("containerProperties") or {}
             log_group = _job_definition_log_group(job_def)
             discovered_log_group = discovered_log_group or log_group
-            return {"jobDefinitionName": job_def.get("jobDefinitionName"), "revision": job_def.get("revision"), "image": container.get("image"), "jobRoleArn": container.get("jobRoleArn"), "log_group": log_group, "command": container.get("command")}
+            return {
+                "jobDefinitionName": job_def.get("jobDefinitionName"),
+                "revision": job_def.get("revision"),
+                "image": container.get("image"),
+                "jobRoleArn": container.get("jobRoleArn"),
+                "log_group": log_group,
+                "command": container.get("command"),
+            }
+
         checks.append(_doctor_check("batch_job_definition", check_job_definition))
 
     if args.s3_prefix:
         for prefix in args.s3_prefix:
+
             def check_s3(prefix=prefix) -> dict[str, Any]:
                 s3 = session.client("s3", region_name=args.region)
                 bucket, key = parse_s3_uri(prefix)
@@ -1270,9 +1464,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     s3.delete_object(Bucket=bucket, Key=probe_key)
                     probe_uri = f"s3://{bucket}/{probe_key}"
                 return {"prefix": prefix, "bucket": bucket, "key_prefix": list_prefix, "write_probe": probe_uri}
+
             checks.append(_doctor_check(f"s3_prefix:{prefix}", check_s3))
 
     if discovered_log_group:
+
         def check_logs() -> dict[str, Any]:
             logs = session.client("logs", region_name=args.region)
             groups = logs.describe_log_groups(logGroupNamePrefix=discovered_log_group).get("logGroups", [])
@@ -1280,9 +1476,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if not match:
                 raise RuntimeError(f"log group not found: {discovered_log_group}")
             return {"log_group": discovered_log_group, "retentionInDays": match.get("retentionInDays"), "storedBytes": match.get("storedBytes")}
+
         checks.append(_doctor_check("cloudwatch_log_group", check_logs))
 
-    checks.append({"name": "service_quotas", "ok": None, "details": {"status": "not_checked", "reason": "AWS Batch quota codes vary by account/Region; verify max vCPUs and queue limits in Service Quotas for production runs."}})
+    checks.append(
+        {"name": "service_quotas", "ok": None, "details": {"status": "not_checked", "reason": "AWS Batch quota codes vary by account/Region; verify max vCPUs and queue limits in Service Quotas for production runs."}}
+    )
     ok = all(c.get("ok") is not False for c in checks)
     print(json.dumps({"schema": "spotbatch.doctor.v1", "checked_at": iso_now(), "ok": ok, "region": args.region, "checks": checks}, indent=2, sort_keys=True))
     return 0 if ok else 2
@@ -1297,14 +1496,30 @@ def main() -> int:
     p.add_argument("--max-messages", type=int, default=int(os.environ.get("SPOTBATCH_MAX_MESSAGES", "1")))
     p.add_argument("--visibility-timeout", type=int, default=int(os.environ.get("SPOTBATCH_VISIBILITY_TIMEOUT", "1800")))
     p.add_argument("--heartbeat-seconds", type=int, default=int(os.environ.get("SPOTBATCH_HEARTBEAT_SECONDS", "300")))
-    p.add_argument("--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", str(SAFE_TASK_TIMEOUT_SECONDS))), help="Default per-task command timeout when a task omits timeout_seconds")
+    p.add_argument(
+        "--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", str(SAFE_TASK_TIMEOUT_SECONDS))), help="Default per-task command timeout when a task omits timeout_seconds"
+    )
     p.add_argument("--wait-time", type=int, default=10)
     p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SPOTBATCH_WORK_DIR", "/tmp/spotbatch-work")))
     p.add_argument("--allowed-s3-prefix", action="append", default=_env_allowed_s3_prefixes(), help="S3 prefix allowed in task payloads; repeatable. Also read from SPOTBATCH_ALLOWED_S3_PREFIXES.")
     p.add_argument("--log-tail-bytes", type=int, default=int(os.environ.get("SPOTBATCH_LOG_TAIL_BYTES", str(DEFAULT_LOG_TAIL_BYTES))), help="Bytes of redacted stdout/stderr tail to keep in task summaries")
     p.add_argument("--max-log-bytes", type=int, default=int(os.environ.get("SPOTBATCH_MAX_LOG_BYTES", str(DEFAULT_MAX_LOG_BYTES))), help="Maximum redacted bytes per stdout/stderr stream to upload to S3")
     p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from streamed/uploaded task logs; repeatable. SPOTBATCH_REDACT_REGEXES may provide newline-separated defaults.")
-    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds, allowed_s3_prefixes=a.allowed_s3_prefix, log_tail_bytes=a.log_tail_bytes, max_log_bytes=a.max_log_bytes, redact_regexes=a.redact_regex))
+    p.set_defaults(
+        func=lambda a: run_worker(
+            queue_url=a.queue_url,
+            max_messages=a.max_messages,
+            visibility_timeout=a.visibility_timeout,
+            heartbeat_seconds=a.heartbeat_seconds,
+            wait_time=a.wait_time,
+            work_dir=a.work_dir,
+            task_timeout_seconds=a.task_timeout_seconds,
+            allowed_s3_prefixes=a.allowed_s3_prefix,
+            log_tail_bytes=a.log_tail_bytes,
+            max_log_bytes=a.max_log_bytes,
+            redact_regexes=a.redact_regex,
+        )
+    )
 
     p = sub.add_parser("enqueue-jsonl")
     p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))

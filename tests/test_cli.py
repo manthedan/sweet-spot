@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 try:
     from botocore.exceptions import ClientError as _ClientError
 except ModuleNotFoundError:
+
     class _ClientError(Exception):
         def __init__(self, response, operation_name):
             super().__init__(f"{operation_name}: {response}")
@@ -35,7 +36,24 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, _worker_overrides, cmd_derive_canary, cmd_dlq, cmd_doctor, cmd_enqueue_jsonl, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
+from spotbatch.cli import (
+    _auto_canary_indices,
+    _job_log_group,
+    _job_log_stream,
+    _parse_index_selection,
+    _redact_env,
+    _supervisor_desired_workers,
+    _validate_s3_delete_prefix,
+    _worker_overrides,
+    cmd_derive_canary,
+    cmd_dlq,
+    cmd_doctor,
+    cmd_enqueue_jsonl,
+    cmd_finalize,
+    cmd_logs,
+    cmd_s3_delete_prefix,
+    cmd_supervise_workers,
+)
 from spotbatch.worker import task_hash
 
 
@@ -253,7 +271,15 @@ class FakeDoctorClient:
         return {"jobQueues": [{"jobQueueName": "jq", "state": "ENABLED", "status": "VALID", "computeEnvironmentOrder": []}]}
 
     def describe_job_definitions(self, **kwargs):
-        return {"jobDefinitions": [{"jobDefinitionName": "jd", "revision": 1, "containerProperties": {"image": "repo/worker:tag", "jobRoleArn": "arn", "command": ["spotbatch", "worker"], "logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}}}}]}
+        return {
+            "jobDefinitions": [
+                {
+                    "jobDefinitionName": "jd",
+                    "revision": 1,
+                    "containerProperties": {"image": "repo/worker:tag", "jobRoleArn": "arn", "command": ["spotbatch", "worker"], "logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}}},
+                }
+            ]
+        }
 
     def describe_log_groups(self, **kwargs):
         return {"logGroups": [{"logGroupName": "/aws/batch/miser", "retentionInDays": 14, "storedBytes": 0}]}
@@ -641,7 +667,9 @@ class FinalizeTests(unittest.TestCase):
 
     def test_finalize_refuses_ready_when_done_exists_but_output_missing(self) -> None:
         s3 = FakeFinalizeS3()
-        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt"}).encode()}
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {
+            "Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt"}).encode()
+        }
         tasks = [
             {
                 "run_id": "r1",
@@ -728,8 +756,12 @@ class FinalizeTests(unittest.TestCase):
 
     def test_finalize_publishes_ready_after_complete_manifest_upload(self) -> None:
         s3 = FakeFinalizeS3()
-        s3.objects[("bucket", "runs/r1/done/task-10.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-10", "output_s3": "s3://bucket/runs/r1/shards/task-10.txt"}).encode()}
-        s3.objects[("bucket", "runs/r1/done/task-2.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-2", "output_s3": "s3://bucket/runs/r1/shards/task-2.txt"}).encode()}
+        s3.objects[("bucket", "runs/r1/done/task-10.done.json")] = {
+            "Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-10", "output_s3": "s3://bucket/runs/r1/shards/task-10.txt"}).encode()
+        }
+        s3.objects[("bucket", "runs/r1/done/task-2.done.json")] = {
+            "Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-2", "output_s3": "s3://bucket/runs/r1/shards/task-2.txt"}).encode()
+        }
         s3.objects[("bucket", "runs/r1/shards/task-10.txt")] = {"Body": b"ok"}
         s3.objects[("bucket", "runs/r1/shards/task-2.txt")] = {"Body": b"ok"}
         tasks = [
@@ -819,15 +851,19 @@ class FinalizeTests(unittest.TestCase):
         repair_task["done_s3"] = repair_done
         repair_task["spotbatch_repair_reason"] = "invalid_done_marker"
         s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"not-json"}
-        s3.objects[("bucket", "runs/r1/done/task-1.done.json.repair-abc")] = {"Body": json.dumps({
-            "schema": "spotbatch.done_marker.v2",
-            "run_id": "r1",
-            "task_id": "task-1",
-            "task_hash": task_hash(repair_task),
-            "attempt_id": "attempt-r",
-            "done_s3": repair_done,
-            "output_s3": "",
-        }).encode()}
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json.repair-abc")] = {
+            "Body": json.dumps(
+                {
+                    "schema": "spotbatch.done_marker.v2",
+                    "run_id": "r1",
+                    "task_id": "task-1",
+                    "task_hash": task_hash(repair_task),
+                    "attempt_id": "attempt-r",
+                    "done_s3": repair_done,
+                    "output_s3": "",
+                }
+            ).encode()
+        }
         with tempfile.TemporaryDirectory() as tmp:
             task_path = Path(tmp) / "tasks.jsonl"
             task_path.write_text(json.dumps(task) + "\n")

@@ -8,6 +8,7 @@ This combines three signals:
 
 It does not submit jobs or mutate AWS resources.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,31 +27,97 @@ import boto3
 from botocore.exceptions import ClientError
 
 X86_CPU_TYPES = [
-    "c5.large", "c5.xlarge", "c5.2xlarge", "c5.4xlarge",
-    "c5a.large", "c5a.xlarge", "c5a.2xlarge", "c5a.4xlarge",
-    "c6i.large", "c6i.xlarge", "c6i.2xlarge", "c6i.4xlarge",
-    "c6a.large", "c6a.xlarge", "c6a.2xlarge", "c6a.4xlarge",
-    "c7i.large", "c7i.xlarge", "c7i.2xlarge", "c7i.4xlarge",
-    "c7a.large", "c7a.xlarge", "c7a.2xlarge", "c7a.4xlarge",
-    "c8i.large", "c8i.xlarge", "c8i.2xlarge", "c8i.4xlarge",
-    "c8a.large", "c8a.xlarge", "c8a.2xlarge", "c8a.4xlarge",
-    "m5.large", "m5.xlarge", "m5.2xlarge", "m5.4xlarge",
-    "m5a.large", "m5a.xlarge", "m5a.2xlarge", "m5a.4xlarge",
-    "m6i.large", "m6i.xlarge", "m6i.2xlarge", "m6i.4xlarge",
-    "m6a.large", "m6a.xlarge", "m6a.2xlarge", "m6a.4xlarge",
-    "m7i.large", "m7i.xlarge", "m7i.2xlarge", "m7i.4xlarge",
-    "m7a.large", "m7a.xlarge", "m7a.2xlarge", "m7a.4xlarge",
-    "m8i.large", "m8i.xlarge", "m8i.2xlarge", "m8i.4xlarge",
-    "m8a.large", "m8a.xlarge", "m8a.2xlarge", "m8a.4xlarge",
+    "c5.large",
+    "c5.xlarge",
+    "c5.2xlarge",
+    "c5.4xlarge",
+    "c5a.large",
+    "c5a.xlarge",
+    "c5a.2xlarge",
+    "c5a.4xlarge",
+    "c6i.large",
+    "c6i.xlarge",
+    "c6i.2xlarge",
+    "c6i.4xlarge",
+    "c6a.large",
+    "c6a.xlarge",
+    "c6a.2xlarge",
+    "c6a.4xlarge",
+    "c7i.large",
+    "c7i.xlarge",
+    "c7i.2xlarge",
+    "c7i.4xlarge",
+    "c7a.large",
+    "c7a.xlarge",
+    "c7a.2xlarge",
+    "c7a.4xlarge",
+    "c8i.large",
+    "c8i.xlarge",
+    "c8i.2xlarge",
+    "c8i.4xlarge",
+    "c8a.large",
+    "c8a.xlarge",
+    "c8a.2xlarge",
+    "c8a.4xlarge",
+    "m5.large",
+    "m5.xlarge",
+    "m5.2xlarge",
+    "m5.4xlarge",
+    "m5a.large",
+    "m5a.xlarge",
+    "m5a.2xlarge",
+    "m5a.4xlarge",
+    "m6i.large",
+    "m6i.xlarge",
+    "m6i.2xlarge",
+    "m6i.4xlarge",
+    "m6a.large",
+    "m6a.xlarge",
+    "m6a.2xlarge",
+    "m6a.4xlarge",
+    "m7i.large",
+    "m7i.xlarge",
+    "m7i.2xlarge",
+    "m7i.4xlarge",
+    "m7a.large",
+    "m7a.xlarge",
+    "m7a.2xlarge",
+    "m7a.4xlarge",
+    "m8i.large",
+    "m8i.xlarge",
+    "m8i.2xlarge",
+    "m8i.4xlarge",
+    "m8a.large",
+    "m8a.xlarge",
+    "m8a.2xlarge",
+    "m8a.4xlarge",
 ]
 
 ARM_CPU_TYPES = [
-    "c6g.large", "c6g.xlarge", "c6g.2xlarge", "c6g.4xlarge",
-    "c7g.large", "c7g.xlarge", "c7g.2xlarge", "c7g.4xlarge",
-    "c8g.large", "c8g.xlarge", "c8g.2xlarge", "c8g.4xlarge",
-    "m6g.large", "m6g.xlarge", "m6g.2xlarge", "m6g.4xlarge",
-    "m7g.large", "m7g.xlarge", "m7g.2xlarge", "m7g.4xlarge",
-    "m8g.large", "m8g.xlarge", "m8g.2xlarge", "m8g.4xlarge",
+    "c6g.large",
+    "c6g.xlarge",
+    "c6g.2xlarge",
+    "c6g.4xlarge",
+    "c7g.large",
+    "c7g.xlarge",
+    "c7g.2xlarge",
+    "c7g.4xlarge",
+    "c8g.large",
+    "c8g.xlarge",
+    "c8g.2xlarge",
+    "c8g.4xlarge",
+    "m6g.large",
+    "m6g.xlarge",
+    "m6g.2xlarge",
+    "m6g.4xlarge",
+    "m7g.large",
+    "m7g.xlarge",
+    "m7g.2xlarge",
+    "m7g.4xlarge",
+    "m8g.large",
+    "m8g.xlarge",
+    "m8g.2xlarge",
+    "m8g.4xlarge",
 ]
 
 PRESETS = {
@@ -197,7 +264,7 @@ def observed_perf(session: boto3.Session, refs: list[str], max_files: int) -> di
         if not isinstance(lps, (int, float)) or lps <= 0:
             continue
         all_vals.append(float(lps))
-        inst = (((js.get("worker_metadata") or {}).get("ec2") or {}).get("instanceType"))
+        inst = ((js.get("worker_metadata") or {}).get("ec2") or {}).get("instanceType")
         if inst:
             by_type[str(inst)].append(float(lps))
     return {
@@ -302,20 +369,22 @@ def main() -> int:
             packed_workers = max(1, vcpus // args.worker_vcpus)
             units_per_hour = lps * packed_workers * 3600.0
             cost_per_1m = (price / units_per_hour) * 1_000_000.0 if units_per_hour > 0 else math.nan
-            instance_rows.append({
-                "region": region,
-                "az": az,
-                "instance_type": it,
-                "vcpus": vcpus,
-                "spot_hourly": price,
-                "spot_per_vcpu": price / vcpus,
-                "placement_score": score,
-                "bucket_local": same_bucket,
-                "packed_workers": packed_workers,
-                "units_per_s_per_worker": lps,
-                "observed_n": obs_it.get("n", 0),
-                "estimated_cost_per_1m_units": cost_per_1m,
-            })
+            instance_rows.append(
+                {
+                    "region": region,
+                    "az": az,
+                    "instance_type": it,
+                    "vcpus": vcpus,
+                    "spot_hourly": price,
+                    "spot_per_vcpu": price / vcpus,
+                    "placement_score": score,
+                    "bucket_local": same_bucket,
+                    "packed_workers": packed_workers,
+                    "units_per_s_per_worker": lps,
+                    "observed_n": obs_it.get("n", 0),
+                    "estimated_cost_per_1m_units": cost_per_1m,
+                }
+            )
 
     ok_regions = [r for r in region_rows if r.get("ok")]
     cap0 = args.target_vcpus[-1]
@@ -359,7 +428,9 @@ def main() -> int:
     print("\nTOP INSTANCE POOLS BY ESTIMATED $/1M UNITS")
     print("region           az              type          score  $/hr    vcpu workers units/s  $/1M")
     for r in instance_rows[: args.top_instance_rows]:
-        print(f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('placement_score')):>5s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_cost_per_1m_units']:.3f}")
+        print(
+            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('placement_score')):>5s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_cost_per_1m_units']:.3f}"
+        )
     return 0
 
 

@@ -24,6 +24,8 @@ jobs:
           cache: pip
       - name: Install package and dev tools
         run: python -m pip install --constraint requirements-dev.lock -e '.[dev]'
+      - name: Format check
+        run: python -m ruff format --check .
       - name: Lint
         run: python -m ruff check .
       - name: Type check

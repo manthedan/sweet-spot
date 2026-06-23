@@ -40,9 +40,7 @@ class RunTaskTests(unittest.TestCase):
             "done_s3": "s3://bucket/run/done/already-done.done.json",
         }
         marker = {"schema": "spotbatch.done_marker.v1", "run_id": "run-1", "task_id": "already-done", "output_s3": ""}
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=True), \
-             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=True), mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
             result = run_task(task, s3=object(), work_root=Path(tmp))
         self.assertEqual(result["event"], "skip_existing_done")
 
@@ -61,10 +59,12 @@ class RunTaskTests(unittest.TestCase):
             "summary_s3": "s3://bucket/run/summaries/task-1.summary.json",
             "done_s3": "s3://bucket/run/done/task-1.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_file") as upload_file, \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_file") as upload_file,
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
+        ):
             with self.assertRaisesRegex(RuntimeError, "expected output file was not produced"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
@@ -102,11 +102,13 @@ class RunTaskTests(unittest.TestCase):
             "output_s3": "s3://bucket/run/shards/a_b.txt",
             "done_s3": "s3://bucket/run/done/a_b.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_file", side_effect=capture_file), \
-             mock.patch("spotbatch.worker.s3_upload_text"), \
-             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_file", side_effect=capture_file),
+            mock.patch("spotbatch.worker.s3_upload_text"),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True),
+        ):
             # This is the stale path the previous implementation would have reused for both ids.
             stale_dir = Path(tmp) / "a_b"
             stale_dir.mkdir()
@@ -134,9 +136,7 @@ class RunTaskTests(unittest.TestCase):
             "summary_s3": "s3://bucket/run/summaries/slow.summary.json",
             "done_s3": "s3://bucket/run/done/slow.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False), mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text):
             with self.assertRaises(subprocess.TimeoutExpired):
                 run_task(task, s3=object(), work_root=Path(tmp), default_timeout_seconds=0.05)
 
@@ -158,10 +158,12 @@ class RunTaskTests(unittest.TestCase):
         def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
             text_uploads.append((uri, json.loads(text)))
 
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
-             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True),
+        ):
             work_root = Path(tmp) / "missing-work-root"
             result = run_task(task, s3=object(), work_root=work_root)
             self.assertTrue(work_root.is_dir())
@@ -183,8 +185,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "pass"],
             "done_s3": "s3://bucket/run/done/missing-schema.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "task schema"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
@@ -196,8 +197,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "pass"],
             "done_s3": "s3://evil-bucket/runs/r1/done/bad.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists") as exists:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists") as exists:
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
             exists.assert_not_called()
@@ -210,8 +210,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "print('s3://evil-bucket/runs/r1/input')"],
             "done_s3": "s3://bucket/runs/r1/done/bad-s3-prefix.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
@@ -224,8 +223,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "pass"],
             "done_s3": "s3://bucket/run/done/bad-timeout.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "positive finite"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
@@ -237,8 +235,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "print('s3://bucket/runs/r1/input; aws s3 cp s3://evil-bucket/secret -')"],
             "done_s3": "s3://bucket/runs/r1/done/mixed-s3-prefix.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
@@ -250,8 +247,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "print('--inputs=s3://bucket/runs/r1/input,s3://evil-bucket/secret')"],
             "done_s3": "s3://bucket/runs/r1/done/adjacent-s3-prefix.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
@@ -263,8 +259,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "print('aws s3 sync s3://evil-bucket/ /tmp/in')"],
             "done_s3": "s3://bucket/runs/r1/done/bucket-root-s3-prefix.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
@@ -276,8 +271,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "print('s3://bucket/runs/r1.')"],
             "done_s3": "s3://bucket/runs/r1/done/sibling-dot-s3-prefix.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
@@ -289,8 +283,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "print('s3://bucket/runs/r1,secret')"],
             "done_s3": "s3://bucket/runs/r1/done/sibling-comma-s3-prefix.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
@@ -312,11 +305,13 @@ class RunTaskTests(unittest.TestCase):
         import io
 
         out = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
-             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True), \
-             contextlib.redirect_stdout(out):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True),
+            contextlib.redirect_stdout(out),
+        ):
             result = run_task(task, s3=object(), work_root=Path(tmp), log_tail_bytes=16, max_log_bytes=20, redact_regexes=[r"token=\w+"])
 
         self.assertEqual(result["event"], "processed")
@@ -349,11 +344,13 @@ class RunTaskTests(unittest.TestCase):
         import io
 
         out = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
-             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True), \
-             contextlib.redirect_stdout(out):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True),
+            contextlib.redirect_stdout(out),
+        ):
             run_task(task, s3=object(), work_root=Path(tmp), log_tail_bytes=9000, max_log_bytes=9000, redact_regexes=[r"ABCDEF"])
 
         self.assertNotIn("ABCDEF", out.getvalue())
@@ -380,11 +377,13 @@ class RunTaskTests(unittest.TestCase):
         import io
 
         out = io.StringIO()
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
-             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True), \
-             contextlib.redirect_stdout(out):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True),
+            contextlib.redirect_stdout(out),
+        ):
             run_task(task, s3=object(), work_root=Path(tmp), log_tail_bytes=2000, max_log_bytes=2000, redact_regexes=[r"token=\S+"])
 
         self.assertIn("stream-redaction-window-exceeded", out.getvalue())
@@ -402,8 +401,7 @@ class RunTaskTests(unittest.TestCase):
             "command": [sys.executable, "-c", "pass"],
             "done_s3": "s3://bucket/run/done/too-long.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "SQS 12h visibility"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
@@ -416,8 +414,7 @@ class RunTaskTests(unittest.TestCase):
             "env": {"SPOTBATCH_DONE_S3": "s3://evil/done"},
             "done_s3": "s3://bucket/run/done/bad-env.done.json",
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=False):
             with self.assertRaisesRegex(ValueError, "reserved prefix"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
@@ -472,13 +469,17 @@ class RunTaskTests(unittest.TestCase):
             "summary_s3": "",
             "output": {"logical_uri": "s3://bucket/run/shards/race.txt", "uri": winner_output, "size_bytes": 2, "sha256": hashlib.sha256(b"ok").hexdigest()},
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", side_effect=[False, True]), \
-             mock.patch("spotbatch.worker.s3_upload_file"), \
-             mock.patch("spotbatch.worker.s3_upload_text"), \
-             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=False), \
-             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(winner)), \
-             mock.patch("spotbatch.worker.s3_head_object", return_value={"ContentLength": 2, "Metadata": {"sha256": hashlib.sha256(b"ok").hexdigest(), "spotbatch-task-hash": task_hash(task), "spotbatch-attempt-id": "winner"}}):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("spotbatch.worker.s3_exists", side_effect=[False, True]),
+            mock.patch("spotbatch.worker.s3_upload_file"),
+            mock.patch("spotbatch.worker.s3_upload_text"),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=False),
+            mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(winner)),
+            mock.patch(
+                "spotbatch.worker.s3_head_object", return_value={"ContentLength": 2, "Metadata": {"sha256": hashlib.sha256(b"ok").hexdigest(), "spotbatch-task-hash": task_hash(task), "spotbatch-attempt-id": "winner"}}
+            ),
+        ):
             result = run_task(task, s3=object(), work_root=Path(tmp))
         self.assertEqual(result["event"], "commit_lost_existing_done")
         self.assertEqual(result["winning_attempt_id"], "winner")
@@ -502,9 +503,7 @@ class RunTaskTests(unittest.TestCase):
             "output_s3": task["output_s3"],
             "output": {"logical_uri": task["output_s3"], "uri": "s3://bucket/other/object", "size_bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()},
         }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=True), \
-             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=True), mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
             with self.assertRaisesRegex(ValueError, "output uri"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
@@ -517,23 +516,15 @@ class RunTaskTests(unittest.TestCase):
             "done_s3": "s3://bucket/run/done/stale.done.json",
         }
         marker = {"schema": "spotbatch.done_marker.v2", "run_id": "run-1", "task_id": "stale", "task_hash": "0" * 64, "done_s3": task["done_s3"], "output_s3": ""}
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=True), \
-             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("spotbatch.worker.s3_exists", return_value=True), mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
             with self.assertRaisesRegex(ValueError, "task_hash mismatch"):
                 run_task(task, s3=object(), work_root=Path(tmp))
 
     def test_successful_task_cleans_up_background_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "background-ran"
-            child = (
-                "import pathlib, sys, time; "
-                "time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('alive')"
-            )
-            parent = (
-                "import subprocess, sys; "
-                "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])"
-            )
+            child = "import pathlib, sys, time; " "time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('alive')"
+            parent = "import subprocess, sys; " "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])"
             task = {
                 "schema": "spotbatch.task.v1",
                 "run_id": "run-1",
@@ -541,9 +532,7 @@ class RunTaskTests(unittest.TestCase):
                 "command": [sys.executable, "-c", parent, child, str(marker)],
                 "done_s3": "s3://bucket/run/done/background.done.json",
             }
-            with mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-                 mock.patch("spotbatch.worker.s3_upload_text"), \
-                 mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
+            with mock.patch("spotbatch.worker.s3_exists", return_value=False), mock.patch("spotbatch.worker.s3_upload_text"), mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
                 run_task(task, s3=object(), work_root=Path(tmp), default_timeout_seconds=2)
             time.sleep(0.7)
             self.assertFalse(marker.exists())
@@ -551,16 +540,8 @@ class RunTaskTests(unittest.TestCase):
     def test_timeout_kills_subprocess_group_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "grandchild-ran"
-            grandchild = (
-                "import pathlib, signal, sys, time; "
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('alive')"
-            )
-            parent = (
-                "import subprocess, sys, time; "
-                "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
-                "time.sleep(5)"
-            )
+            grandchild = "import pathlib, signal, sys, time; " "signal.signal(signal.SIGTERM, signal.SIG_IGN); " "time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('alive')"
+            parent = "import subprocess, sys, time; " "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); " "time.sleep(5)"
             task = {
                 "schema": "spotbatch.task.v1",
                 "run_id": "run-1",
