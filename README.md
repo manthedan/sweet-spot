@@ -80,6 +80,7 @@ SPOTBATCH_RUN_ID
 SPOTBATCH_TASK_HASH       stable hash of the task fields committed by the worker
 SPOTBATCH_ATTEMPT_ID      immutable execution attempt id
 SPOTBATCH_OUTPUT_PATH     local path to write if output_s3 should be uploaded by framework
+SPOTBATCH_METRICS_PATH    optional JSON metrics file written by the command for cost telemetry
 SPOTBATCH_OUTPUT_S3       attempt-scoped S3 URI used by this execution
 SPOTBATCH_SUMMARY_S3      attempt-scoped S3 URI used by this execution
 SPOTBATCH_DONE_S3         canonical conditional done marker URI
@@ -97,6 +98,8 @@ For production, set `SPOTBATCH_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix
 Finalization is streaming and scale-oriented: `spotbatch finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
 
 Worker observability is on by default: child stdout/stderr are streamed to container logs for CloudWatch, a bounded redacted tail is stored in the task summary, and capped redacted attempt logs are uploaded to S3. Use `--log-tail-bytes`, `--max-log-bytes`, and repeatable `--redact-regex` on `worker`, `submit-workers`, or `supervise-workers` for sensitive workloads. Redaction is applied per newline-terminated log record; overlong unterminated records are suppressed with a placeholder rather than risk leaking a partial secret.
+
+For measured cost optimization, tasks may write a JSON object to `SPOTBATCH_METRICS_PATH`, for example `{"completed_units": 100000, "useful_compute_seconds": 3600, "input_bytes": 1048576, "output_bytes": 524288}`. The worker includes this under `summary.telemetry` together with instance/architecture/Region/AZ/image best-effort metadata, SQS receive count/retry status, startup delay from SQS sent timestamp, bytes transferred, interruption/failure status, and discarded compute seconds. `spotbatch-spot-scout --observed-summaries ...` consumes these summaries to rank pools by expected total cost, not only Spot price.
 
 Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much shorter shards, and checkpoint/split work that cannot fit safely under the default 11-hour cap.
 
@@ -201,9 +204,14 @@ spotbatch-spot-scout \
   --preset x86 \
   --regions us-west-2 us-east-2 eu-north-1 \
   --target-vcpus 256 512 \
-  --bucket my-data-bucket
+  --bucket my-data-bucket \
+  --observed-summaries artifacts/hello-001/summaries \
+  --startup-overhead-seconds 90 \
+  --cross-region-gb-per-1m-units 2 \
+  --nat-gb-per-1m-units 0 \
+  --json-out artifacts/hello-001/spot_scout.json
 
-# multi-lane dry-run submitter
+# multi-lane dry-run submitter; lanes with expected_total_cost_per_1m_units are allocated cheapest-first among eligible placement scores
 spotbatch-lane-manager --config lanes.json
 ```
 

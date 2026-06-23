@@ -4,7 +4,10 @@
 This combines three signals:
 - EC2 Spot placement score for requested vCPU targets.
 - Recent Spot price history by instance type/AZ.
-- Optional observed completed-units/sec from worker summary JSON.
+- Optional observed throughput/retry/discard telemetry from worker summary JSON.
+
+Ranking uses expected total cost per useful unit: Spot compute plus replay,
+startup overhead, and caller-supplied non-compute costs.
 
 It does not submit jobs or mutate AWS resources.
 """
@@ -259,19 +262,70 @@ def iter_summary_jsons(session: boto3.Session, refs: list[str], max_files: int) 
 def observed_perf(session: boto3.Session, refs: list[str], max_files: int) -> dict[str, Any]:
     by_type: dict[str, list[float]] = defaultdict(list)
     all_vals: list[float] = []
+    attempts = 0
+    retry_attempts = 0
+    useful_compute = 0.0
+    discarded_compute = 0.0
+    bytes_transferred = 0.0
     for js in iter_summary_jsons(session, refs, max_files):
-        lps = js.get("units_per_s") or js.get("completed_units_per_s") or js.get("labels_per_s")
-        if not isinstance(lps, (int, float)) or lps <= 0:
-            continue
-        all_vals.append(float(lps))
-        inst = ((js.get("worker_metadata") or {}).get("ec2") or {}).get("instanceType")
-        if inst:
-            by_type[str(inst)].append(float(lps))
+        attempts += 1
+        telemetry_raw = js.get("telemetry")
+        telemetry: dict[str, Any] = telemetry_raw if isinstance(telemetry_raw, dict) else {}
+        returncode = js.get("returncode")
+        successful_useful_attempt = returncode in (None, 0) and not js.get("timed_out") and not js.get("framework_error") and js.get("commit_status") != "lost"
+        lps = js.get("units_per_s") or js.get("completed_units_per_s") or js.get("labels_per_s") or telemetry.get("units_per_second")
+        completed_units = telemetry.get("completed_units")
+        useful_sec = telemetry.get("useful_compute_seconds")
+        if (not isinstance(lps, (int, float)) or lps <= 0) and isinstance(completed_units, (int, float)) and isinstance(useful_sec, (int, float)) and useful_sec > 0:
+            lps = float(completed_units) / float(useful_sec)
+        if successful_useful_attempt and isinstance(lps, (int, float)) and lps > 0:
+            all_vals.append(float(lps))
+            inst = telemetry.get("instance_type") or ((js.get("worker_metadata") or {}).get("ec2") or {}).get("instanceType")
+            if inst:
+                by_type[str(inst)].append(float(lps))
+        if telemetry.get("retry"):
+            retry_attempts += 1
+        if successful_useful_attempt and isinstance(useful_sec, (int, float)):
+            useful_compute += max(0.0, float(useful_sec))
+        discarded = telemetry.get("discarded_compute_seconds")
+        if isinstance(discarded, (int, float)):
+            discarded_compute += max(0.0, float(discarded))
+        transferred = telemetry.get("bytes_transferred")
+        if isinstance(transferred, (int, float)):
+            bytes_transferred += max(0.0, float(transferred))
+    observed_replay_fraction = discarded_compute / useful_compute if useful_compute > 0 else 0.0
     return {
         "global_median_units_per_s": statistics.median(all_vals) if all_vals else None,
         "by_instance_type": {k: {"n": len(v), "median_units_per_s": statistics.median(v)} for k, v in sorted(by_type.items())},
         "count": len(all_vals),
+        "attempt_count": attempts,
+        "retry_fraction": retry_attempts / attempts if attempts else 0.0,
+        "discarded_compute_seconds": discarded_compute,
+        "useful_compute_seconds": useful_compute,
+        "observed_replay_fraction": observed_replay_fraction,
+        "bytes_transferred": bytes_transferred,
     }
+
+
+def noncompute_cost_per_1m_units(args: argparse.Namespace, *, bucket_local: bool | None) -> float:
+    transfer_gb = max(0.0, args.cross_region_gb_per_1m_units)
+    if bucket_local is True:
+        transfer_gb = 0.0
+    return (
+        max(0.0, args.extra_cost_per_1m_units)
+        + transfer_gb * max(0.0, args.cross_region_cost_per_gb)
+        + max(0.0, args.nat_gb_per_1m_units) * max(0.0, args.nat_cost_per_gb)
+        + max(0.0, args.cloudwatch_log_gb_per_1m_units) * max(0.0, args.cloudwatch_log_cost_per_gb)
+        + max(0.0, args.s3_storage_gb_month_per_1m_units) * max(0.0, args.s3_storage_cost_per_gb_month)
+    )
+
+
+def expected_cost_per_1m_units(*, hourly_price: float, units_per_hour: float, replay_fraction: float, startup_overhead_seconds: float, useful_task_seconds: float, noncompute_per_1m: float) -> float:
+    if units_per_hour <= 0:
+        return math.nan
+    compute = (hourly_price / units_per_hour) * 1_000_000.0
+    startup_fraction = max(0.0, startup_overhead_seconds) / max(1.0, useful_task_seconds)
+    return compute * (1.0 + max(0.0, replay_fraction) + startup_fraction) + max(0.0, noncompute_per_1m)
 
 
 def instance_vcpus(ec2, instance_types: list[str]) -> dict[str, int]:
@@ -307,6 +361,18 @@ def main() -> int:
     ap.add_argument("--observed-summaries", nargs="*", default=[], help="Local dirs/files or s3:// prefixes containing *.summary.json")
     ap.add_argument("--max-observed-files", type=int, default=5000)
     ap.add_argument("--top-instance-rows", type=int, default=20)
+    ap.add_argument("--expected-replay-fraction", type=float, default=None, help="Override observed discarded/useful compute fraction for retries/interruption replay")
+    ap.add_argument("--startup-overhead-seconds", type=float, default=0.0, help="Expected worker startup/queue overhead amortized per task")
+    ap.add_argument("--useful-task-seconds", type=float, default=3600.0, help="Expected useful task duration used to amortize startup overhead")
+    ap.add_argument("--extra-cost-per-1m-units", type=float, default=0.0, help="Known extra non-compute cost per 1M useful units")
+    ap.add_argument("--cross-region-gb-per-1m-units", type=float, default=0.0)
+    ap.add_argument("--cross-region-cost-per-gb", type=float, default=0.02)
+    ap.add_argument("--nat-gb-per-1m-units", type=float, default=0.0)
+    ap.add_argument("--nat-cost-per-gb", type=float, default=0.045)
+    ap.add_argument("--cloudwatch-log-gb-per-1m-units", type=float, default=0.0)
+    ap.add_argument("--cloudwatch-log-cost-per-gb", type=float, default=0.50)
+    ap.add_argument("--s3-storage-gb-month-per-1m-units", type=float, default=0.0)
+    ap.add_argument("--s3-storage-cost-per-gb-month", type=float, default=0.023)
     ap.add_argument("--json-out", type=Path)
     args = ap.parse_args()
 
@@ -328,6 +394,7 @@ def main() -> int:
     scores = placement_scores(ec2_home, regions, instance_types, args.target_vcpus)
     obs = observed_perf(session, args.observed_summaries, args.max_observed_files) if args.observed_summaries else {"count": 0, "by_instance_type": {}, "global_median_units_per_s": None}
     fallback_lps = obs.get("global_median_units_per_s") or args.default_units_per_s
+    replay_fraction = args.expected_replay_fraction if args.expected_replay_fraction is not None else float(obs.get("observed_replay_fraction") or 0.0)
 
     region_rows = []
     instance_rows = []
@@ -358,6 +425,7 @@ def main() -> int:
             "median_per_vcpu": statistics.median(per_vcpu),
             "min_hourly": min(prices),
             "median_hourly": statistics.median(prices),
+            "noncompute_cost_per_1m_units": noncompute_cost_per_1m_units(args, bucket_local=same_bucket),
         }
         region_rows.append(row)
         for (it, az), price in price_map.items():
@@ -368,7 +436,16 @@ def main() -> int:
             lps = obs_it.get("median_units_per_s") or fallback_lps
             packed_workers = max(1, vcpus // args.worker_vcpus)
             units_per_hour = lps * packed_workers * 3600.0
-            cost_per_1m = (price / units_per_hour) * 1_000_000.0 if units_per_hour > 0 else math.nan
+            compute_cost_per_1m = (price / units_per_hour) * 1_000_000.0 if units_per_hour > 0 else math.nan
+            noncompute_per_1m = noncompute_cost_per_1m_units(args, bucket_local=same_bucket)
+            total_cost_per_1m = expected_cost_per_1m_units(
+                hourly_price=price,
+                units_per_hour=units_per_hour,
+                replay_fraction=replay_fraction,
+                startup_overhead_seconds=args.startup_overhead_seconds,
+                useful_task_seconds=args.useful_task_seconds,
+                noncompute_per_1m=noncompute_per_1m,
+            )
             instance_rows.append(
                 {
                     "region": region,
@@ -382,7 +459,10 @@ def main() -> int:
                     "packed_workers": packed_workers,
                     "units_per_s_per_worker": lps,
                     "observed_n": obs_it.get("n", 0),
-                    "estimated_cost_per_1m_units": cost_per_1m,
+                    "estimated_compute_cost_per_1m_units": compute_cost_per_1m,
+                    "expected_total_cost_per_1m_units": total_cost_per_1m,
+                    "noncompute_cost_per_1m_units": noncompute_per_1m,
+                    "expected_replay_fraction": replay_fraction,
                 }
             )
 
@@ -396,7 +476,7 @@ def main() -> int:
         return float(scores.get(str(cap0)) or -1)
 
     ok_regions.sort(key=lambda r: (-region_placement_score(r), r["median_per_vcpu"], not bool(r.get("bucket_local"))))
-    instance_rows.sort(key=lambda r: (-(r.get("placement_score") or -1), r["estimated_cost_per_1m_units"], not bool(r.get("bucket_local"))))
+    instance_rows.sort(key=lambda r: (r["expected_total_cost_per_1m_units"], -(r.get("placement_score") or -1), not bool(r.get("bucket_local"))))
 
     report = {
         "schema": "spotbatch.spot_scout.v1",
@@ -409,6 +489,20 @@ def main() -> int:
         "target_vcpus": args.target_vcpus,
         "worker_vcpus": args.worker_vcpus,
         "observed_perf": obs,
+        "cost_model": {
+            "expected_replay_fraction": replay_fraction,
+            "startup_overhead_seconds": args.startup_overhead_seconds,
+            "useful_task_seconds": args.useful_task_seconds,
+            "extra_cost_per_1m_units": args.extra_cost_per_1m_units,
+            "cross_region_gb_per_1m_units": args.cross_region_gb_per_1m_units,
+            "cross_region_cost_per_gb": args.cross_region_cost_per_gb,
+            "nat_gb_per_1m_units": args.nat_gb_per_1m_units,
+            "nat_cost_per_gb": args.nat_cost_per_gb,
+            "cloudwatch_log_gb_per_1m_units": args.cloudwatch_log_gb_per_1m_units,
+            "cloudwatch_log_cost_per_gb": args.cloudwatch_log_cost_per_gb,
+            "s3_storage_gb_month_per_1m_units": args.s3_storage_gb_month_per_1m_units,
+            "s3_storage_cost_per_gb_month": args.s3_storage_cost_per_gb_month,
+        },
         "regions": region_rows,
         "top_instance_pools": instance_rows[: max(0, args.top_instance_rows)],
     }
@@ -425,11 +519,11 @@ def main() -> int:
         placement_scores_obj = r.get("placement_scores")
         score = placement_scores_obj.get(str(cap0)) if isinstance(placement_scores_obj, dict) else None
         print(f"{r['region']:15s} {str(r.get('bucket_local')):5s} {str(score):>5s} {r['pools']:6d}  ${r['min_per_vcpu']:.4f}   ${r['median_per_vcpu']:.4f}")
-    print("\nTOP INSTANCE POOLS BY ESTIMATED $/1M UNITS")
-    print("region           az              type          score  $/hr    vcpu workers units/s  $/1M")
+    print("\nTOP INSTANCE POOLS BY EXPECTED TOTAL $/1M UNITS")
+    print("region           az              type          score  $/hr    vcpu workers units/s compute$/1M total$/1M")
     for r in instance_rows[: args.top_instance_rows]:
         print(
-            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('placement_score')):>5s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_cost_per_1m_units']:.3f}"
+            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('placement_score')):>5s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_compute_cost_per_1m_units']:.3f} ${r['expected_total_cost_per_1m_units']:.3f}"
         )
     return 0
 
