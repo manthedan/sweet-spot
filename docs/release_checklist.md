@@ -15,10 +15,10 @@ This checklist is for SweetSpot releases. The public CLI, import package, schema
    - OpenTofu validation
    - container build/SBOM/provenance/Trivy scan
 
-3. Verify the workflow still scans and uploads the same OCI artifact path:
-   - build output: `/tmp/sweetspot-worker.oci.tar`
-   - Trivy input: `/tmp/sweetspot-worker.oci.tar`
-   - uploaded artifact path: `/tmp/sweetspot-worker.oci.tar`
+3. Verify the workflow still scans and uploads the same OCI directory artifact path:
+   - build output: `/tmp/sweetspot-worker.oci`
+   - Trivy input: `/tmp/sweetspot-worker.oci`
+   - uploaded artifact path: `/tmp/sweetspot-worker.oci`
 
 4. Check supply-chain pins:
    - GitHub Actions are full commit SHAs, with version comments for maintainability.
