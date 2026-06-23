@@ -153,6 +153,9 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     canary_tasks = [dict(tasks[i]) for i in selected]
     if args.rewrite_run_id:
+        marker_fields = ("output_s3", "summary_s3", "done_s3")
+        if any(any(task.get(k) for k in marker_fields) for task in canary_tasks):
+            raise SystemExit("--rewrite-run-id requires tasks without explicit output_s3/summary_s3/done_s3 markers; derive new tasks with canary S3 paths first")
         for task in canary_tasks:
             task["run_id"] = args.run_id
     selected_run_ids = sorted({str(t.get("run_id")) for t in canary_tasks if t.get("run_id") is not None})
