@@ -319,7 +319,14 @@ def main() -> int:
 
     ok_regions = [r for r in region_rows if r.get("ok")]
     cap0 = args.target_vcpus[-1]
-    ok_regions.sort(key=lambda r: (-(r["placement_scores"].get(str(cap0)) or -1), r["median_per_vcpu"], not bool(r.get("bucket_local"))))
+
+    def region_placement_score(row: dict[str, Any]) -> float:
+        scores = row.get("placement_scores")
+        if not isinstance(scores, dict):
+            return -1.0
+        return float(scores.get(str(cap0)) or -1)
+
+    ok_regions.sort(key=lambda r: (-region_placement_score(r), r["median_per_vcpu"], not bool(r.get("bucket_local"))))
     instance_rows.sort(key=lambda r: (-(r.get("placement_score") or -1), r["estimated_cost_per_1m_units"], not bool(r.get("bucket_local"))))
 
     report = {
@@ -346,7 +353,8 @@ def main() -> int:
     print("\nREGION RANK")
     print("region           local score  pools  min$/vcpu med$/vcpu")
     for r in ok_regions[:20]:
-        score = r["placement_scores"].get(str(cap0))
+        placement_scores_obj = r.get("placement_scores")
+        score = placement_scores_obj.get(str(cap0)) if isinstance(placement_scores_obj, dict) else None
         print(f"{r['region']:15s} {str(r.get('bucket_local')):5s} {str(score):>5s} {r['pools']:6d}  ${r['min_per_vcpu']:.4f}   ${r['median_per_vcpu']:.4f}")
     print("\nTOP INSTANCE POOLS BY ESTIMATED $/1M UNITS")
     print("region           az              type          score  $/hr    vcpu workers units/s  $/1M")

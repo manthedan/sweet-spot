@@ -244,7 +244,10 @@ def _load_done_marker(s3, done_s3: str) -> dict[str, Any] | None:
 
 def _head_matches_output_marker(s3, output: dict[str, Any], *, expected_uri: str, expected_task_hash: str, expected_attempt_id: str) -> None:
     uri = str(output.get("uri") or "")
-    expected_size = int(output.get("size_bytes"))
+    size_raw = output.get("size_bytes")
+    if not isinstance(size_raw, int | str):
+        raise ValueError("done marker output must include size_bytes")
+    expected_size = int(size_raw)
     expected_sha = str(output.get("sha256") or "")
     if not uri or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
         raise ValueError("done marker output must include uri and sha256")
@@ -258,8 +261,10 @@ def _head_matches_output_marker(s3, output: dict[str, Any], *, expected_uri: str
         if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
             raise ValueError("done marker output is missing") from exc
         raise
-    actual_size = int(head.get("ContentLength", expected_size))
-    metadata = {str(k).lower(): str(v) for k, v in (head.get("Metadata") or {}).items()}
+    content_length = head.get("ContentLength", expected_size)
+    actual_size = int(content_length) if isinstance(content_length, int | str) else expected_size
+    metadata_raw = head.get("Metadata") or {}
+    metadata = {str(k).lower(): str(v) for k, v in metadata_raw.items()} if isinstance(metadata_raw, dict) else {}
     actual_sha = metadata.get("sha256")
     if actual_size != expected_size:
         raise ValueError(f"done marker output size mismatch for {uri}: marker={expected_size} s3={actual_size}")

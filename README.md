@@ -44,7 +44,13 @@ Chess/Stockfish workflows live under `examples/`.
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install -e .
+pip install --constraint requirements.lock -e .
+
+# optional local closeout checks used by CI
+pip install --constraint requirements-dev.lock -e '.[dev]'
+ruff check .
+mypy spotbatch
+python -m unittest discover -s tests -v
 ```
 
 ## Minimal task schema
@@ -204,12 +210,16 @@ spotbatch-lane-manager --config lanes.json
 
 `infra/opentofu/` creates:
 
-- SQS work queue + DLQ
+- SQS work queue + DLQ with SSE enabled, longer DLQ retention, and a by-source-queue redrive allow policy
 - AWS Batch Spot compute environment and queue
 - optional On-Demand repair queue
 - least-privilege IAM roles scoped to the work queue and configured S3 bucket/prefixes
+- a no-ingress Batch security group by default, plus an IMDSv2-required encrypted-root launch template
 - generic worker job definition with runtime S3-prefix validation
 - CloudWatch dashboard and baseline alarms for queue age, DLQ depth, Batch failures, and runnable-job stalls
+- optional monthly AWS Budget alerts
+
+Runtime and dev dependency lock files (`requirements.lock`, `requirements-dev.lock`) pin the Python dependency graph used by Docker and CI. The worker Dockerfile pins its Python base image by digest and drops to an unprivileged `spotbatch` user. CI runs unit tests, linting, typing, OpenTofu lock/fmt/validate checks, and a container build with SBOM/provenance attestations plus Trivy scanning.
 
 See `infra/opentofu/README.md`.
 

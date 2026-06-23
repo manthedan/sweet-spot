@@ -29,3 +29,15 @@ output "cloudwatch_dashboard_name" {
 output "cloudwatch_log_group" {
   value = aws_cloudwatch_log_group.batch.name
 }
+
+output "batch_security_group_ids" {
+  value = local.security_group_ids
+}
+
+output "batch_launch_template_id" {
+  value = aws_launch_template.batch.id
+}
+
+output "monthly_budget_name" {
+  value = var.monthly_budget_limit_usd > 0 ? aws_budgets_budget.monthly[0].name : null
+}

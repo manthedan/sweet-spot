@@ -72,13 +72,13 @@ Goal: make finalization and cleanup scale and make cost claims defensible.
 
 Goal: make the infrastructure demonstrably reproducible and safer by default.
 
-- [ ] Add CI for tests, linting, typing, `tofu fmt`, `tofu validate`, and provider-lock verification.
-- [ ] Commit the OpenTofu provider lock file and constrain provider versions.
-- [ ] Pin Python dependencies and base image digest.
-- [ ] Run worker containers as an unprivileged user.
-- [ ] Add image provenance/SBOM generation and container scanning.
-- [ ] Provide a production topology option with dedicated no-ingress security group, explicit subnet mode, IMDSv2, encryption, cost tags, budget ceiling, and automatic teardown guidance.
-- [ ] Set DLQ retention longer than source queue retention and narrow the redrive allow policy.
+- [x] Add CI for tests, linting, typing, `tofu fmt`, `tofu validate`, and provider-lock verification.
+- [x] Commit the OpenTofu provider lock file and constrain provider versions.
+- [x] Pin Python dependencies and base image digest.
+- [x] Run worker containers as an unprivileged user.
+- [x] Add image provenance/SBOM generation and container scanning.
+- [x] Provide a production topology option with dedicated no-ingress security group, explicit subnet mode, IMDSv2, encryption, cost tags, budget ceiling, and automatic teardown guidance.
+- [x] Set DLQ retention longer than source queue retention and narrow the redrive allow policy.
 
 ## Milestone 7 — measured cost-optimization proof
 

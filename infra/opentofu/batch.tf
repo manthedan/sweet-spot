@@ -20,9 +20,25 @@ resource "aws_batch_compute_environment" "spot" {
     subnets             = local.subnet_ids
     security_group_ids  = local.security_group_ids
     instance_role       = aws_iam_instance_profile.ecs_instance.arn
+
+    launch_template {
+      launch_template_id = aws_launch_template.batch.id
+      version            = "$Latest"
+    }
   }
 
   tags = local.tags
+
+  lifecycle {
+    precondition {
+      condition     = !var.require_explicit_subnets || length(var.subnet_ids) > 0
+      error_message = "require_explicit_subnets=true requires non-empty subnet_ids."
+    }
+    precondition {
+      condition     = var.sqs_dlq_message_retention_seconds > var.sqs_message_retention_seconds
+      error_message = "sqs_dlq_message_retention_seconds must be greater than sqs_message_retention_seconds."
+    }
+  }
 }
 
 resource "aws_batch_job_queue" "spot" {
@@ -51,6 +67,11 @@ resource "aws_batch_compute_environment" "ondemand" {
     subnets            = local.subnet_ids
     security_group_ids = local.security_group_ids
     instance_role      = aws_iam_instance_profile.ecs_instance.arn
+
+    launch_template {
+      launch_template_id = aws_launch_template.batch.id
+      version            = "$Latest"
+    }
   }
 
   tags = local.tags

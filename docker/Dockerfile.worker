@@ -1,12 +1,25 @@
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca
+
+ARG APP_UID=10001
+ARG APP_GID=10001
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/spotbatch
+
+RUN groupadd --gid "${APP_GID}" spotbatch \
+    && useradd --uid "${APP_UID}" --gid spotbatch --home-dir /home/spotbatch --no-create-home --shell /usr/sbin/nologin spotbatch \
+    && mkdir -p /home/spotbatch /work \
+    && chown -R spotbatch:spotbatch /home/spotbatch /work
 
 WORKDIR /app
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml README.md requirements.lock /app/
 COPY spotbatch /app/spotbatch
 COPY examples /app/examples
-RUN pip install --no-cache-dir /app
+
+RUN python -m pip install --no-cache-dir --constraint /app/requirements.lock /app
+
+USER spotbatch:spotbatch
+WORKDIR /work
 
 CMD ["spotbatch", "worker"]

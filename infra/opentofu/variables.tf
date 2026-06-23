@@ -23,8 +23,20 @@ variable "subnet_ids" {
 
 variable "security_group_ids" {
   type        = list(string)
-  description = "Security groups for Batch instances. If empty, default VPC SG is used."
+  description = "Security groups for Batch instances. If empty, a no-ingress security group is created by default."
   default     = []
+}
+
+variable "create_no_ingress_security_group" {
+  type        = bool
+  description = "Create and use a dedicated no-ingress security group when security_group_ids is empty. Set false only if you intentionally want the VPC default security group."
+  default     = true
+}
+
+variable "require_explicit_subnets" {
+  type        = bool
+  description = "Fail planning when subnet_ids is empty instead of discovering all subnets in the selected/default VPC. Recommended for production."
+  default     = false
 }
 
 variable "worker_image_uri" {
@@ -105,8 +117,15 @@ variable "sqs_visibility_timeout_seconds" {
 }
 
 variable "sqs_message_retention_seconds" {
-  type    = number
-  default = 1209600
+  type        = number
+  description = "Source work-queue message retention. Keep shorter than sqs_dlq_message_retention_seconds so failed messages remain inspectable after redrive."
+  default     = 1123200
+}
+
+variable "sqs_dlq_message_retention_seconds" {
+  type        = number
+  description = "DLQ retention. Defaults to the SQS maximum and should exceed source queue retention."
+  default     = 1209600
 }
 
 variable "sqs_max_receive_count" {
@@ -160,6 +179,48 @@ variable "runnable_jobs_alarm_evaluation_periods" {
   type        = number
   description = "Evaluation periods before alarming on stalled runnable AWS Batch jobs."
   default     = 30
+}
+
+variable "batch_root_device_name" {
+  type        = string
+  description = "Root block device name used by the Batch ECS-optimized AMI launch template."
+  default     = "/dev/xvda"
+}
+
+variable "batch_root_volume_size_gib" {
+  type        = number
+  description = "Encrypted gp3 root volume size for Batch EC2 instances."
+  default     = 30
+}
+
+variable "ebs_kms_key_id" {
+  type        = string
+  description = "Optional KMS key ID/ARN for encrypted Batch instance root volumes. Empty uses the account default EBS key."
+  default     = ""
+}
+
+variable "monthly_budget_limit_usd" {
+  type        = number
+  description = "Optional AWS Budgets monthly cost ceiling. Set to 0 to disable. Budgets are account-scoped unless you customize outside this module."
+  default     = 0
+}
+
+variable "monthly_budget_alarm_threshold_percent" {
+  type        = number
+  description = "Budget alert threshold as a percentage of monthly_budget_limit_usd."
+  default     = 80
+}
+
+variable "budget_notification_emails" {
+  type        = list(string)
+  description = "Email subscribers for the optional monthly budget alert."
+  default     = []
+}
+
+variable "cost_tags" {
+  type        = map(string)
+  description = "Additional cost-allocation tags merged onto resources after the module's default tags."
+  default     = {}
 }
 
 variable "tags" {

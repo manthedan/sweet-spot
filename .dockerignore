@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+artifacts
+.dist
+dist
+build
+*.egg-info
+infra/opentofu/.terraform
+*.tfstate
+*.tfstate.*
+*.tfplan

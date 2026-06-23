@@ -58,3 +58,9 @@ Finalization and cleanup:
 - The final manifest inlines only a bounded `outputs` sample (`--max-inline-outputs`) and points to the complete outputs manifest.
 - For versioned buckets, cleanup must use `spotbatch s3-delete-prefix --include-versions` or an S3 lifecycle policy that expires noncurrent versions/delete markers; deleting only current keys does not reclaim all storage.
 - Whole-DLQ redrive should use native SQS `StartMessageMoveTask` via `spotbatch dlq --native-redrive --apply` when unfiltered redrive is acceptable. Filtered/manual receive-send-delete redrive remains available for small targeted repairs.
+
+Deployment reproducibility and safety:
+
+- CI is expected to run unit tests, linting, typing, OpenTofu formatting/validation with the committed provider lock, and a worker-image build that emits SBOM/provenance attestations and runs vulnerability scanning.
+- The worker image pins its base image by digest and runs as an unprivileged `spotbatch` user.
+- The OpenTofu module defaults to a no-ingress Batch security group, SQS SSE, IMDSv2-required Batch instances, encrypted root volumes, longer DLQ retention than source retention, and a redrive allow policy restricted to the module's source queue.

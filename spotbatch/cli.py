@@ -1160,7 +1160,9 @@ def cmd_dlq(args: argparse.Namespace) -> int:
         print(json.dumps({"schema": "spotbatch.dlq_redrive_summary.v1", "checked_at": iso_now(), "native_redrive": True, "source_arn": kwargs["SourceArn"], "destination_arn": kwargs.get("DestinationArn"), "task_handle": resp.get("TaskHandle"), "max_messages_per_second": kwargs.get("MaxNumberOfMessagesPerSecond")}, indent=2, sort_keys=True))
         return 0
     scanned = matched = moved = 0
-    by_run: Counter[str] = Counter(); by_schema: Counter[str] = Counter(); examples = []
+    by_run: Counter[str] = Counter()
+    by_schema: Counter[str] = Counter()
+    examples: list[dict[str, Any]] = []
     while scanned < args.max_messages:
         resp = sqs.receive_message(QueueUrl=args.dlq_url, MaxNumberOfMessages=min(10, args.max_messages - scanned), WaitTimeSeconds=args.wait_time, VisibilityTimeout=args.visibility_timeout, AttributeNames=["ApproximateReceiveCount", "SentTimestamp"])
         messages = resp.get("Messages", [])
