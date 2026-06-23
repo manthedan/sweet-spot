@@ -35,3 +35,4 @@ tofu apply -var-file=example.tfvars
 - `create_observability` defaults to true and creates a CloudWatch dashboard plus alarms for work-queue age, DLQ depth, Batch failures, and runnable-job stalls. Set `alarm_sns_topic_arns` to wire notifications.
 - The dashboard includes a Logs Insights widget over structured `spotbatch.worker_event.v1` events emitted by the worker.
 - The reliability contract depends on SQS visibility timeout + deterministic S3 done markers, not Batch retries.
+- For S3 buckets with versioning enabled, pair run prefixes with lifecycle rules that expire noncurrent versions/delete markers, or use `spotbatch s3-delete-prefix --include-versions` for explicit teardown. Deleting current objects only is not a complete cost cleanup on versioned buckets.

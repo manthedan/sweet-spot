@@ -81,11 +81,13 @@ SPOTBATCH_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default:
 
 If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. Successful workers upload output, summaries, and stdout/stderr under attempt-scoped S3 paths, then publish the canonical done marker with a conditional `If-None-Match: *` write. If another duplicate attempt won first, the worker validates the winning marker before deleting the SQS message.
 
-For v2 markers, `output_s3` in the task is the logical output URI used for task hashing; the actual immutable object URI is recorded in the done marker's `output.uri` and in the final manifest `outputs` list.
+For v2 markers, `output_s3` in the task is the logical output URI used for task hashing; the actual immutable object URI is recorded in the done marker's `output.uri` and in finalizer outputs manifests.
 
 Task payloads are validated as `spotbatch.task.v1` before execution: `run_id`, `task_id`, `command`, timeout, env, marker URIs, and S3 URI syntax must pass bounded checks. Task-provided `env` keys may not start with `SPOTBATCH_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
 
 For production, set `SPOTBATCH_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `spotbatch worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be inside one of those prefixes.
+
+Finalization is streaming and scale-oriented: `spotbatch finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
 
 Worker observability is on by default: child stdout/stderr are streamed to container logs for CloudWatch, a bounded redacted tail is stored in the task summary, and capped redacted attempt logs are uploaded to S3. Use `--log-tail-bytes`, `--max-log-bytes`, and repeatable `--redact-regex` on `worker`, `submit-workers`, or `supervise-workers` for sensitive workloads. Redaction is applied per newline-terminated log record; overlong unterminated records are suppressed with a placeholder rather than risk leaking a partial secret.
 
@@ -142,12 +144,13 @@ spotbatch doctor \
   --job-definition my-worker-jobdef:1 \
   --s3-prefix s3://my-bucket/runs/hello-001
 
-# finalize by checking S3 done markers
+# finalize by streaming tasks, checking S3 done markers, and writing manifests
 spotbatch finalize \
   --run-id hello-001 \
   --output-prefix s3://my-bucket/runs/hello-001 \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
   --workers 32 \
+  --use-listing-index \
   --write-repair-jsonl artifacts/hello-001/repair_tasks.jsonl \
   --require-complete
 
@@ -167,15 +170,24 @@ spotbatch logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERRO
 # If --job-id is provided and --log-group is omitted, spotbatch uses the job's awslogs-group when AWS Batch reports it.
 spotbatch watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
 
-# dry-run a guarded S3 prefix cleanup; add --delete and exact --confirm-prefix to mutate
+# dry-run a guarded S3 prefix cleanup; add --delete and exact --confirm-prefix to mutate.
+# Add --include-versions for versioned buckets so old versions and delete markers are included.
 spotbatch s3-delete-prefix \
   --prefix s3://my-bucket/runs/old-run/ \
+  --include-versions \
   --artifact-dir artifacts/old-run/delete-dryrun
 
-# inspect DLQ
+# inspect DLQ; filtered manual redrive is available for small repairs
 spotbatch dlq \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
   --run-id hello-001
+
+# whole-DLQ redrive should use native SQS StartMessageMoveTask where possible
+spotbatch dlq \
+  --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
+  --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --native-redrive \
+  --apply
 
 # read-only Spot scout
 spotbatch-spot-scout \

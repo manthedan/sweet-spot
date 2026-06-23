@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, _worker_overrides, cmd_derive_canary, cmd_doctor, cmd_enqueue_jsonl, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, _worker_overrides, cmd_derive_canary, cmd_dlq, cmd_doctor, cmd_enqueue_jsonl, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
 from spotbatch.worker import task_hash
 
 
@@ -407,6 +407,86 @@ class S3DeletePrefixTests(unittest.TestCase):
                 cmd_s3_delete_prefix(args)
         self.assertFalse(s3.marker_written)
 
+    def test_delete_prefix_can_include_versions_and_delete_markers(self) -> None:
+        class Paginator:
+            def paginate(self, **kwargs):
+                yield {
+                    "Versions": [{"Key": "runs/old-run/a", "VersionId": "v1"}],
+                    "DeleteMarkers": [{"Key": "runs/old-run/a", "VersionId": "d1"}],
+                }
+
+        class S3:
+            def __init__(self) -> None:
+                self.deleted = None
+
+            def get_paginator(self, name):
+                self.name = name
+                return Paginator()
+
+            def delete_objects(self, **kwargs):
+                self.deleted = kwargs["Delete"]["Objects"]
+                return {}
+
+        class Session:
+            def __init__(self, s3):
+                self.s3 = s3
+
+            def client(self, service, region_name=None):
+                return self.s3
+
+        s3 = S3()
+        with tempfile.TemporaryDirectory() as tmp:
+            args = types.SimpleNamespace(
+                prefix="s3://bucket/runs/old-run/",
+                min_prefix_chars=8,
+                delete=True,
+                confirm_prefix="s3://bucket/runs/old-run/",
+                batch_size=1000,
+                include_versions=True,
+                profile=None,
+                region=None,
+                artifact_dir=Path(tmp),
+                completion_marker_s3=None,
+            )
+            with patch("spotbatch.cli.boto3.Session", return_value=Session(s3)), contextlib.redirect_stdout(io.StringIO()):
+                cmd_s3_delete_prefix(args)
+        self.assertEqual(s3.name, "list_object_versions")
+        self.assertEqual(s3.deleted, [{"Key": "runs/old-run/a", "VersionId": "v1"}, {"Key": "runs/old-run/a", "VersionId": "d1"}])
+
+
+class DLQTests(unittest.TestCase):
+    def test_native_redrive_starts_message_move_task(self) -> None:
+        class SQS:
+            def __init__(self) -> None:
+                self.kwargs = None
+
+            def get_queue_attributes(self, *, QueueUrl, AttributeNames):
+                name = QueueUrl.rsplit("/", 1)[-1]
+                return {"Attributes": {"QueueArn": f"arn:aws:sqs:us-west-2:123:{name}"}}
+
+            def start_message_move_task(self, **kwargs):
+                self.kwargs = kwargs
+                return {"TaskHandle": "move-1"}
+
+        sqs = SQS()
+        args = types.SimpleNamespace(
+            dlq_url="https://sqs.us-west-2.amazonaws.com/123/dlq",
+            queue_url="https://sqs.us-west-2.amazonaws.com/123/q",
+            run_id=None,
+            task_id_regex=None,
+            native_redrive=True,
+            max_messages_per_second=50,
+            apply=True,
+        )
+        with patch("spotbatch.cli.boto3.client", return_value=sqs), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cmd_dlq(args), 0)
+        self.assertEqual(sqs.kwargs, {"SourceArn": "arn:aws:sqs:us-west-2:123:dlq", "DestinationArn": "arn:aws:sqs:us-west-2:123:q", "MaxNumberOfMessagesPerSecond": 50})
+
+    def test_native_redrive_rejects_filters(self) -> None:
+        args = types.SimpleNamespace(dlq_url="dlq", queue_url="q", run_id="r1", task_id_regex=None, native_redrive=True, apply=True)
+        with patch("spotbatch.cli.boto3.client"), self.assertRaisesRegex(SystemExit, "whole DLQ"):
+            cmd_dlq(args)
+
 
 class SupervisorPlanningTests(unittest.TestCase):
     def test_supervisor_sizes_to_backlog_when_not_keep_full(self) -> None:
@@ -467,6 +547,21 @@ class FakeFinalizeS3:
         self.deleted.append((Bucket, Key))
         self.objects.pop((Bucket, Key), None)
         return {}
+
+    def upload_file(self, Filename: str, Bucket: str, Key: str, ExtraArgs=None) -> None:
+        with open(Filename, "rb") as f:
+            body = f.read()
+        self.objects[(Bucket, Key)] = {"Body": body, "ContentType": (ExtraArgs or {}).get("ContentType"), "Metadata": (ExtraArgs or {}).get("Metadata", {})}
+
+    def get_paginator(self, name):
+        s3 = self
+
+        class Paginator:
+            def paginate(self, *, Bucket, Prefix):
+                contents = [{"Key": key} for (bucket, key), obj in s3.objects.items() if bucket == Bucket and key.startswith(Prefix)]
+                yield {"Contents": contents}
+
+        return Paginator()
 
 
 class FinalizeTests(unittest.TestCase):
@@ -580,7 +675,7 @@ class FinalizeTests(unittest.TestCase):
             repair_rows = [json.loads(line) for line in (Path(tmp) / "finalizer" / "repair_tasks.jsonl").read_text().splitlines()]
             self.assertEqual(repair_rows[0]["output_s3"], "s3://bucket/runs/r1/shards/task-1.txt")
             self.assertTrue(repair_rows[0]["done_s3"].startswith("s3://bucket/runs/r1/done/task-1.done.json.repair-"))
-            self.assertEqual(manifest["missing_done_count"], 0)
+            self.assertEqual(manifest["missing_done_count"], 1)
             self.assertEqual(manifest["missing_output_count"], 1)
             self.assertFalse(manifest["complete"])
             self.assertNotIn(("bucket", "runs/r1/READY"), s3.objects)
@@ -680,6 +775,131 @@ class FinalizeTests(unittest.TestCase):
                 ["s3://bucket/runs/r1/shards/task-10.txt", "s3://bucket/runs/r1/shards/task-2.txt"],
             )
             self.assertIn(("bucket", "runs/r1/READY"), s3.objects)
+
+    def test_finalize_treats_corrupt_done_marker_as_repairable(self) -> None:
+        s3 = FakeFinalizeS3()
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"not-json"}
+        task = {"run_id": "r1", "task_id": "task-1", "done_s3": "s3://bucket/runs/r1/done/task-1.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=1,
+                progress_interval=0,
+                max_inline_outputs=1000,
+                use_listing_index=False,
+                preload_s3_prefix=[],
+                write_repair_jsonl=None,
+                upload=False,
+                publish_ready=False,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                require_complete=True,
+            )
+            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+                rc = cmd_finalize(args)
+            self.assertEqual(rc, 2)
+            manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
+            self.assertEqual(manifest["done_count"], 0)
+            self.assertEqual(manifest["done_marker_count"], 1)
+            self.assertEqual(manifest["invalid_marker_count"], 1)
+            repair_rows = [json.loads(line) for line in (Path(tmp) / "finalizer" / "repair_tasks.jsonl").read_text().splitlines()]
+            self.assertTrue(repair_rows[0]["done_s3"].startswith(task["done_s3"] + ".repair-"))
+
+    def test_finalize_accepts_valid_repair_done_marker_for_invalid_canonical_marker(self) -> None:
+        s3 = FakeFinalizeS3()
+        task = {"run_id": "r1", "task_id": "task-1", "done_s3": "s3://bucket/runs/r1/done/task-1.done.json"}
+        repair_done = task["done_s3"] + ".repair-abc"
+        repair_task = dict(task)
+        repair_task["done_s3"] = repair_done
+        repair_task["spotbatch_repair_reason"] = "invalid_done_marker"
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"not-json"}
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json.repair-abc")] = {"Body": json.dumps({
+            "schema": "spotbatch.done_marker.v2",
+            "run_id": "r1",
+            "task_id": "task-1",
+            "task_hash": task_hash(repair_task),
+            "attempt_id": "attempt-r",
+            "done_s3": repair_done,
+            "output_s3": "",
+        }).encode()}
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=1,
+                progress_interval=0,
+                max_inline_outputs=1000,
+                use_listing_index=False,
+                preload_s3_prefix=[],
+                write_repair_jsonl=None,
+                upload=False,
+                publish_ready=False,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                require_complete=True,
+            )
+            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_finalize(args), 0)
+            manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
+            self.assertEqual(manifest["done_count"], 1)
+            self.assertEqual(manifest["missing_count"], 0)
+            statuses = [json.loads(line) for line in (Path(tmp) / "finalizer" / "task_status.jsonl").read_text().splitlines()]
+            self.assertEqual(statuses[0]["done_s3"], repair_done)
+
+    def test_finalize_streams_outputs_manifest_and_caps_inline_outputs(self) -> None:
+        s3 = FakeFinalizeS3()
+        tasks = []
+        for i in range(3):
+            task = {
+                "run_id": "r1",
+                "task_id": f"task-{i}",
+                "output_s3": f"s3://bucket/runs/r1/shards/task-{i}.txt",
+                "done_s3": f"s3://bucket/runs/r1/done/task-{i}.done.json",
+            }
+            tasks.append(task)
+            s3.objects[("bucket", f"runs/r1/done/task-{i}.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": f"task-{i}", "output_s3": task["output_s3"]}).encode()}
+            s3.objects[("bucket", f"runs/r1/shards/task-{i}.txt")] = {"Body": b"ok"}
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=2,
+                progress_interval=0,
+                max_inline_outputs=2,
+                use_listing_index=True,
+                preload_s3_prefix=[],
+                write_repair_jsonl=None,
+                upload=False,
+                publish_ready=False,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                require_complete=True,
+            )
+            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cmd_finalize(args), 0)
+            manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
+            outputs_rows = [json.loads(line) for line in (Path(tmp) / "finalizer" / "outputs.jsonl").read_text().splitlines()]
+            self.assertEqual(manifest["task_count"], 3)
+            self.assertEqual(len(manifest["outputs"]), 2)
+            self.assertTrue(manifest["outputs_truncated"])
+            self.assertEqual(len(outputs_rows), 3)
+            self.assertIn("s3://bucket/runs/r1/done/", manifest["existence_index_prefixes"])
 
 
 if __name__ == "__main__":

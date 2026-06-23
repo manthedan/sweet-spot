@@ -49,3 +49,12 @@ Why done markers are the source of truth:
 - Uploading a small deterministic done marker last gives finalizers and workers a stable idempotency check.
 - Done marker v2 records the task hash, attempt id, logical output URI, actual immutable output URI, size, and SHA-256.
 - The canonical marker is written conditionally; duplicate attempts either win exactly one marker or validate the winner before acknowledging SQS.
+
+Finalization and cleanup:
+
+- `spotbatch finalize` streams task JSONL and writes `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` instead of retaining every task/status record in memory.
+- The finalizer rejects duplicate task IDs while streaming, validates marker contents, and verifies v2 output size/SHA metadata before counting a task complete.
+- `--use-listing-index` preloads default run prefixes (`done/`, `shards/`, `summaries/`) with S3 listings to avoid many per-task existence HEAD requests; extra prefixes can be added with `--preload-s3-prefix`.
+- The final manifest inlines only a bounded `outputs` sample (`--max-inline-outputs`) and points to the complete outputs manifest.
+- For versioned buckets, cleanup must use `spotbatch s3-delete-prefix --include-versions` or an S3 lifecycle policy that expires noncurrent versions/delete markers; deleting only current keys does not reclaim all storage.
+- Whole-DLQ redrive should use native SQS `StartMessageMoveTask` via `spotbatch dlq --native-redrive --apply` when unfiltered redrive is acceptable. Filtered/manual receive-send-delete redrive remains available for small targeted repairs.

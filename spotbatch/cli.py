@@ -8,30 +8,37 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import boto3
 
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
-from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
+from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
 
 
+FINALIZER_DEFAULT_MAX_INLINE_OUTPUTS = 1000
+FINALIZER_FUTURE_BUFFER_MULTIPLIER = 4
+
+
+def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{line_no}") from exc
+            if not isinstance(obj, dict):
+                raise ValueError(f"task at {path}:{line_no} is not an object")
+            yield obj
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    out = []
-    for line_no, line in enumerate(path.read_text().splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid JSONL at {path}:{line_no}") from exc
-        if not isinstance(obj, dict):
-            raise ValueError(f"task at {path}:{line_no} is not an object")
-        out.append(obj)
-    return out
+    return list(_iter_jsonl(path))
 
 
 def _chunks(xs: list[dict[str, Any]], n: int) -> Iterable[list[dict[str, Any]]]:
@@ -531,64 +538,195 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
     return 2 if stop_reason and args.fail_on_stop else 0
 
 
-def _read_tasks_for_finalizer(args: argparse.Namespace, s3) -> list[dict[str, Any]]:
+def _iter_s3_jsonl(s3, uri: str) -> Iterator[dict[str, Any]]:
+    bucket, key = parse_s3_uri(uri)
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+    if hasattr(body, "iter_lines"):
+        lines = body.iter_lines()
+    else:
+        lines = body.read().splitlines()
+    for line_no, line in enumerate(lines, start=1):
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        line = str(line).strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSONL at {uri}:{line_no}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"task at {uri}:{line_no} is not an object")
+        yield obj
+
+
+def _iter_tasks_for_finalizer(args: argparse.Namespace, s3) -> Iterator[dict[str, Any]]:
     if args.tasks_jsonl:
-        return _read_jsonl(args.tasks_jsonl)
+        yield from _iter_jsonl(args.tasks_jsonl)
+        return
     tasks_s3 = args.tasks_s3 or s3_join(args.output_prefix, "manifests", "tasks.jsonl")
-    tmp = []
-    for line in s3_download_text(s3, tasks_s3).splitlines():
-        if line.strip():
-            tmp.append(json.loads(line))
-    return tmp
+    yield from _iter_s3_jsonl(s3, tasks_s3)
 
 
-def _done_marker_for_task(s3, task: dict[str, Any], done_s3: str) -> dict[str, Any] | None:
-    if not s3_exists(s3, done_s3):
+class _S3ExistenceIndex:
+    def __init__(self, s3, prefixes: Iterable[str]) -> None:
+        self.s3 = s3
+        self.prefixes: list[tuple[str, str]] = []
+        self.keys_by_bucket: dict[str, set[str]] = {}
+        for uri in prefixes:
+            if not uri:
+                continue
+            bucket, key = parse_s3_uri(uri)
+            key = key.rstrip("/") + "/" if key else ""
+            self.prefixes.append((bucket, key))
+
+    def load(self) -> None:
+        for bucket, prefix in self.prefixes:
+            keys = self.keys_by_bucket.setdefault(bucket, set())
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if key is not None:
+                        keys.add(str(key))
+
+    def indexed_prefixes(self) -> list[str]:
+        return [f"s3://{bucket}/{prefix}" for bucket, prefix in self.prefixes]
+
+    def exists(self, uri: str) -> bool:
+        bucket, key = parse_s3_uri(uri)
+        for indexed_bucket, indexed_prefix in self.prefixes:
+            if bucket == indexed_bucket and key.startswith(indexed_prefix):
+                return key in self.keys_by_bucket.get(bucket, set())
+        return s3_exists(self.s3, uri)
+
+
+def _finalizer_existence_index(args: argparse.Namespace, s3) -> _S3ExistenceIndex | None:
+    prefixes = list(getattr(args, "preload_s3_prefix", None) or [])
+    if getattr(args, "use_listing_index", False):
+        prefixes.extend([
+            s3_join(args.output_prefix, "done"),
+            s3_join(args.output_prefix, "shards"),
+            s3_join(args.output_prefix, "summaries"),
+        ])
+    if not prefixes:
         return None
-    marker = json.loads(s3_download_text(s3, done_s3))
+    index = _S3ExistenceIndex(s3, prefixes)
+    index.load()
+    return index
+
+
+def _s3_exists_indexed(s3, uri: str, existence_index: _S3ExistenceIndex | None) -> bool:
+    return existence_index.exists(uri) if existence_index else s3_exists(s3, uri)
+
+
+def _repair_done_marker_candidates(s3, canonical_done_s3: str) -> Iterator[str]:
+    bucket, key = parse_s3_uri(canonical_done_s3)
+    prefix = key + ".repair-"
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            candidate_key = obj.get("Key")
+            if candidate_key:
+                yield f"s3://{bucket}/{candidate_key}"
+
+
+def _repair_task_candidates_for_marker_validation(task: dict[str, Any], repair_done_s3: str) -> Iterator[dict[str, Any]]:
+    """Yield task payload variants that could have produced a repair marker.
+
+    Current repair tasks include spotbatch_repair_reason, which participates in
+    the full task hash. Older repair tasks did not, so validate both forms.
+    """
+    base = dict(task)
+    base["done_s3"] = repair_done_s3
+    yield base
+    for reason in ("invalid_done_marker", "missing_output", "output_without_done", "incomplete"):
+        with_reason = dict(base)
+        with_reason["spotbatch_repair_reason"] = reason
+        yield with_reason
+
+
+def _valid_repair_done_marker(s3, task: dict[str, Any], canonical_done_s3: str) -> tuple[str, dict[str, Any]] | None:
+    for repair_done_s3 in _repair_done_marker_candidates(s3, canonical_done_s3):
+        repair_marker = _done_marker_for_task(s3, task, repair_done_s3, None)
+        if repair_marker is None or repair_marker.get("_spotbatch_marker_parse_error"):
+            continue
+        for repair_task in _repair_task_candidates_for_marker_validation(task, repair_done_s3):
+            try:
+                validate_done_marker(s3, repair_task, repair_marker, task_hash(repair_task))
+            except ValueError:
+                continue
+            return repair_done_s3, repair_marker
+    return None
+
+
+def _read_tasks_for_finalizer(args: argparse.Namespace, s3) -> list[dict[str, Any]]:
+    return list(_iter_tasks_for_finalizer(args, s3))
+
+
+def _done_marker_for_task(s3, task: dict[str, Any], done_s3: str, existence_index: _S3ExistenceIndex | None = None) -> dict[str, Any] | None:
+    if not _s3_exists_indexed(s3, done_s3, existence_index):
+        return None
+    try:
+        marker = json.loads(s3_download_text(s3, done_s3))
+    except json.JSONDecodeError as exc:
+        return {"_spotbatch_marker_parse_error": f"done marker is not valid JSON: {exc}"}
     if not isinstance(marker, dict):
-        raise ValueError(f"done marker is not an object: {done_s3}")
+        return {"_spotbatch_marker_parse_error": f"done marker is not an object: {done_s3}"}
     return marker
 
 
-def _check_task(s3, task: dict[str, Any]) -> dict[str, Any]:
+def _check_task(s3, task: dict[str, Any], existence_index: _S3ExistenceIndex | None = None) -> dict[str, Any]:
     logical_output_s3 = str(task.get("output_s3") or "")
     summary_s3 = str(task.get("summary_s3") or "")
     done_s3 = default_done_s3(task)
-    marker = _done_marker_for_task(s3, task, done_s3)
+    marker = _done_marker_for_task(s3, task, done_s3, existence_index)
     marker_validation_error = None
     if marker is not None:
-        try:
-            validate_done_marker(s3, task, marker, task_hash(task))
-        except ValueError as exc:
-            marker_validation_error = str(exc)
-            if "output is missing" not in marker_validation_error:
-                raise
+        marker_validation_error = marker.get("_spotbatch_marker_parse_error")
+        if not marker_validation_error:
+            try:
+                # validate_done_marker verifies schema/run/task/hash and, for
+                # v2, HEADs the immutable attempt output to check size/SHA
+                # metadata. Validation failures are status/repair inputs, not
+                # finalizer crashes.
+                validate_done_marker(s3, task, marker, task_hash(task))
+            except ValueError as exc:
+                marker_validation_error = str(exc)
+    if marker is not None and marker_validation_error:
+        repair_candidate = _valid_repair_done_marker(s3, task, done_s3)
+        if repair_candidate is not None:
+            done_s3, marker = repair_candidate
+            marker_validation_error = None
     done_exists = marker is not None
+    marker_valid = marker is not None and marker_validation_error is None
     output_s3 = logical_output_s3
-    output_exists = s3_exists(s3, logical_output_s3) if logical_output_s3 else False
-    summary_exists = s3_exists(s3, summary_s3) if summary_s3 else False
+    output_exists = False if marker_validation_error else (_s3_exists_indexed(s3, logical_output_s3, existence_index) if logical_output_s3 else False)
+    summary_exists = _s3_exists_indexed(s3, summary_s3, existence_index) if summary_s3 else False
     if marker and isinstance(marker.get("output"), dict):
         output_s3 = str(marker["output"].get("uri") or logical_output_s3)
-        output_exists = False if marker_validation_error else True
+        # Keep an explicit existence check here even though v2 validation
+        # already verified metadata, so the status record reflects current S3
+        # availability and listing-index decisions.
+        output_exists = False if marker_validation_error else _s3_exists_indexed(s3, output_s3, existence_index)
     if marker and marker.get("attempt_summary_s3"):
         summary_s3 = str(marker.get("attempt_summary_s3"))
-        summary_exists = s3_exists(s3, summary_s3)
-    state = "done" if done_exists else "incomplete"
+        summary_exists = _s3_exists_indexed(s3, summary_s3, existence_index)
+    state = "done" if marker_valid else ("invalid_done_marker" if done_exists else "incomplete")
     if done_exists and logical_output_s3 and not output_exists:
         state = "missing_output"
-    elif output_exists and not done_exists:
+    elif output_exists and not marker_valid:
         state = "output_without_done"
-    return {"task_id": task.get("task_id"), "output_s3": output_s3, "logical_output_s3": logical_output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "output_exists": output_exists, "summary_exists": summary_exists, "state": state, "marker_validation_error": marker_validation_error}
+    return {"task_id": task.get("task_id"), "output_s3": output_s3, "logical_output_s3": logical_output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "marker_valid": marker_valid, "output_exists": output_exists, "summary_exists": summary_exists, "state": state, "marker_validation_error": marker_validation_error}
 
 
 def _repair_task_for_record(task: dict[str, Any], record: dict[str, Any], repair_suffix: str) -> dict[str, Any]:
     repair = dict(task)
-    repair["spotbatch_repair_reason"] = record["state"]
-    if record["state"] == "missing_output" and record["done_exists"]:
-        # Existing done markers make normal workers skip the task. Keep the
-        # original output_s3 so the missing object is regenerated, but write the
-        # repair completion marker elsewhere; the next finalize sees the output.
+    if record["done_exists"] and (record["state"] == "missing_output" or not record.get("marker_valid", False)):
+        # Existing invalid/incomplete done markers make normal workers collide
+        # on the canonical marker. Keep the original output_s3 so missing
+        # objects are regenerated, but write the repair completion marker
+        # elsewhere; the next finalize validates the original output location.
         repair["done_s3"] = str(record["done_s3"]) + f".repair-{repair_suffix}"
     return repair
 
@@ -600,88 +738,167 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     if args.publish_ready and not args.upload:
         raise SystemExit("--publish-ready requires --upload")
     args.ready_key = str(args.ready_key).strip("/")
-    if args.publish_ready and (not args.ready_key or args.ready_key in {"manifests/final_manifest.json", "manifests/repair_tasks.jsonl"}):
+    reserved_ready_keys = {"manifests/final_manifest.json", "manifests/repair_tasks.jsonl", "manifests/task_status.jsonl", "manifests/outputs.jsonl"}
+    if args.publish_ready and (not args.ready_key or args.ready_key in reserved_ready_keys):
         raise SystemExit("--ready-key must not be empty or collide with SpotBatch manifest paths")
+    if args.workers <= 0:
+        raise SystemExit("--workers must be positive")
     s3 = boto3.client("s3")
-    tasks = _read_tasks_for_finalizer(args, s3)
-    _validate_unique_task_ids(tasks, context="finalizer tasks")
+    existence_index = _finalizer_existence_index(args, s3)
     artifact_dir = args.artifact_dir or Path("artifacts") / args.run_id / "finalizer"
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    records_by_index: list[dict[str, Any] | None] = [None] * len(tasks)
-    by_task_id: dict[Any, dict[str, Any]] = {t.get("task_id"): t for t in tasks}
-    checked = 0
-    with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        future_map = {ex.submit(_check_task, s3, t): i for i, t in enumerate(tasks)}
-        for fut in cf.as_completed(future_map):
-            records_by_index[future_map[fut]] = fut.result()
-            checked += 1
-            if args.progress_interval and (checked == len(tasks) or checked % args.progress_interval == 0):
-                print(f"spotbatch finalize progress: checked={checked}/{len(tasks)}", file=sys.stderr)
-    records = [r for r in records_by_index if r is not None]
-    done = sum(r["done_exists"] for r in records)
-    output = sum(r["output_exists"] for r in records)
-    summary = sum(r["summary_exists"] for r in records)
-    output_without_done = [r for r in records if r["state"] == "output_without_done"]
-    missing_output = [r for r in records if r["output_s3"] and not r["output_exists"]]
-    missing_done = [r for r in records if not r["done_exists"]]
-    missing = [r for r in records if not r["done_exists"] or (r["output_s3"] and not r["output_exists"])]
-    repair_suffix = str(time.time_ns())
-    repair_tasks = [_repair_task_for_record(by_task_id.get(r["task_id"], {"task_id": r["task_id"]}), r, repair_suffix) for r in missing]
+
+    final_path = artifact_dir / "final_manifest.json"
+    repair_path = args.write_repair_jsonl or artifact_dir / "repair_tasks.jsonl"
+    status_path = artifact_dir / "task_status.jsonl"
+    outputs_path = artifact_dir / "outputs.jsonl"
     final_s3 = s3_join(args.output_prefix, "manifests", "final_manifest.json")
     repair_s3 = s3_join(args.output_prefix, "manifests", "repair_tasks.jsonl")
+    status_s3 = s3_join(args.output_prefix, "manifests", "task_status.jsonl")
+    outputs_s3 = s3_join(args.output_prefix, "manifests", "outputs.jsonl")
     ready_s3 = s3_join(args.output_prefix, args.ready_key)
+
+    counts: Counter[str] = Counter()
+    seen_task_ids: dict[str, int] = {}
+    checked = submitted = 0
+    max_inline_outputs = max(0, int(getattr(args, "max_inline_outputs", FINALIZER_DEFAULT_MAX_INLINE_OUTPUTS)))
+    inline_outputs: list[str] = []
+    missing_task_ids: list[Any] = []
+    output_without_done_task_ids: list[Any] = []
+    missing_output_task_ids: list[Any] = []
+    repair_suffix = str(time.time_ns())
+    pending: dict[cf.Future, tuple[int, dict[str, Any]]] = {}
+    ready_records: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+    next_to_emit = 0
+    buffer_limit = max(1, args.workers * FINALIZER_FUTURE_BUFFER_MULTIPLIER)
+
+    def remember(xs: list[Any], value: Any) -> None:
+        if len(xs) < 1000:
+            xs.append(value)
+
+    def process_record(task: dict[str, Any], record: dict[str, Any], status_f, repair_f, outputs_f) -> None:
+        nonlocal checked
+        checked += 1
+        counts["task"] += 1
+        if record["done_exists"]:
+            counts["done_marker"] += 1
+        if record.get("marker_validation_error"):
+            counts["invalid_marker"] += 1
+        if record["marker_valid"]:
+            counts["done"] += 1
+        if record["output_exists"]:
+            counts["output"] += 1
+        if record["summary_exists"]:
+            counts["summary"] += 1
+        is_missing_done = not record["marker_valid"]
+        is_missing_output = bool(record["output_s3"] and not record["output_exists"])
+        is_missing = is_missing_done or is_missing_output
+        if record["state"] == "output_without_done":
+            counts["output_without_done"] += 1
+            remember(output_without_done_task_ids, record["task_id"])
+        if is_missing_done:
+            counts["missing_done"] += 1
+        if is_missing_output:
+            counts["missing_output"] += 1
+            remember(missing_output_task_ids, record["task_id"])
+        if is_missing:
+            counts["missing"] += 1
+            remember(missing_task_ids, record["task_id"])
+            repair = _repair_task_for_record(task, record, repair_suffix)
+            repair_f.write(json.dumps(repair, sort_keys=True) + "\n")
+        if record["marker_valid"] and (not record["output_s3"] or record["output_exists"]):
+            output_uri = record["output_s3"]
+            counts["output_manifest"] += 1
+            if len(inline_outputs) < max_inline_outputs:
+                inline_outputs.append(output_uri)
+            outputs_f.write(json.dumps({"task_id": record["task_id"], "output_s3": output_uri}, sort_keys=True) + "\n")
+        status_f.write(json.dumps(record, sort_keys=True) + "\n")
+        if args.progress_interval and checked % args.progress_interval == 0:
+            print(f"spotbatch finalize progress: checked={checked}", file=sys.stderr)
+
+    def drain(done_futures: set[cf.Future], status_f, repair_f, outputs_f) -> None:
+        nonlocal next_to_emit
+        for fut in done_futures:
+            index, task = pending.pop(fut)
+            ready_records[index] = (task, fut.result())
+        while next_to_emit in ready_records:
+            task, record = ready_records.pop(next_to_emit)
+            process_record(task, record, status_f, repair_f, outputs_f)
+            next_to_emit += 1
+
+    with status_path.open("w", encoding="utf-8") as status_f, repair_path.open("w", encoding="utf-8") as repair_f, outputs_path.open("w", encoding="utf-8") as outputs_f, cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for line_no, task in enumerate(_iter_tasks_for_finalizer(args, s3), start=1):
+            task_id = str(task.get("task_id") or "")
+            if task_id in seen_task_ids:
+                raise SystemExit(f"duplicate task_id values in finalizer tasks: {task_id!r} at lines {seen_task_ids[task_id]} and {line_no}")
+            if task_id:
+                seen_task_ids[task_id] = line_no
+            pending[ex.submit(_check_task, s3, task, existence_index)] = (submitted, task)
+            submitted += 1
+            while len(pending) + len(ready_records) >= buffer_limit and pending:
+                done_futures, _ = cf.wait(pending.keys(), return_when=cf.FIRST_COMPLETED)
+                drain(done_futures, status_f, repair_f, outputs_f)
+        while pending:
+            done_futures, _ = cf.wait(pending.keys(), return_when=cf.FIRST_COMPLETED)
+            drain(done_futures, status_f, repair_f, outputs_f)
+    if args.progress_interval and checked and checked % args.progress_interval != 0:
+        print(f"spotbatch finalize progress: checked={checked}", file=sys.stderr)
+
     final_manifest = {
         "schema": "spotbatch.final_manifest.v1",
         "run_id": args.run_id,
         "finalized_at": iso_now(),
         "output_prefix": args.output_prefix.rstrip("/"),
-        "task_count": len(records),
-        "done_count": done,
-        "output_count": output,
-        "summary_count": summary,
-        "missing_count": len(missing),
-        "missing_done_count": len(missing_done),
-        "output_without_done_count": len(output_without_done),
-        "missing_output_count": len(missing_output),
-        "complete": len(missing) == 0,
-        "missing_task_ids": [r["task_id"] for r in missing[:1000]],
-        "output_without_done_task_ids": [r["task_id"] for r in output_without_done[:1000]],
-        "missing_output_task_ids": [r["task_id"] for r in missing_output[:1000]],
-        "outputs": [r["output_s3"] for r in records if r["done_exists"] and (not r["output_s3"] or r["output_exists"])],
-        "repair_task_count": len(repair_tasks),
+        "task_count": counts["task"],
+        "done_count": counts["done"],
+        "done_marker_count": counts["done_marker"],
+        "invalid_marker_count": counts["invalid_marker"],
+        "output_count": counts["output"],
+        "summary_count": counts["summary"],
+        "missing_count": counts["missing"],
+        "missing_done_count": counts["missing_done"],
+        "output_without_done_count": counts["output_without_done"],
+        "missing_output_count": counts["missing_output"],
+        "complete": counts["missing"] == 0,
+        "missing_task_ids": missing_task_ids,
+        "output_without_done_task_ids": output_without_done_task_ids,
+        "missing_output_task_ids": missing_output_task_ids,
+        "outputs": inline_outputs,
+        "outputs_truncated": counts["output_manifest"] > len(inline_outputs),
+        "outputs_manifest": str(outputs_path),
+        "outputs_manifest_s3": outputs_s3 if args.upload else None,
+        "task_status": str(status_path),
+        "task_status_s3": status_s3 if args.upload else None,
+        "repair_task_count": counts["missing"],
         "final_manifest_s3": final_s3 if args.upload else None,
-        "repair_tasks_s3": repair_s3 if args.upload and repair_tasks else None,
+        "repair_tasks_s3": repair_s3 if args.upload and counts["missing"] else None,
         "ready_s3": ready_s3 if args.publish_ready else None,
+        "existence_index_prefixes": existence_index.indexed_prefixes() if existence_index else [],
     }
+    if submitted != checked:
+        raise RuntimeError(f"finalizer internal error: submitted {submitted}, checked {checked}")
     if args.publish_ready and not final_manifest["complete"] and not args.allow_incomplete_ready:
         final_manifest["ready_s3"] = None
 
-    final_path = artifact_dir / "final_manifest.json"
-    repair_path = args.write_repair_jsonl or artifact_dir / "repair_tasks.jsonl"
-    status_path = artifact_dir / "task_status.jsonl"
     final_path.write_text(json.dumps(final_manifest, indent=2, sort_keys=True) + "\n")
-    repair_path.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in repair_tasks))
-    status_path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
-
-    if args.publish_ready and not final_manifest["complete"] and not args.allow_incomplete_ready:
-        if args.upload:
-            s3_delete(s3, ready_s3)
-            s3_upload_text(s3, json.dumps(final_manifest, indent=2, sort_keys=True) + "\n", final_s3)
-            if repair_tasks:
-                s3_upload_text(s3, repair_path.read_text(), repair_s3, "application/jsonl")
-        print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": None, "refused_ready": True}, indent=2, sort_keys=True))
-        return 2
 
     if args.upload:
         if args.publish_ready:
             s3_delete(s3, ready_s3)
         s3_upload_text(s3, json.dumps(final_manifest, indent=2, sort_keys=True) + "\n", final_s3)
-        if repair_tasks:
-            s3_upload_text(s3, repair_path.read_text(), repair_s3, "application/jsonl")
-        if args.publish_ready:
-            ready = {"schema": "spotbatch.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
-            s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
-    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": ready_s3 if args.publish_ready and args.upload else None}, indent=2, sort_keys=True))
+        s3_upload_file(s3, status_path, status_s3, "application/jsonl")
+        s3_upload_file(s3, outputs_path, outputs_s3, "application/jsonl")
+        if counts["missing"]:
+            s3_upload_file(s3, repair_path, repair_s3, "application/jsonl")
+
+    if args.publish_ready and not final_manifest["complete"] and not args.allow_incomplete_ready:
+        print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "outputs_manifest": str(outputs_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": None, "refused_ready": True}, indent=2, sort_keys=True))
+        return 2
+
+    if args.upload and args.publish_ready:
+        ready = {"schema": "spotbatch.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
+        s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
+    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "outputs_manifest": str(outputs_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": ready_s3 if args.publish_ready and args.upload else None}, indent=2, sort_keys=True))
     return 2 if args.require_complete and not final_manifest["complete"] else 0
 
 
@@ -857,10 +1074,11 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir or Path("artifacts") / "s3-delete-prefix" / utc_stamp()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     status_path = artifact_dir / "s3_delete_prefix_status.json"
-    listed = deleted = 0
+    listed = deleted = delete_markers = 0
     batches = 0
-    examples: list[str] = []
-    paginator = s3.get_paginator("list_objects_v2")
+    examples: list[dict[str, str]] = []
+    paginator_name = "list_object_versions" if getattr(args, "include_versions", False) else "list_objects_v2"
+    paginator = s3.get_paginator(paginator_name)
     batch: list[dict[str, str]] = []
 
     def flush() -> None:
@@ -877,21 +1095,32 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
         batch = []
 
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix_key):
-        for obj in page.get("Contents", []):
+        if getattr(args, "include_versions", False):
+            page_objects = list(page.get("Versions", [])) + list(page.get("DeleteMarkers", []))
+        else:
+            page_objects = list(page.get("Contents", []))
+        for obj in page_objects:
             key = obj["Key"]
             listed += 1
+            entry = {"Key": key}
+            if getattr(args, "include_versions", False):
+                version_id = str(obj.get("VersionId") or "")
+                if version_id:
+                    entry["VersionId"] = version_id
+                if obj in page.get("DeleteMarkers", []):
+                    delete_markers += 1
             if len(examples) < 20:
-                examples.append(key)
-            batch.append({"Key": key})
+                examples.append(dict(entry))
+            batch.append(entry)
             if len(batch) >= args.batch_size:
                 flush()
-        status_path.write_text(json.dumps({"schema": "spotbatch.s3_delete_prefix_status.v1", "updated_at": iso_now(), "prefix": args.prefix, "delete": bool(args.delete), "listed": listed, "deleted": deleted, "batches": batches, "examples": examples}, indent=2, sort_keys=True) + "\n")
+        status_path.write_text(json.dumps({"schema": "spotbatch.s3_delete_prefix_status.v1", "updated_at": iso_now(), "prefix": args.prefix, "delete": bool(args.delete), "include_versions": bool(getattr(args, "include_versions", False)), "listed": listed, "deleted": deleted, "delete_markers": delete_markers, "batches": batches, "examples": examples}, indent=2, sort_keys=True) + "\n")
     flush()
     marker_s3 = None
     if args.delete and args.completion_marker_s3:
         marker_s3 = args.completion_marker_s3
-        s3_upload_text(s3, json.dumps({"schema": "spotbatch.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "deleted": deleted}, indent=2, sort_keys=True) + "\n", marker_s3)
-    summary = {"schema": "spotbatch.s3_delete_prefix_summary.v1", "finished_at": iso_now(), "prefix": args.prefix, "bucket": bucket, "key_prefix": prefix_key, "delete": bool(args.delete), "listed": listed, "deleted": deleted, "batches": batches, "completion_marker_s3": marker_s3, "status_json": str(status_path), "examples": examples}
+        s3_upload_text(s3, json.dumps({"schema": "spotbatch.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "include_versions": bool(getattr(args, "include_versions", False)), "deleted": deleted}, indent=2, sort_keys=True) + "\n", marker_s3)
+    summary = {"schema": "spotbatch.s3_delete_prefix_summary.v1", "finished_at": iso_now(), "prefix": args.prefix, "bucket": bucket, "key_prefix": prefix_key, "delete": bool(args.delete), "include_versions": bool(getattr(args, "include_versions", False)), "listed": listed, "deleted": deleted, "delete_markers": delete_markers, "batches": batches, "completion_marker_s3": marker_s3, "status_json": str(status_path), "examples": examples}
     status_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
@@ -905,10 +1134,31 @@ def _parse_body(msg: dict[str, Any]) -> dict[str, Any]:
         return {"_json_error": str(exc), "_raw_body": msg.get("Body", "")[:500]}
 
 
+def _queue_arn(sqs, queue_url: str) -> str:
+    attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"]).get("Attributes", {})
+    arn = attrs.get("QueueArn")
+    if not arn:
+        raise RuntimeError(f"queue has no QueueArn attribute: {queue_url}")
+    return str(arn)
+
+
 def cmd_dlq(args: argparse.Namespace) -> int:
-    if args.apply and not args.queue_url:
+    if args.apply and not args.queue_url and not getattr(args, "native_redrive", False):
         raise SystemExit("--apply requires --queue-url")
     sqs = boto3.client("sqs")
+    if getattr(args, "native_redrive", False):
+        if not args.apply:
+            raise SystemExit("--native-redrive requires --apply")
+        if args.run_id or args.task_id_regex:
+            raise SystemExit("--native-redrive moves the whole DLQ; use manual redrive for --run-id/--task-id-regex filters")
+        kwargs: dict[str, Any] = {"SourceArn": _queue_arn(sqs, args.dlq_url)}
+        if args.queue_url:
+            kwargs["DestinationArn"] = _queue_arn(sqs, args.queue_url)
+        if getattr(args, "max_messages_per_second", None):
+            kwargs["MaxNumberOfMessagesPerSecond"] = args.max_messages_per_second
+        resp = sqs.start_message_move_task(**kwargs)
+        print(json.dumps({"schema": "spotbatch.dlq_redrive_summary.v1", "checked_at": iso_now(), "native_redrive": True, "source_arn": kwargs["SourceArn"], "destination_arn": kwargs.get("DestinationArn"), "task_handle": resp.get("TaskHandle"), "max_messages_per_second": kwargs.get("MaxNumberOfMessagesPerSecond")}, indent=2, sort_keys=True))
+        return 0
     scanned = matched = moved = 0
     by_run: Counter[str] = Counter(); by_schema: Counter[str] = Counter(); examples = []
     while scanned < args.max_messages:
@@ -1140,6 +1390,9 @@ def main() -> int:
     p.add_argument("--artifact-dir", type=Path)
     p.add_argument("--workers", type=int, default=32)
     p.add_argument("--progress-interval", type=int, default=1000)
+    p.add_argument("--max-inline-outputs", type=int, default=FINALIZER_DEFAULT_MAX_INLINE_OUTPUTS, help="Max output URIs to inline in final_manifest.json; all outputs are written to outputs.jsonl")
+    p.add_argument("--use-listing-index", action="store_true", help="Preload default run S3 prefixes with ListObjectsV2 to reduce per-task HeadObject calls")
+    p.add_argument("--preload-s3-prefix", action="append", default=[], help="Additional s3://bucket/prefix to preload into the finalizer existence index; repeatable")
     p.add_argument("--write-repair-jsonl", type=Path)
     p.add_argument("--upload", action="store_true")
     p.add_argument("--publish-ready", action="store_true")
@@ -1192,6 +1445,7 @@ def main() -> int:
     p.add_argument("--confirm-prefix", default="", help="must exactly match --prefix when --delete is set")
     p.add_argument("--min-prefix-chars", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=1000)
+    p.add_argument("--include-versions", action="store_true", help="Delete/list object versions and delete markers, not just current objects")
     p.add_argument("--artifact-dir", type=Path)
     p.add_argument("--completion-marker-s3")
     p.set_defaults(func=cmd_s3_delete_prefix)
@@ -1218,6 +1472,8 @@ def main() -> int:
     p.add_argument("--run-id")
     p.add_argument("--task-id-regex")
     p.add_argument("--max-messages", type=int, default=100)
+    p.add_argument("--native-redrive", action="store_true", help="Use SQS StartMessageMoveTask to move the whole DLQ instead of manual receive/send/delete")
+    p.add_argument("--max-messages-per-second", type=int, help="Rate limit for --native-redrive")
     p.add_argument("--visibility-timeout", type=int, default=10)
     p.add_argument("--wait-time", type=int, default=1)
     p.add_argument("--apply", action="store_true")
