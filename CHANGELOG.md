@@ -4,6 +4,10 @@ All notable changes to this project are documented here. This project uses human
 
 ## Unreleased
 
+_No unreleased changes yet._
+
+## sweetspot-v0.1.0 - 2026-06-23
+
 ### Added
 
 - Atomic attempt/commit protocol with attempt-scoped output and summary artifacts.
