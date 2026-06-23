@@ -105,6 +105,24 @@ class CanaryTests(unittest.TestCase):
             self.assertEqual(manifest["run_id"], "source-r")
             self.assertEqual(probe["run_id"], "source-r")
 
+    def test_derive_canary_rewrite_run_id_rejects_existing_s3_markers(self) -> None:
+        tasks = [{"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            out_dir = Path(tmp) / "canary"
+            tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(
+                tasks_jsonl=tasks_path,
+                out_dir=out_dir,
+                run_id="canary-r",
+                selected_indices="0",
+                task_count=1,
+                rewrite_run_id=True,
+                include_dlq_probe=False,
+            )
+            with self.assertRaisesRegex(SystemExit, "explicit output_s3"):
+                cmd_derive_canary(args)
+
     def test_derive_canary_writes_manifest_and_dlq_probe(self) -> None:
         tasks = [
             {"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"},
@@ -120,14 +138,14 @@ class CanaryTests(unittest.TestCase):
                 run_id="canary-r",
                 selected_indices="1",
                 task_count=1,
-                rewrite_run_id=True,
+                rewrite_run_id=False,
                 include_dlq_probe=True,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = cmd_derive_canary(args)
             self.assertEqual(rc, 0)
             canary_task = json.loads((out_dir / "canary_tasks.jsonl").read_text())
-            self.assertEqual(canary_task["run_id"], "canary-r")
+            self.assertEqual(canary_task["run_id"], "r")
             manifest = json.loads((out_dir / "canary_manifest.json").read_text())
             self.assertEqual(manifest["selected_indices"], [1])
             self.assertEqual(manifest["expected_done_s3"], ["s3://b/r/done/t1"])
