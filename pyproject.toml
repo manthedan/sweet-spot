@@ -4,9 +4,24 @@ version = "0.1.0"
 description = "SweetSpot: durable AWS Batch + SQS + S3 runner for cost-aware Spot workloads."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [{name = "SweetSpot contributors"}]
+keywords = ["aws", "aws-batch", "batch-processing", "s3", "spot-instances", "sqs"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = ["boto3==1.43.36", "botocore==1.43.36"]
+
+[project.urls]
+Homepage = "https://github.com/manthedan/sweet-spot"
+Repository = "https://github.com/manthedan/sweet-spot"
+Issues = "https://github.com/manthedan/sweet-spot/issues"
 
 [project.optional-dependencies]
 dev = ["mypy==1.14.1", "ruff==0.8.6"]
@@ -17,7 +32,7 @@ sweetspot-scout = "sweetspot.scout:main"
 sweetspot-lane-manager = "sweetspot.lane_manager:main"
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

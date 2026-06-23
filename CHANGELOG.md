@@ -4,7 +4,14 @@ All notable changes to this project are documented here. This project uses human
 
 ## Unreleased
 
-_No unreleased changes yet._
+### Added
+
+- Contributor guide covering local development, release checks, dependency pins, and SweetSpot's trusted-workload boundary.
+- PyPI-oriented project metadata for repository URLs, keywords, classifiers, and SPDX license expression.
+
+### Fixed
+
+- `scripts/verify_release.sh` now works on systems that provide `python3` but not `python`, and reports missing release-check dependencies with install guidance.
 
 ## sweetspot-v0.1.0 - 2026-06-23
 

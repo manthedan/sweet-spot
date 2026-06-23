@@ -4,10 +4,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PYTHON_BIN="${PYTHON_BIN:-python}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  :
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=python
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+else
+  echo "ERROR: could not find python or python3; set PYTHON_BIN=/path/to/python" >&2
+  exit 127
+fi
 TOFU_BIN="${TOFU_BIN:-tofu}"
 
-echo "==> Python: $($PYTHON_BIN --version)"
+echo "==> Python: $("$PYTHON_BIN" --version)"
+
+"$PYTHON_BIN" - "$PYTHON_BIN" <<'PY'
+import importlib.util
+import sys
+
+python_bin = sys.argv[1]
+missing = [name for name in ("boto3", "botocore", "ruff", "mypy") if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit(
+        "missing release-check dependency module(s): "
+        + ", ".join(missing)
+        + f"\nInstall them with: {python_bin} -m pip install --constraint requirements-dev.lock -e '.[dev]'"
+    )
+PY
 
 echo "==> Ruff format"
 "$PYTHON_BIN" -m ruff format --check .

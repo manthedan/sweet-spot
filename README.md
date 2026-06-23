@@ -41,6 +41,8 @@ Chess/Stockfish workflows live under `examples/`.
 
 ## Install for development
 
+See `CONTRIBUTING.md` for contributor workflow, trust-boundary expectations, and release hygiene.
+
 ```bash
 python -m venv .venv
 . .venv/bin/activate
