@@ -7,8 +7,8 @@ import os
 import re
 import signal
 import subprocess
-import tempfile
 import threading
+from tempfile import TemporaryDirectory
 import time
 from pathlib import Path
 from typing import Any
@@ -99,7 +99,7 @@ def run_task(
     timeout = _timeout_seconds(task, default_timeout_seconds)
 
     work_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=_task_dir_prefix(task_id), dir=work_root) as tmp_dir:
+    with TemporaryDirectory(prefix=_task_dir_prefix(task_id), dir=work_root) as tmp_dir:
         task_dir = Path(tmp_dir)
         task_json = task_dir / "task.json"
         output_path = task_dir / "output"
