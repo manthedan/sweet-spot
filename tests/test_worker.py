@@ -115,28 +115,6 @@ class RunTaskTests(unittest.TestCase):
         def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
             text_uploads.append((uri, json.loads(text)))
 
-    def test_run_task_creates_missing_work_root(self) -> None:
-        task = {
-            "run_id": "run-1",
-            "task_id": "task-1",
-            "command": [sys.executable, "-c", "pass"],
-            "done_s3": "s3://bucket/run/done/task-1.done.json",
-        }
-        text_uploads: list[tuple[str, dict[str, object]]] = []
-
-        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
-            text_uploads.append((uri, json.loads(text)))
-
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text):
-            work_root = Path(tmp) / "missing-work-root"
-            result = run_task(task, s3=object(), work_root=work_root)
-
-        self.assertEqual(result["event"], "processed")
-        self.assertTrue(work_root.is_dir())
-        self.assertIn("s3://bucket/run/done/task-1.done.json", [uri for uri, _payload in text_uploads])
-
         task = {
             "run_id": "run-1",
             "task_id": "slow",
@@ -154,6 +132,28 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(text_uploads[0][0], "s3://bucket/run/summaries/slow.summary.json")
         self.assertTrue(text_uploads[0][1]["timed_out"])
         self.assertIn("timed out", str(text_uploads[0][1]["framework_error"]))
+
+    def test_run_task_creates_missing_work_root(self) -> None:
+        task = {
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "command": [sys.executable, "-c", "pass"],
+            "done_s3": "s3://bucket/run/done/task-1.done.json",
+        }
+        text_uploads: list[tuple[str, dict[str, object]]] = []
+
+        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
+            text_uploads.append((uri, json.loads(text)))
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
+             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text):
+            work_root = Path(tmp) / "missing-work-root"
+            result = run_task(task, s3=object(), work_root=work_root)
+            self.assertTrue(work_root.is_dir())
+
+        self.assertEqual(result["event"], "processed")
+        self.assertIn("s3://bucket/run/done/task-1.done.json", [uri for uri, _payload in text_uploads])
 
     def test_rejects_non_finite_timeouts(self) -> None:
         task = {
