@@ -17,7 +17,8 @@ COPY pyproject.toml README.md requirements.lock /app/
 COPY sweetspot /app/sweetspot
 COPY examples /app/examples
 
-RUN python -m pip install --no-cache-dir --constraint /app/requirements.lock /app
+RUN python -m pip install --no-cache-dir --constraint /app/requirements.lock /app \
+    && python -m pip uninstall -y pip setuptools wheel
 
 USER sweetspot:sweetspot
 WORKDIR /work

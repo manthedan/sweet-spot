@@ -39,9 +39,10 @@ echo "==> workflow artifact path consistency"
 from pathlib import Path
 workflow = Path('.github/workflows/ci.yml').read_text()
 required = [
-    'outputs: type=oci,dest=/tmp/sweetspot-worker.oci.tar',
-    'input: /tmp/sweetspot-worker.oci.tar',
-    'path: /tmp/sweetspot-worker.oci.tar',
+    'outputs: type=oci,dest=/tmp/sweetspot-worker.oci,tar=false',
+    'input: /tmp/sweetspot-worker.oci',
+    'path: /tmp/sweetspot-worker.oci',
+    'continue-on-error: true',
 ]
 missing = [needle for needle in required if needle not in workflow]
 if missing:
