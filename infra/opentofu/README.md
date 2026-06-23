@@ -1,11 +1,11 @@
 # OpenTofu AWS infra
 
-Creates the AWS primitives used by `aws-spot-batch-runner`:
+Creates the AWS primitives used by `SpotBatch`:
 
 - SQS work queue + DLQ
 - AWS Batch Spot compute environment + queue
 - optional On-Demand repair queue
-- generic worker job definition
+- generic worker job definition that explicitly runs `spotbatch worker`
 - IAM roles for Batch/ECS/worker task
 
 ## Example

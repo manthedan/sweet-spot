@@ -9,4 +9,4 @@ COPY spotbatch /app/spotbatch
 COPY examples /app/examples
 RUN pip install --no-cache-dir /app
 
-ENTRYPOINT ["spotbatch", "worker"]
+CMD ["spotbatch", "worker"]
