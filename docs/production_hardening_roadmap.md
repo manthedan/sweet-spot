@@ -84,10 +84,10 @@ Goal: make the infrastructure demonstrably reproducible and safer by default.
 
 Goal: turn the Spot scout/lane manager into a measured controller and publish an honest case study.
 
-- [ ] Have workers emit instance type, architecture, Region/AZ, image digest, startup delay, useful units completed, useful compute seconds, bytes transferred, retry/interruption status, attempt count, and discarded compute seconds.
-- [ ] Teach `spot_scout` and lane manager to optimize expected total cost, not just instance price.
-- [ ] Include compute, interruption replay, startup overhead, cross-region transfer, NAT/endpoints, S3/SQS/CloudWatch, storage, and On-Demand repair costs.
-- [ ] Publish an anonymized machine-readable run manifest and short case study comparing Spot vs On-Demand under a fixed deadline and completeness target.
+- [x] Have workers emit instance type, architecture, Region/AZ, image digest, startup delay, useful units completed, useful compute seconds, bytes transferred, retry/interruption status, attempt count, and discarded compute seconds.
+- [x] Teach `spot_scout` and lane manager to optimize expected total cost, not just instance price.
+- [x] Include compute, interruption replay, startup overhead, cross-region transfer, NAT/endpoints, S3/SQS/CloudWatch, storage, and On-Demand repair costs.
+- [x] Publish an anonymized machine-readable run manifest and short case study comparing Spot vs On-Demand under a fixed deadline and completeness target.
 
 ## Identity cleanup
 

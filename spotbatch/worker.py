@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import signal
 import subprocess
@@ -13,6 +14,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Pattern
+from urllib.request import urlopen
 
 import boto3
 from botocore.exceptions import ClientError
@@ -29,11 +31,133 @@ DONE_MARKER_SCHEMA_V2 = "spotbatch.done_marker.v2"
 DEFAULT_LOG_TAIL_BYTES = 12_000
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
 REDACTION_CARRY_CHARS = 65_536
+METADATA_TIMEOUT_SECONDS = 0.25
 
 
 def _emit_event(event: str, **fields: Any) -> None:
     payload = {"schema": "spotbatch.worker_event.v1", "event": event, "emitted_at": iso_now(), **fields}
     print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _parse_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out >= 0 else None
+
+
+def _parse_int(value: Any) -> int | None:
+    parsed = _parse_float(value)
+    return int(parsed) if parsed is not None else None
+
+
+def _http_json(url: str) -> dict[str, Any]:
+    try:
+        with urlopen(url, timeout=METADATA_TIMEOUT_SECONDS) as resp:  # noqa: S310 - ECS task metadata URL is provided by AWS Batch/ECS env
+            data = resp.read(256 * 1024)
+        obj = json.loads(data.decode("utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:  # noqa: BLE001 - metadata is best-effort telemetry, not task-critical
+        return {}
+
+
+def _region_from_az(az: str | None) -> str | None:
+    if not az:
+        return None
+    # Commercial/Gov/China AZ names all end with a zone letter, e.g. us-west-2a.
+    return az[:-1] if len(az) > 1 and az[-1].isalpha() else None
+
+
+def _worker_runtime_metadata(env: dict[str, str]) -> dict[str, Any]:
+    metadata_uri = env.get("ECS_CONTAINER_METADATA_URI_V4") or env.get("ECS_CONTAINER_METADATA_URI") or ""
+    container_meta = _http_json(metadata_uri) if metadata_uri else {}
+    task_meta = _http_json(f"{metadata_uri.rstrip('/')}/task") if metadata_uri else {}
+    az = env.get("SPOTBATCH_AVAILABILITY_ZONE") or str(task_meta.get("AvailabilityZone") or "") or None
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or env.get("SPOTBATCH_REGION") or _region_from_az(az)
+    image_id = env.get("SPOTBATCH_IMAGE_DIGEST") or str(container_meta.get("ImageID") or "") or None
+    return {
+        "hostname": env.get("HOSTNAME"),
+        "instance_type": env.get("SPOTBATCH_INSTANCE_TYPE") or env.get("EC2_INSTANCE_TYPE"),
+        "architecture": env.get("SPOTBATCH_ARCHITECTURE") or platform.machine(),
+        "region": region,
+        "availability_zone": az,
+        "image": env.get("SPOTBATCH_IMAGE") or str(container_meta.get("Image") or "") or None,
+        "image_digest": image_id,
+        "aws_batch_job_id": env.get("AWS_BATCH_JOB_ID"),
+        "aws_batch_job_attempt": _parse_int(env.get("AWS_BATCH_JOB_ATTEMPT")),
+        "ecs_task_arn": str(task_meta.get("TaskARN") or "") or None,
+    }
+
+
+def _read_task_metrics(path: Path) -> tuple[dict[str, Any], str | None]:
+    if not path.exists():
+        return {}, None
+    try:
+        obj = json.loads(path.read_text())
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"invalid metrics JSON: {exc}"
+    if not isinstance(obj, dict):
+        return {}, "metrics JSON must be an object"
+    return obj, None
+
+
+def _task_telemetry(
+    *,
+    env: dict[str, str],
+    metrics: dict[str, Any],
+    metrics_error: str | None,
+    worker_context: dict[str, Any],
+    command_started_at: float,
+    elapsed: float,
+    timed_out: bool,
+    returncode: int | None,
+    framework_error: str | None,
+    output_record: dict[str, Any] | None,
+    stdout_bytes: int,
+    stderr_bytes: int,
+) -> dict[str, Any]:
+    sent_ms = _parse_float(worker_context.get("sent_timestamp_ms"))
+    startup_delay_sec = max(0.0, command_started_at - (sent_ms / 1000.0)) if sent_ms else None
+    receive_count = _parse_int(worker_context.get("receive_count"))
+    completed_units = _parse_float(metrics.get("completed_units"))
+    if completed_units is None:
+        completed_units = _parse_float(metrics.get("useful_units"))
+    useful_compute_sec = _parse_float(metrics.get("useful_compute_seconds"))
+    if useful_compute_sec is None:
+        useful_compute_sec = _parse_float(metrics.get("useful_compute_sec"))
+    success = returncode == 0 and not timed_out and not framework_error
+    if useful_compute_sec is None and success and completed_units and completed_units > 0:
+        useful_compute_sec = elapsed
+    output_bytes = _parse_float(metrics.get("output_bytes"))
+    if output_bytes is None and output_record is not None:
+        output_bytes = _parse_float(output_record.get("size_bytes"))
+    input_bytes = _parse_float(metrics.get("input_bytes")) or 0.0
+    bytes_transferred = _parse_float(metrics.get("bytes_transferred"))
+    if bytes_transferred is None:
+        bytes_transferred = input_bytes + (output_bytes or 0.0) + stdout_bytes + stderr_bytes
+    discarded_compute_sec = 0.0 if success else elapsed
+    units_per_s = (completed_units / useful_compute_sec) if completed_units and useful_compute_sec and useful_compute_sec > 0 else None
+    interruption_status = "timeout" if timed_out else ("failed" if returncode not in (0, None) or framework_error else "none")
+    out = {
+        **_worker_runtime_metadata(env),
+        "startup_delay_seconds": startup_delay_sec,
+        "completed_units": completed_units,
+        "useful_compute_seconds": useful_compute_sec,
+        "units_per_second": units_per_s,
+        "input_bytes": input_bytes,
+        "output_bytes": output_bytes,
+        "log_bytes": stdout_bytes + stderr_bytes,
+        "bytes_transferred": bytes_transferred,
+        "retry": bool(receive_count and receive_count > 1),
+        "receive_count": receive_count,
+        "interruption_status": interruption_status,
+        "discarded_compute_seconds": discarded_compute_sec,
+        "metrics_error": metrics_error,
+    }
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def parse_redact_patterns(patterns: Iterable[str] | str | None) -> list[Pattern[str]]:
@@ -336,6 +460,7 @@ def run_task(
     log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
     redact_regexes: Iterable[str] | str | None = None,
+    worker_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_id = str(task.get("run_id", ""))
     task_id = str(task.get("task_id", ""))
@@ -349,6 +474,7 @@ def run_task(
     output_s3 = str(task.get("output_s3") or "")
     summary_s3 = str(task.get("summary_s3") or "")
     this_task_hash = task_hash(task)
+    worker_context = worker_context or {}
 
     existing_marker = _load_done_marker(s3, done_s3)
     if existing_marker is not None:
@@ -388,6 +514,7 @@ def run_task(
         task_dir = Path(tmp_dir)
         task_json = task_dir / "task.json"
         output_path = task_dir / "output"
+        metrics_path = task_dir / "metrics.json"
         task_json.write_text(json.dumps(task, indent=2, sort_keys=True) + "\n")
 
         env = os.environ.copy()
@@ -399,6 +526,7 @@ def run_task(
                 "SPOTBATCH_TASK_HASH": this_task_hash,
                 "SPOTBATCH_ATTEMPT_ID": attempt_id,
                 "SPOTBATCH_OUTPUT_PATH": str(output_path),
+                "SPOTBATCH_METRICS_PATH": str(metrics_path),
                 "SPOTBATCH_OUTPUT_S3": attempt_output_s3 or output_s3,
                 "SPOTBATCH_SUMMARY_S3": attempt_summary_s3 or summary_s3,
                 "SPOTBATCH_DONE_S3": done_s3,
@@ -484,6 +612,23 @@ def run_task(
             else:
                 framework_error = f"expected output file was not produced: {output_path}"
 
+        task_metrics, metrics_error = _read_task_metrics(metrics_path)
+        telemetry = _task_telemetry(
+            env=env,
+            metrics=task_metrics,
+            metrics_error=metrics_error,
+            worker_context=worker_context,
+            command_started_at=started,
+            elapsed=elapsed,
+            timed_out=timed_out,
+            returncode=proc.returncode,
+            framework_error=framework_error,
+            output_record=output_record,
+            stdout_bytes=stdout_capture.total_bytes,
+            stderr_bytes=stderr_capture.total_bytes,
+        )
+        _emit_event("telemetry", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, **telemetry)
+
         summary = {
             "schema": "spotbatch.task_summary.v2",
             "run_id": run_id,
@@ -510,11 +655,12 @@ def run_task(
             "stderr_tail": stderr,
             "stdout_log": stdout_capture.summary(),
             "stderr_log": stderr_capture.summary(),
+            "telemetry": telemetry,
             "worker": {
-                "hostname": os.environ.get("HOSTNAME"),
-                "aws_batch_job_id": os.environ.get("AWS_BATCH_JOB_ID"),
-                "aws_batch_job_attempt": os.environ.get("AWS_BATCH_JOB_ATTEMPT"),
-                "ecs_container_metadata_uri_v4": os.environ.get("ECS_CONTAINER_METADATA_URI_V4"),
+                "hostname": telemetry.get("hostname"),
+                "aws_batch_job_id": telemetry.get("aws_batch_job_id"),
+                "aws_batch_job_attempt": telemetry.get("aws_batch_job_attempt"),
+                "ecs_task_arn": telemetry.get("ecs_task_arn"),
             },
         }
         if attempt_summary_s3:
@@ -559,7 +705,13 @@ def run_task(
             _emit_event("commit_succeeded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, done_s3=done_s3)
             return {"event": "processed", **done}
 
-        _emit_event("commit_lost", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, done_s3=done_s3)
+        telemetry["discarded_compute_seconds"] = elapsed
+        summary["telemetry"] = telemetry
+        summary["commit_status"] = "lost"
+        if attempt_summary_s3:
+            s3_upload_text(s3, json.dumps(summary, indent=2, sort_keys=True) + "\n", attempt_summary_s3)
+            _emit_event("summary_uploaded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, uri=attempt_summary_s3, corrected=True)
+        _emit_event("commit_lost", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, done_s3=done_s3, discarded_compute_seconds=elapsed)
         winning_marker = _load_done_marker(s3, done_s3)
         if winning_marker is None:
             raise RuntimeError(f"conditional done marker write lost but no marker is readable: {done_s3}")
@@ -572,6 +724,7 @@ def run_task(
             "attempt_id": attempt_id,
             "winning_attempt_id": winning_marker.get("attempt_id"),
             "done_s3": done_s3,
+            "discarded_compute_seconds": elapsed,
             "checked_at": iso_now(),
         }
 
@@ -642,6 +795,7 @@ def run_worker(
                 log_tail_bytes=log_tail_bytes,
                 max_log_bytes=max_log_bytes,
                 redact_regexes=redact_regexes,
+                worker_context={"receive_count": attrs.get("ApproximateReceiveCount"), "sent_timestamp_ms": attrs.get("SentTimestamp")},
             )
             print(json.dumps(result, sort_keys=True), flush=True)
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)

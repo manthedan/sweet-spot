@@ -12,7 +12,8 @@
       "messages_per_worker": 4,
       "vcpus": 2,
       "memory": 4096,
-      "min_placement_score": 7
+      "min_placement_score": 7,
+      "expected_total_cost_per_1m_units": 0.42
     }
   ]
 }

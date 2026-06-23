@@ -20,7 +20,8 @@ Example config:
       "messages_per_worker": 4,
       "vcpus": 2,
       "memory": 4096,
-      "min_placement_score": 7
+      "min_placement_score": 7,
+      "expected_total_cost_per_1m_units": 0.42
     }
   ]
 }
@@ -83,6 +84,17 @@ def placement_score(ec2_home, lane: dict[str, Any], instance_types: list[str], t
         return None
 
 
+def lane_expected_cost(lane: dict[str, Any]) -> float | None:
+    raw = lane.get("expected_total_cost_per_1m_units", lane.get("expected_cost_per_1m_units"))
+    if raw is None:
+        return None
+    try:
+        cost = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return cost if cost >= 0 else None
+
+
 def submit_jobs(batch, lane: dict[str, Any], sqs_queue_url: str, count: int, dry_run: bool) -> list[dict[str, str | None]]:
     if dry_run or count <= 0:
         return []
@@ -136,9 +148,8 @@ def main() -> int:
 
     ec2_home = session.client("ec2", region_name=args.home_region)
     instance_types = cfg.get("instance_types") or []
-    remaining = target_workers
-    lane_reports = []
-    for lane in lanes:
+    scored_lanes = []
+    for index, lane in enumerate(lanes):
         batch = session.client("batch", region_name=lane["region"])
         active = active_jobs(batch, lane["batch_job_queue"], lane["job_name_prefix"])
         max_workers = int(lane.get("max_workers", 0))
@@ -146,9 +157,25 @@ def main() -> int:
         score = placement_score(ec2_home, lane, instance_types, lane_target_vcpus)
         min_score = int(lane.get("min_placement_score", 0))
         eligible = score is None or score >= min_score
-        desired_for_lane = min(max_workers, remaining) if eligible else 0
-        to_submit = max(0, desired_for_lane - active)
-        remaining = max(0, remaining - max(active, desired_for_lane))
+        expected_cost = lane_expected_cost(lane)
+        scored_lanes.append({"index": index, "lane": lane, "batch": batch, "active": active, "score": score, "min_score": min_score, "eligible": eligible, "expected_cost": expected_cost})
+    scored_lanes.sort(key=lambda x: (not bool(x["eligible"]), x["expected_cost"] is None, x["expected_cost"] if x["expected_cost"] is not None else math.inf, -(x["score"] or -1), x["index"]))
+
+    total_active = sum(int(x["active"]) for x in scored_lanes)
+    remaining = max(0, target_workers - total_active)
+    lane_reports = []
+    for allocation_index, scored in enumerate(scored_lanes):
+        lane = scored["lane"]
+        batch = scored["batch"]
+        active = int(scored["active"])
+        max_workers = int(lane.get("max_workers", 0))
+        score = scored["score"]
+        min_score = scored["min_score"]
+        eligible = bool(scored["eligible"])
+        lane_capacity = max(0, max_workers - active)
+        to_submit = min(lane_capacity, remaining) if eligible else 0
+        desired_for_lane = active + to_submit
+        remaining = max(0, remaining - to_submit)
         submitted = submit_jobs(batch, lane, sqs_queue_url, to_submit, dry_run=not args.submit)
         lane_reports.append(
             {
@@ -156,6 +183,8 @@ def main() -> int:
                 "region": lane["region"],
                 "placement_score": score,
                 "min_placement_score": min_score,
+                "allocation_order": allocation_index,
+                "expected_total_cost_per_1m_units": scored["expected_cost"],
                 "eligible": eligible,
                 "active": active,
                 "max_workers": max_workers,
@@ -175,6 +204,7 @@ def main() -> int:
                 "queue_depth": depth,
                 "backlog_used_for_sizing": backlog,
                 "target_workers": target_workers,
+                "active_workers_before_submit": total_active,
                 "remaining_unallocated": remaining,
                 "lanes": lane_reports,
             },

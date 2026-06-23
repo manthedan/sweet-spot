@@ -50,6 +50,13 @@ Why done markers are the source of truth:
 - Done marker v2 records the task hash, attempt id, logical output URI, actual immutable output URI, size, and SHA-256.
 - The canonical marker is written conditionally; duplicate attempts either win exactly one marker or validate the winner before acknowledging SQS.
 
+Cost telemetry and optimization:
+
+- Commands may write a JSON object to `SPOTBATCH_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, `output_bytes`, or `bytes_transferred`.
+- Task summaries include best-effort runtime metadata plus startup delay, retry/receive count, interruption/failure status, transferred bytes, useful throughput, and discarded compute seconds.
+- `spotbatch-spot-scout` consumes summary telemetry and ranks pools by expected total cost, including compute, replay, startup overhead, transfer, NAT/endpoints, CloudWatch logs, and S3 storage/request assumptions.
+- `spotbatch-lane-manager` allocates cost-annotated lanes cheapest-first among placement-score-eligible lanes.
+
 Finalization and cleanup:
 
 - `spotbatch finalize` streams task JSONL and writes `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` instead of retaining every task/status record in memory.

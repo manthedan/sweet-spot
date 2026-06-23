@@ -287,6 +287,45 @@ class RunTaskTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
+    def test_task_metrics_file_populates_cost_telemetry(self) -> None:
+        uploads: dict[str, str] = {}
+
+        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
+            uploads[uri] = text
+
+        task = {
+            "schema": "spotbatch.task.v1",
+            "run_id": "run-1",
+            "task_id": "telemetry",
+            "command": [
+                sys.executable,
+                "-c",
+                "import json, os; open(os.environ['SPOTBATCH_METRICS_PATH'], 'w').write(json.dumps({'completed_units': 250, 'useful_compute_seconds': 5, 'input_bytes': 1000}))",
+            ],
+            "summary_s3": "s3://bucket/run/summaries/telemetry.summary.json",
+            "done_s3": "s3://bucket/run/done/telemetry.done.json",
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict("os.environ", {"SPOTBATCH_INSTANCE_TYPE": "c7i.large", "AWS_REGION": "us-west-2", "AWS_BATCH_JOB_ATTEMPT": "2"}, clear=False),
+            mock.patch("spotbatch.worker.s3_exists", return_value=False),
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
+            mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True),
+        ):
+            run_task(task, s3=object(), work_root=Path(tmp), worker_context={"receive_count": "2", "sent_timestamp_ms": str(int((time.time() - 3) * 1000))})
+
+        summary_uri = next(uri for uri in uploads if uri.endswith("/summary.json"))
+        telemetry = json.loads(uploads[summary_uri])["telemetry"]
+        self.assertEqual(telemetry["instance_type"], "c7i.large")
+        self.assertEqual(telemetry["region"], "us-west-2")
+        self.assertEqual(telemetry["completed_units"], 250.0)
+        self.assertEqual(telemetry["useful_compute_seconds"], 5.0)
+        self.assertEqual(telemetry["units_per_second"], 50.0)
+        self.assertEqual(telemetry["input_bytes"], 1000.0)
+        self.assertTrue(telemetry["retry"])
+        self.assertEqual(telemetry["receive_count"], 2)
+        self.assertGreaterEqual(telemetry["startup_delay_seconds"], 0)
+
     def test_streams_redacts_caps_and_summarizes_task_logs(self) -> None:
         uploads: dict[str, str] = {}
 
@@ -454,6 +493,7 @@ class RunTaskTests(unittest.TestCase):
             "task_id": "race",
             "command": [sys.executable, "-c", "from pathlib import Path; import os; Path(os.environ['SPOTBATCH_OUTPUT_PATH']).write_text('ok')"],
             "output_s3": "s3://bucket/run/shards/race.txt",
+            "summary_s3": "s3://bucket/run/summaries/race.summary.json",
             "done_s3": "s3://bucket/run/done/race.done.json",
         }
         winner_output = "s3://bucket/run/shards/race.txt.attempts/winner/output"
@@ -469,11 +509,16 @@ class RunTaskTests(unittest.TestCase):
             "summary_s3": "",
             "output": {"logical_uri": "s3://bucket/run/shards/race.txt", "uri": winner_output, "size_bytes": 2, "sha256": hashlib.sha256(b"ok").hexdigest()},
         }
+        uploads: dict[str, str] = {}
+
+        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
+            uploads[uri] = text
+
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch("spotbatch.worker.s3_exists", side_effect=[False, True]),
             mock.patch("spotbatch.worker.s3_upload_file"),
-            mock.patch("spotbatch.worker.s3_upload_text"),
+            mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text),
             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=False),
             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(winner)),
             mock.patch(
@@ -483,6 +528,10 @@ class RunTaskTests(unittest.TestCase):
             result = run_task(task, s3=object(), work_root=Path(tmp))
         self.assertEqual(result["event"], "commit_lost_existing_done")
         self.assertEqual(result["winning_attempt_id"], "winner")
+        summary_uri = next(uri for uri in uploads if uri.endswith("/summary.json"))
+        summary = json.loads(uploads[summary_uri])
+        self.assertEqual(summary["commit_status"], "lost")
+        self.assertGreater(summary["telemetry"]["discarded_compute_seconds"], 0)
 
     def test_v2_done_marker_rejects_wrong_attempt_output_uri(self) -> None:
         task = {

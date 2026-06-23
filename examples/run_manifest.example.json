@@ -1,0 +1,47 @@
+{
+  "schema": "spotbatch.cost_case_study.v1",
+  "run_id": "example-anonymized-2026-06",
+  "workload": "trusted idempotent CPU annotation shards",
+  "region_strategy": "multi-region Spot with On-Demand repair",
+  "deadline_hours": 24,
+  "completeness_target_fraction": 1.0,
+  "units": {
+    "name": "records",
+    "planned": 100000000,
+    "completed": 100000000
+  },
+  "observed": {
+    "task_attempts": 25000,
+    "retry_fraction": 0.018,
+    "useful_compute_seconds": 720000,
+    "discarded_compute_seconds": 18000,
+    "observed_replay_fraction": 0.025,
+    "bytes_transferred": 536870912000,
+    "median_units_per_second_per_worker": 140.0
+  },
+  "cost_model": {
+    "currency": "USD",
+    "spot_compute": 42.15,
+    "on_demand_repair_compute": 3.20,
+    "interruption_replay_compute": 1.05,
+    "startup_overhead_compute": 0.80,
+    "cross_region_transfer": 2.50,
+    "nat_or_vpc_endpoints": 0.00,
+    "s3_requests_and_storage": 0.65,
+    "sqs": 0.08,
+    "cloudwatch_logs": 0.12,
+    "total_spotbatch": 50.55,
+    "estimated_all_on_demand": 133.40,
+    "estimated_savings_fraction": 0.621
+  },
+  "artifacts": {
+    "spot_scout_report": "artifacts/example/spot_scout.json",
+    "lane_manager_plan": "artifacts/example/lane_manager_plan.json",
+    "final_manifest": "artifacts/example/final_manifest.json",
+    "task_status_jsonl": "artifacts/example/task_status.jsonl"
+  },
+  "notes": [
+    "Example values are anonymized placeholders; replace with measured task summaries and billing export data for a real public case study.",
+    "No task payloads, account IDs, bucket names, or private S3 keys are required."
+  ]
+}
