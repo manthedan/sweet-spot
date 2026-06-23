@@ -493,6 +493,17 @@ def _check_task(s3, task: dict[str, Any]) -> dict[str, Any]:
     return {"task_id": task.get("task_id"), "output_s3": output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "output_exists": output_exists, "summary_exists": summary_exists, "state": state}
 
 
+def _repair_task_for_record(task: dict[str, Any], record: dict[str, Any], repair_suffix: str) -> dict[str, Any]:
+    repair = dict(task)
+    repair["spotbatch_repair_reason"] = record["state"]
+    if record["state"] == "missing_output" and record["done_exists"]:
+        # Existing done markers make normal workers skip the task. Keep the
+        # original output_s3 so the missing object is regenerated, but write the
+        # repair completion marker elsewhere; the next finalize sees the output.
+        repair["done_s3"] = str(record["done_s3"]) + f".repair-{repair_suffix}"
+    return repair
+
+
 def cmd_finalize(args: argparse.Namespace) -> int:
     import concurrent.futures as cf
     import sys
@@ -524,7 +535,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     missing_output = [r for r in records if r["output_s3"] and not r["output_exists"]]
     missing_done = [r for r in records if not r["done_exists"]]
     missing = [r for r in records if not r["done_exists"] or (r["output_s3"] and not r["output_exists"])]
-    repair_tasks = [by_task_id.get(r["task_id"], {"task_id": r["task_id"]}) for r in missing]
+    repair_suffix = str(time.time_ns())
+    repair_tasks = [_repair_task_for_record(by_task_id.get(r["task_id"], {"task_id": r["task_id"]}), r, repair_suffix) for r in missing]
     final_s3 = s3_join(args.output_prefix, "manifests", "final_manifest.json")
     repair_s3 = s3_join(args.output_prefix, "manifests", "repair_tasks.jsonl")
     ready_s3 = s3_join(args.output_prefix, args.ready_key)

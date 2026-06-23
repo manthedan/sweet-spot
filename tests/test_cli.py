@@ -390,6 +390,9 @@ class FinalizeTests(unittest.TestCase):
                 rc = cmd_finalize(args)
             self.assertEqual(rc, 2)
             manifest = json.loads(s3.objects[("bucket", "runs/r1/manifests/final_manifest.json")]["Body"])
+            repair_rows = [json.loads(line) for line in (Path(tmp) / "finalizer" / "repair_tasks.jsonl").read_text().splitlines()]
+            self.assertEqual(repair_rows[0]["output_s3"], "s3://bucket/runs/r1/shards/task-1.txt")
+            self.assertTrue(repair_rows[0]["done_s3"].startswith("s3://bucket/runs/r1/done/task-1.done.json.repair-"))
             self.assertEqual(manifest["missing_done_count"], 0)
             self.assertEqual(manifest["missing_output_count"], 1)
             self.assertFalse(manifest["complete"])
