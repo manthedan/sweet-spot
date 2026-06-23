@@ -135,7 +135,7 @@ def _pump_pipe(pipe: BinaryIO, capture: _BoundedLogCapture) -> None:
                     newline_index = text.find("\n")
                     if newline_index < 0:
                         continue
-                    text = text[newline_index + 1:]
+                    text = text[newline_index + 1 :]
                     suppress_until_newline = False
                 pending += text
                 while "\n" in pending:
@@ -218,15 +218,22 @@ def _heartbeat(sqs, queue_url: str, receipt_handle: str, timeout: int, every: in
             )
             _emit_event("lease_renewed", queue_url=queue_url, visibility_timeout=timeout, heartbeat_seconds=every)
         except Exception as exc:
-            print(json.dumps({
-                "schema": "spotbatch.heartbeat_error.v1",
-                "checked_at": iso_now(),
-                "queue_url": queue_url,
-                "visibility_timeout": timeout,
-                "heartbeat_seconds": every,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }, sort_keys=True), file=sys.stderr, flush=True)
+            print(
+                json.dumps(
+                    {
+                        "schema": "spotbatch.heartbeat_error.v1",
+                        "checked_at": iso_now(),
+                        "queue_url": queue_url,
+                        "visibility_timeout": timeout,
+                        "heartbeat_seconds": every,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _load_done_marker(s3, done_s3: str) -> dict[str, Any] | None:
@@ -384,17 +391,19 @@ def run_task(
         task_json.write_text(json.dumps(task, indent=2, sort_keys=True) + "\n")
 
         env = os.environ.copy()
-        env.update({
-            "SPOTBATCH_TASK_JSON": str(task_json),
-            "SPOTBATCH_TASK_ID": task_id,
-            "SPOTBATCH_RUN_ID": run_id,
-            "SPOTBATCH_TASK_HASH": this_task_hash,
-            "SPOTBATCH_ATTEMPT_ID": attempt_id,
-            "SPOTBATCH_OUTPUT_PATH": str(output_path),
-            "SPOTBATCH_OUTPUT_S3": attempt_output_s3 or output_s3,
-            "SPOTBATCH_SUMMARY_S3": attempt_summary_s3 or summary_s3,
-            "SPOTBATCH_DONE_S3": done_s3,
-        })
+        env.update(
+            {
+                "SPOTBATCH_TASK_JSON": str(task_json),
+                "SPOTBATCH_TASK_ID": task_id,
+                "SPOTBATCH_RUN_ID": run_id,
+                "SPOTBATCH_TASK_HASH": this_task_hash,
+                "SPOTBATCH_ATTEMPT_ID": attempt_id,
+                "SPOTBATCH_OUTPUT_PATH": str(output_path),
+                "SPOTBATCH_OUTPUT_S3": attempt_output_s3 or output_s3,
+                "SPOTBATCH_SUMMARY_S3": attempt_summary_s3 or summary_s3,
+                "SPOTBATCH_DONE_S3": done_s3,
+            }
+        )
         env.update(task_env_overrides(task))
 
         started = time.time()

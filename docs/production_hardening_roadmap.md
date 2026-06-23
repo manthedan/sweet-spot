@@ -72,7 +72,7 @@ Goal: make finalization and cleanup scale and make cost claims defensible.
 
 Goal: make the infrastructure demonstrably reproducible and safer by default.
 
-- [x] Add CI for tests, linting, typing, `tofu fmt`, `tofu validate`, and provider-lock verification.
+- [x] Add CI for tests, Ruff formatting/linting, typing, `tofu fmt`, `tofu validate`, and provider-lock verification.
 - [x] Commit the OpenTofu provider lock file and constrain provider versions.
 - [x] Pin Python dependencies and base image digest.
 - [x] Run worker containers as an unprivileged user.

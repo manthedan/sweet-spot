@@ -24,7 +24,7 @@ def _embedded_s3_uri_candidates(s: str) -> Iterable[str]:
     # brackets), and emit a candidate for every s3:// occurrence so adjacent
     # URI lists still validate each URI independently.
     for match in S3_URI_START_RE.finditer(s):
-        rest = s[match.start():]
+        rest = s[match.start() :]
         end_match = S3_TOKEN_END_RE.search(rest)
         yield rest[: end_match.start()] if end_match else rest
 
