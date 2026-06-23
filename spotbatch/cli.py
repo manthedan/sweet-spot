@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 import boto3
 
-from .aws_batch import active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
+from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .s3util import s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
 from .worker import default_done_s3, run_worker
 
@@ -570,6 +570,126 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     return 2 if args.require_complete and not final_manifest["complete"] else 0
 
 
+def _containers_log_stream(task_properties: Any) -> str | None:
+    for task_prop in reversed(task_properties or []):
+        for container in reversed(task_prop.get("containers") or []):
+            stream = container.get("logStreamName")
+            if stream:
+                return str(stream)
+    return None
+
+
+def _job_log_stream(job: dict[str, Any]) -> str | None:
+    attempts = job.get("attempts") or []
+    for attempt in reversed(attempts):
+        stream = ((attempt.get("container") or {}).get("logStreamName")) or _containers_log_stream(attempt.get("taskProperties"))
+        if stream:
+            return str(stream)
+    stream = ((job.get("container") or {}).get("logStreamName")) or _containers_log_stream(((job.get("ecsProperties") or {}).get("taskProperties")))
+    return str(stream) if stream else None
+
+
+def _describe_one_job(batch, job_id: str) -> dict[str, Any]:
+    jobs = batch.describe_jobs(jobs=[job_id]).get("jobs", [])
+    if not jobs:
+        raise SystemExit(f"job not found: {job_id}")
+    return jobs[0]
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    batch = session.client("batch", region_name=args.region)
+    statuses = args.status or ACTIVE_STATUSES
+    rows: list[dict[str, Any]] = []
+    for status in statuses:
+        paginator = batch.get_paginator("list_jobs")
+        for page in paginator.paginate(jobQueue=args.job_queue, jobStatus=status):
+            for job in page.get("jobSummaryList", []):
+                if args.name_regex and not re.search(args.name_regex, str(job.get("jobName", ""))):
+                    continue
+                rows.append({"jobId": job.get("jobId"), "jobName": job.get("jobName"), "status": status, "createdAt": job.get("createdAt"), "startedAt": job.get("startedAt"), "stoppedAt": job.get("stoppedAt")})
+                if len(rows) >= args.max_jobs:
+                    break
+            if len(rows) >= args.max_jobs:
+                break
+        if len(rows) >= args.max_jobs:
+            break
+    print(json.dumps({"schema": "spotbatch.jobs.v1", "checked_at": iso_now(), "job_queue": args.job_queue, "statuses": statuses, "count": len(rows), "jobs": rows}, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_describe_job(args: argparse.Namespace) -> int:
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    batch = session.client("batch", region_name=args.region)
+    job = _describe_one_job(batch, args.job_id)
+    container = job.get("container") or {}
+    report = {
+        "schema": "spotbatch.job_description.v1",
+        "checked_at": iso_now(),
+        "jobId": job.get("jobId"),
+        "jobName": job.get("jobName"),
+        "jobQueue": job.get("jobQueue"),
+        "status": job.get("status"),
+        "statusReason": job.get("statusReason"),
+        "createdAt": job.get("createdAt"),
+        "startedAt": job.get("startedAt"),
+        "stoppedAt": job.get("stoppedAt"),
+        "containerReason": container.get("reason"),
+        "exitCode": container.get("exitCode"),
+        "logStreamName": _job_log_stream(job),
+        "attempts": job.get("attempts", []),
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _log_stream_from_args(session, args: argparse.Namespace) -> str:
+    if args.log_stream:
+        return args.log_stream
+    if not args.job_id:
+        raise SystemExit("logs requires --log-stream or --job-id")
+    batch = session.client("batch", region_name=args.region)
+    stream = _job_log_stream(_describe_one_job(batch, args.job_id))
+    if not stream:
+        raise SystemExit(f"job has no log stream yet: {args.job_id}")
+    return stream
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    logs = session.client("logs", region_name=args.region)
+    stream = _log_stream_from_args(session, args)
+    kwargs: dict[str, Any] = {"logGroupName": args.log_group, "logStreamName": stream, "limit": args.limit, "startFromHead": args.start_from_head or bool(args.next_token)}
+    if args.next_token:
+        kwargs["nextToken"] = args.next_token
+    resp = logs.get_log_events(**kwargs)
+    events = []
+    for ev in resp.get("events", []):
+        msg = str(ev.get("message", ""))
+        if args.filter_regex and not re.search(args.filter_regex, msg):
+            continue
+        events.append({"timestamp": ev.get("timestamp"), "message": msg})
+    print(json.dumps({"schema": "spotbatch.logs.v1", "checked_at": iso_now(), "log_group": args.log_group, "log_stream": stream, "count": len(events), "nextForwardToken": resp.get("nextForwardToken"), "events": events[-args.tail :] if args.tail else events}, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_watch_job(args: argparse.Namespace) -> int:
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    batch = session.client("batch", region_name=args.region)
+    deadline = time.time() + args.max_seconds if args.max_seconds else None
+    last_report = None
+    while True:
+        job = _describe_one_job(batch, args.job_id)
+        status = str(job.get("status"))
+        last_report = {"schema": "spotbatch.watch_job.v1", "checked_at": iso_now(), "jobId": job.get("jobId"), "jobName": job.get("jobName"), "status": status, "statusReason": job.get("statusReason"), "logStreamName": _job_log_stream(job)}
+        print(json.dumps(last_report, indent=2, sort_keys=True))
+        if status in {"SUCCEEDED", "FAILED"}:
+            return 0 if status == "SUCCEEDED" else 2
+        if deadline and time.time() >= deadline:
+            return 3
+        time.sleep(args.interval_seconds)
+
+
 def _parse_body(msg: dict[str, Any]) -> dict[str, Any]:
     try:
         body = json.loads(msg.get("Body", "{}"))
@@ -709,6 +829,42 @@ def main() -> int:
     p.add_argument("--allow-incomplete-ready", action="store_true", help="unsafe: publish READY even when tasks are incomplete")
     p.add_argument("--require-complete", action="store_true")
     p.set_defaults(func=cmd_finalize)
+
+    p = sub.add_parser("jobs")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--job-queue", required=True)
+    p.add_argument("--status", action="append", choices=list(ACTIVE_STATUSES) + ["SUCCEEDED", "FAILED"], help="repeatable; default active statuses")
+    p.add_argument("--name-regex")
+    p.add_argument("--max-jobs", type=int, default=1000)
+    p.set_defaults(func=cmd_jobs)
+
+    p = sub.add_parser("describe-job")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--job-id", required=True)
+    p.set_defaults(func=cmd_describe_job)
+
+    p = sub.add_parser("logs")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--job-id")
+    p.add_argument("--log-group", default="/aws/batch/job")
+    p.add_argument("--log-stream")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--tail", type=int, default=0)
+    p.add_argument("--filter-regex")
+    p.add_argument("--next-token")
+    p.add_argument("--start-from-head", action="store_true")
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("watch-job")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--job-id", required=True)
+    p.add_argument("--interval-seconds", type=float, default=30.0)
+    p.add_argument("--max-seconds", type=float, default=0.0)
+    p.set_defaults(func=cmd_watch_job)
 
     p = sub.add_parser("dlq")
     p.add_argument("--dlq-url", required=True)

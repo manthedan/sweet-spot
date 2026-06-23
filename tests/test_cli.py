@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _parse_index_selection, _redact_env, _supervisor_desired_workers, cmd_derive_canary, cmd_finalize, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_supervise_workers
 
 
 class CanaryTests(unittest.TestCase):
@@ -132,6 +132,58 @@ class CanaryTests(unittest.TestCase):
             self.assertEqual(manifest["selected_indices"], [1])
             self.assertEqual(manifest["expected_done_s3"], ["s3://b/r/done/t1"])
             self.assertTrue((out_dir / "dlq_probe_task.jsonl").exists())
+
+
+class FakeLogsClient:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] | None = None
+
+    def get_log_events(self, **kwargs):
+        self.kwargs = kwargs
+        return {"events": [], "nextForwardToken": "next"}
+
+
+class FakeLogSession:
+    def __init__(self, logs_client: FakeLogsClient) -> None:
+        self.logs_client = logs_client
+
+    def client(self, service: str, region_name=None):
+        assert service == "logs"
+        return self.logs_client
+
+
+class BatchOperatorTests(unittest.TestCase):
+    def test_logs_next_token_forces_start_from_head(self) -> None:
+        logs = FakeLogsClient()
+        args = types.SimpleNamespace(
+            profile=None,
+            region=None,
+            log_stream="stream",
+            job_id=None,
+            log_group="/aws/batch/job",
+            limit=10,
+            start_from_head=False,
+            next_token="token",
+            filter_regex=None,
+            tail=0,
+        )
+        with patch("spotbatch.cli.boto3.Session", return_value=FakeLogSession(logs)), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cmd_logs(args), 0)
+        self.assertEqual(logs.kwargs["startFromHead"], True)
+
+    def test_job_log_stream_reads_ecs_task_properties(self) -> None:
+        job = {"attempts": [{"taskProperties": [{"containers": [{"logStreamName": "ecs-stream"}]}]}]}
+        self.assertEqual(_job_log_stream(job), "ecs-stream")
+
+    def test_job_log_stream_prefers_latest_attempt(self) -> None:
+        job = {
+            "container": {"logStreamName": "container-stream"},
+            "attempts": [
+                {"container": {"logStreamName": "attempt-1"}},
+                {"container": {"logStreamName": "attempt-2"}},
+            ],
+        }
+        self.assertEqual(_job_log_stream(job), "attempt-2")
 
 
 class SupervisorPlanningTests(unittest.TestCase):

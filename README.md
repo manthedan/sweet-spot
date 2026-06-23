@@ -136,6 +136,12 @@ spotbatch finalize \
   --publish-ready \
   --require-complete
 
+# inspect AWS Batch jobs and logs
+spotbatch jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001
+spotbatch describe-job --job-id AWS_BATCH_JOB_ID
+spotbatch logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERROR'
+spotbatch watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
+
 # inspect DLQ
 spotbatch dlq \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
