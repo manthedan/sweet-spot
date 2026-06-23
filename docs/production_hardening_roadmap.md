@@ -25,14 +25,14 @@ Goal: remove the sharpest correctness hazards without redesigning the commit pro
 
 Goal: tolerate duplicate delivery and concurrent execution without canonical output/marker overwrite.
 
-- [ ] Define a canonical task hash over stable task fields.
-- [ ] Assign every execution an immutable attempt ID.
-- [ ] Support attempt-scoped output, summary, and log paths.
-- [ ] Record output size and SHA-256 in the completion marker.
-- [ ] Publish the canonical done marker with S3 conditional write (`If-None-Match: *`).
-- [ ] Treat a 412/precondition failure as "another attempt won"; read and validate the winning marker before deleting SQS.
-- [ ] Validate existing marker schema, run ID, task ID, task hash, output URI, size, and checksum before skipping.
-- [ ] Add tests for simultaneous duplicate delivery, stale/corrupt markers, and interruption between every commit step.
+- [x] Define a canonical task hash over stable task fields.
+- [x] Assign every execution an immutable attempt ID.
+- [x] Support attempt-scoped output, summary, and log paths.
+- [x] Record output size and SHA-256 in the completion marker.
+- [x] Publish the canonical done marker with S3 conditional write (`If-None-Match: *`).
+- [x] Treat a 412/precondition failure as "another attempt won"; read and validate the winning marker before deleting SQS.
+- [x] Validate existing marker schema, run ID, task ID, task hash, output URI, size, and checksum before skipping.
+- [x] Add tests for duplicate delivery, stale/corrupt markers, and commit-race interruption behavior.
 
 ## Milestone 3 — IAM and input model hardening
 

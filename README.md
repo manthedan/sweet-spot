@@ -70,14 +70,18 @@ The worker sets environment variables for the command:
 SPOTBATCH_TASK_JSON       path to local task JSON
 SPOTBATCH_TASK_ID
 SPOTBATCH_RUN_ID
+SPOTBATCH_TASK_HASH       stable hash of the task fields committed by the worker
+SPOTBATCH_ATTEMPT_ID      immutable execution attempt id
 SPOTBATCH_OUTPUT_PATH     local path to write if output_s3 should be uploaded by framework
-SPOTBATCH_OUTPUT_S3
-SPOTBATCH_SUMMARY_S3
-SPOTBATCH_DONE_S3
+SPOTBATCH_OUTPUT_S3       attempt-scoped S3 URI used by this execution
+SPOTBATCH_SUMMARY_S3      attempt-scoped S3 URI used by this execution
+SPOTBATCH_DONE_S3         canonical conditional done marker URI
 SPOTBATCH_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 39600 / 11h)
 ```
 
-If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. The done marker is uploaded last.
+If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. Successful workers upload output, summaries, and stdout/stderr under attempt-scoped S3 paths, then publish the canonical done marker with a conditional `If-None-Match: *` write. If another duplicate attempt won first, the worker validates the winning marker before deleting the SQS message.
+
+For v2 markers, `output_s3` in the task is the logical output URI used for task hashing; the actual immutable object URI is recorded in the done marker's `output.uri` and in the final manifest `outputs` list.
 
 Task-provided `env` keys may not start with `SPOTBATCH_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
 
