@@ -357,10 +357,50 @@ class FinalizeTests(unittest.TestCase):
             self.assertIsNone(manifest["ready_s3"])
             self.assertNotIn(("bucket", "runs/r1/READY"), s3.objects)
 
+    def test_finalize_refuses_ready_when_done_exists_but_output_missing(self) -> None:
+        s3 = FakeFinalizeS3()
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"{}"}
+        tasks = [
+            {
+                "run_id": "r1",
+                "task_id": "task-1",
+                "output_s3": "s3://bucket/runs/r1/shards/task-1.txt",
+                "done_s3": "s3://bucket/runs/r1/done/task-1.done.json",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=1,
+                progress_interval=0,
+                write_repair_jsonl=None,
+                upload=True,
+                publish_ready=True,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                require_complete=False,
+            )
+            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+                rc = cmd_finalize(args)
+            self.assertEqual(rc, 2)
+            manifest = json.loads(s3.objects[("bucket", "runs/r1/manifests/final_manifest.json")]["Body"])
+            self.assertEqual(manifest["missing_done_count"], 0)
+            self.assertEqual(manifest["missing_output_count"], 1)
+            self.assertFalse(manifest["complete"])
+            self.assertNotIn(("bucket", "runs/r1/READY"), s3.objects)
+
     def test_finalize_publishes_ready_after_complete_manifest_upload(self) -> None:
         s3 = FakeFinalizeS3()
         s3.objects[("bucket", "runs/r1/done/task-10.done.json")] = {"Body": b"{}"}
         s3.objects[("bucket", "runs/r1/done/task-2.done.json")] = {"Body": b"{}"}
+        s3.objects[("bucket", "runs/r1/shards/task-10.txt")] = {"Body": b"ok"}
+        s3.objects[("bucket", "runs/r1/shards/task-2.txt")] = {"Body": b"ok"}
         tasks = [
             {
                 "run_id": "r1",
