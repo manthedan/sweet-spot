@@ -479,7 +479,7 @@ def main() -> int:
     instance_rows.sort(key=lambda r: (r["expected_total_cost_per_1m_units"], -(r.get("placement_score") or -1), not bool(r.get("bucket_local"))))
 
     report = {
-        "schema": "spotbatch.spot_scout.v1",
+        "schema": "sweetspot.scout.v1",
         "checked_at": now.isoformat(),
         "home_region": args.home_region,
         "bucket": args.bucket,

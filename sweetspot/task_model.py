@@ -9,8 +9,8 @@ from typing import Any, Iterable, Sequence
 from .s3util import parse_s3_uri
 
 
-TASK_SCHEMA_V1 = "spotbatch.task.v1"
-RESERVED_TASK_ENV_PREFIXES = ("SPOTBATCH_", "AWS_", "ECS_")
+TASK_SCHEMA_V1 = "sweetspot.task.v1"
+RESERVED_TASK_ENV_PREFIXES = ("SWEETSPOT_", "AWS_", "ECS_")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$")
 S3_URI_START_RE = re.compile(r"s3://")
 S3_TOKEN_END_RE = re.compile(r"[\s'\"<>]")

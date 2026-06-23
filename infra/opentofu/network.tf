@@ -1,7 +1,7 @@
 resource "aws_security_group" "batch_no_ingress" {
   count       = var.create_no_ingress_security_group && length(var.security_group_ids) == 0 ? 1 : 0
   name_prefix = "${var.project_name}-batch-no-ingress-"
-  description = "No-ingress security group for SpotBatch Batch instances"
+  description = "No-ingress security group for SweetSpot Batch instances"
   vpc_id      = data.aws_vpc.selected.id
 
   egress {

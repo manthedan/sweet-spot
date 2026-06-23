@@ -5,21 +5,21 @@ ARG APP_GID=10001
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOME=/home/spotbatch
+    HOME=/home/sweetspot
 
-RUN groupadd --gid "${APP_GID}" spotbatch \
-    && useradd --uid "${APP_UID}" --gid spotbatch --home-dir /home/spotbatch --no-create-home --shell /usr/sbin/nologin spotbatch \
-    && mkdir -p /home/spotbatch /work \
-    && chown -R spotbatch:spotbatch /home/spotbatch /work
+RUN groupadd --gid "${APP_GID}" sweetspot \
+    && useradd --uid "${APP_UID}" --gid sweetspot --home-dir /home/sweetspot --no-create-home --shell /usr/sbin/nologin sweetspot \
+    && mkdir -p /home/sweetspot /work \
+    && chown -R sweetspot:sweetspot /home/sweetspot /work
 
 WORKDIR /app
 COPY pyproject.toml README.md requirements.lock /app/
-COPY spotbatch /app/spotbatch
+COPY sweetspot /app/sweetspot
 COPY examples /app/examples
 
 RUN python -m pip install --no-cache-dir --constraint /app/requirements.lock /app
 
-USER spotbatch:spotbatch
+USER sweetspot:sweetspot
 WORKDIR /work
 
-CMD ["spotbatch", "worker"]
+CMD ["sweetspot", "worker"]

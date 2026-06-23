@@ -29,7 +29,7 @@ jobs:
       - name: Lint
         run: python -m ruff check .
       - name: Type check
-        run: python -m mypy spotbatch
+        run: python -m mypy sweetspot
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
@@ -64,8 +64,8 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.worker
-          tags: spotbatch-worker:ci
-          outputs: type=oci,dest=/tmp/spotbatch-worker.oci.tar
+          tags: sweetspot-worker:ci
+          outputs: type=oci,dest=/tmp/sweetspot-worker.oci.tar
           push: false
           sbom: true
           provenance: mode=max
@@ -73,7 +73,7 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0; includes setup-trivy pinned to v0.2.6
         with:
           scan-type: image
-          input: /tmp/spotbatch-worker.oci.tar
+          input: /tmp/sweetspot-worker.oci.tar
           format: table
           vuln-type: os,library
           severity: CRITICAL,HIGH
@@ -82,6 +82,6 @@ jobs:
       - name: Upload attested OCI image artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: spotbatch-worker-oci
-          path: /tmp/spotbatch-worker.oci.tar
+          name: sweetspot-worker-oci
+          path: /tmp/sweetspot-worker.oci.tar
           if-no-files-found: error

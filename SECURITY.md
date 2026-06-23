@@ -6,12 +6,12 @@ This project is pre-1.0. Security fixes are made on `main` until a formal releas
 
 ## Threat model
 
-SpotBatch is designed for **trusted, idempotent AWS Batch workloads**. It is not a sandbox for arbitrary untrusted code.
+SweetSpot is designed for **trusted, idempotent AWS Batch workloads**. It is not a sandbox for arbitrary untrusted code.
 
 The SQS work queue is a trusted control plane: any principal that can enqueue a task can choose the command executed by the worker job role. Production deployments should therefore:
 
 - restrict SQS producers to trusted identities only;
-- set `SPOTBATCH_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` so task payload S3 URIs remain inside approved prefixes;
+- set `SWEETSPOT_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` so task payload S3 URIs remain inside approved prefixes;
 - keep task commands idempotent and bind external side effects to `task_id` / `task_hash`;
 - run workers with the least-privilege IAM role generated or reviewed for the specific bucket/prefix/queue set;
 - keep Batch security groups no-ingress by default;

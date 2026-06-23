@@ -1,8 +1,8 @@
-# Miser
+# SweetSpot
 
-Miser is a cost-aware AWS Batch Spot work runner for trusted, idempotent, embarrassingly parallel workloads.
+SweetSpot is a cost-aware AWS Batch Spot work runner for trusted, idempotent, embarrassingly parallel workloads.
 
-The installed CLI is `spotbatch`. Older docs and package metadata may still refer to the original package name, `aws-batch-job-runner`.
+Install the Python package and use the `sweetspot` CLI for enqueueing, worker submission, finalization, diagnostics, Spot scouting, and lane management.
 
 This project packages a reliability pattern for large retryable AWS Batch jobs:
 
@@ -18,7 +18,7 @@ SQS task message
 
 If a Spot host dies before ack, SQS visibility timeout returns the task. If a task repeatedly fails, SQS redrives it to the DLQ.
 
-Miser is an at-least-once runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent, or use `task_id` as their own idempotency key for external side effects. Do not expose the queue to untrusted producers.
+SweetSpot is an at-least-once runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent, or use `task_id` as their own idempotency key for external side effects. Do not expose the queue to untrusted producers.
 
 ## What it is
 
@@ -50,7 +50,7 @@ pip install --constraint requirements.lock -e .
 pip install --constraint requirements-dev.lock -e '.[dev]'
 ruff format --check .
 ruff check .
-mypy spotbatch
+mypy sweetspot
 python -m unittest discover -s tests -v
 
 # full local release closeout (also runs OpenTofu checks when tofu is installed)
@@ -63,7 +63,7 @@ Each SQS message is a JSON object:
 
 ```json
 {
-  "schema": "spotbatch.task.v1",
+  "schema": "sweetspot.task.v1",
   "run_id": "hello-001",
   "task_id": "task-000001",
   "command": ["python", "/app/hello_worker.py"],
@@ -77,32 +77,32 @@ Each SQS message is a JSON object:
 The worker sets environment variables for the command:
 
 ```text
-SPOTBATCH_TASK_JSON       path to local task JSON
-SPOTBATCH_TASK_ID
-SPOTBATCH_RUN_ID
-SPOTBATCH_TASK_HASH       stable hash of the task fields committed by the worker
-SPOTBATCH_ATTEMPT_ID      immutable execution attempt id
-SPOTBATCH_OUTPUT_PATH     local path to write if output_s3 should be uploaded by framework
-SPOTBATCH_METRICS_PATH    optional JSON metrics file written by the command for cost telemetry
-SPOTBATCH_OUTPUT_S3       attempt-scoped S3 URI used by this execution
-SPOTBATCH_SUMMARY_S3      attempt-scoped S3 URI used by this execution
-SPOTBATCH_DONE_S3         canonical conditional done marker URI
-SPOTBATCH_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 39600 / 11h)
+SWEETSPOT_TASK_JSON       path to local task JSON
+SWEETSPOT_TASK_ID
+SWEETSPOT_RUN_ID
+SWEETSPOT_TASK_HASH       stable hash of the task fields committed by the worker
+SWEETSPOT_ATTEMPT_ID      immutable execution attempt id
+SWEETSPOT_OUTPUT_PATH     local path to write if output_s3 should be uploaded by framework
+SWEETSPOT_METRICS_PATH    optional JSON metrics file written by the command for cost telemetry
+SWEETSPOT_OUTPUT_S3       attempt-scoped S3 URI used by this execution
+SWEETSPOT_SUMMARY_S3      attempt-scoped S3 URI used by this execution
+SWEETSPOT_DONE_S3         canonical conditional done marker URI
+SWEETSPOT_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 39600 / 11h)
 ```
 
-If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. Successful workers upload output, summaries, and stdout/stderr under attempt-scoped S3 paths, then publish the canonical done marker with a conditional `If-None-Match: *` write. If another duplicate attempt won first, the worker validates the winning marker before deleting the SQS message.
+If `output_s3` is present, the command must create `SWEETSPOT_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. Successful workers upload output, summaries, and stdout/stderr under attempt-scoped S3 paths, then publish the canonical done marker with a conditional `If-None-Match: *` write. If another duplicate attempt won first, the worker validates the winning marker before deleting the SQS message.
 
 For v2 markers, `output_s3` in the task is the logical output URI used for task hashing; the actual immutable object URI is recorded in the done marker's `output.uri` and in finalizer outputs manifests.
 
-Task payloads are validated as `spotbatch.task.v1` before execution: `run_id`, `task_id`, `command`, timeout, env, marker URIs, and S3 URI syntax must pass bounded checks. Task-provided `env` keys may not start with `SPOTBATCH_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
+Task payloads are validated as `sweetspot.task.v1` before execution: `run_id`, `task_id`, `command`, timeout, env, marker URIs, and S3 URI syntax must pass bounded checks. Task-provided `env` keys may not start with `SWEETSPOT_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
 
-For production, set `SPOTBATCH_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `spotbatch worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be inside one of those prefixes.
+For production, set `SWEETSPOT_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `sweetspot worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be inside one of those prefixes.
 
-Finalization is streaming and scale-oriented: `spotbatch finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
+Finalization is streaming and scale-oriented: `sweetspot finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
 
 Worker observability is on by default: child stdout/stderr are streamed to container logs for CloudWatch, a bounded redacted tail is stored in the task summary, and capped redacted attempt logs are uploaded to S3. Use `--log-tail-bytes`, `--max-log-bytes`, and repeatable `--redact-regex` on `worker`, `submit-workers`, or `supervise-workers` for sensitive workloads. Redaction is applied per newline-terminated log record; overlong unterminated records are suppressed with a placeholder rather than risk leaking a partial secret.
 
-For measured cost optimization, tasks may write a JSON object to `SPOTBATCH_METRICS_PATH`, for example `{"completed_units": 100000, "useful_compute_seconds": 3600, "input_bytes": 1048576, "output_bytes": 524288}`. The worker includes this under `summary.telemetry` together with instance/architecture/Region/AZ/image best-effort metadata, SQS receive count/retry status, startup delay from SQS sent timestamp, bytes transferred, interruption/failure status, and discarded compute seconds. `spotbatch-spot-scout --observed-summaries ...` consumes these summaries to rank pools by expected total cost, not only Spot price.
+For measured cost optimization, tasks may write a JSON object to `SWEETSPOT_METRICS_PATH`, for example `{"completed_units": 100000, "useful_compute_seconds": 3600, "input_bytes": 1048576, "output_bytes": 524288}`. The worker includes this under `summary.telemetry` together with instance/architecture/Region/AZ/image best-effort metadata, SQS receive count/retry status, startup delay from SQS sent timestamp, bytes transferred, interruption/failure status, and discarded compute seconds. `sweetspot-scout --observed-summaries ...` consumes these summaries to rank pools by expected total cost, not only Spot price.
 
 Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much shorter shards, and checkpoint/split work that cannot fit safely under the default 11-hour cap.
 
@@ -110,7 +110,7 @@ Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much sho
 
 ```bash
 # enqueue JSONL task messages
-spotbatch enqueue-jsonl \
+sweetspot enqueue-jsonl \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --tasks-jsonl examples/hello_world/tasks.jsonl \
   --artifact-dir artifacts/hello-001 \
@@ -118,14 +118,14 @@ spotbatch enqueue-jsonl \
   --submit
 
 # derive a deterministic canary subset before large launches
-spotbatch derive-canary \
+sweetspot derive-canary \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
   --out-dir artifacts/hello-001/canary \
   --task-count 4 \
   --include-dlq-probe
 
 # submit AWS Batch workers, dry-run by default
-spotbatch submit-workers \
+sweetspot submit-workers \
   --sqs-queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --batch-job-queue my-batch-spot-queue \
   --job-definition my-worker-jobdef:1 \
@@ -138,7 +138,7 @@ spotbatch submit-workers \
 # add --submit after reviewing the dry-run
 
 # keep a bounded worker pool topped up across one or more loops
-spotbatch supervise-workers \
+sweetspot supervise-workers \
   --sqs-queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --batch-job-queue my-batch-spot-queue \
   --job-definition my-worker-jobdef:1 \
@@ -150,7 +150,7 @@ spotbatch supervise-workers \
 # add --submit after reviewing the dry-run
 
 # preflight AWS/SQS/S3/Batch/CloudWatch permissions and configuration
-spotbatch doctor \
+sweetspot doctor \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
   --job-queue my-batch-spot-queue \
@@ -158,7 +158,7 @@ spotbatch doctor \
   --s3-prefix s3://my-bucket/runs/hello-001
 
 # finalize by streaming tasks, checking S3 done markers, and writing manifests
-spotbatch finalize \
+sweetspot finalize \
   --run-id hello-001 \
   --output-prefix s3://my-bucket/runs/hello-001 \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
@@ -168,7 +168,7 @@ spotbatch finalize \
   --require-complete
 
 # optionally upload final_manifest.json and publish READY only when complete
-spotbatch finalize \
+sweetspot finalize \
   --run-id hello-001 \
   --output-prefix s3://my-bucket/runs/hello-001 \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
@@ -177,33 +177,33 @@ spotbatch finalize \
   --require-complete
 
 # inspect AWS Batch jobs and logs
-spotbatch jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001
-spotbatch describe-job --job-id AWS_BATCH_JOB_ID
-spotbatch logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERROR'
-# If --job-id is provided and --log-group is omitted, spotbatch uses the job's awslogs-group when AWS Batch reports it.
-spotbatch watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
+sweetspot jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001
+sweetspot describe-job --job-id AWS_BATCH_JOB_ID
+sweetspot logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERROR'
+# If --job-id is provided and --log-group is omitted, sweetspot uses the job's awslogs-group when AWS Batch reports it.
+sweetspot watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
 
 # dry-run a guarded S3 prefix cleanup; add --delete and exact --confirm-prefix to mutate.
 # Add --include-versions for versioned buckets so old versions and delete markers are included.
-spotbatch s3-delete-prefix \
+sweetspot s3-delete-prefix \
   --prefix s3://my-bucket/runs/old-run/ \
   --include-versions \
   --artifact-dir artifacts/old-run/delete-dryrun
 
 # inspect DLQ; filtered manual redrive is available for small repairs
-spotbatch dlq \
+sweetspot dlq \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
   --run-id hello-001
 
 # whole-DLQ redrive should use native SQS StartMessageMoveTask where possible
-spotbatch dlq \
+sweetspot dlq \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --native-redrive \
   --apply
 
 # read-only Spot scout
-spotbatch-spot-scout \
+sweetspot-scout \
   --preset x86 \
   --regions us-west-2 us-east-2 eu-north-1 \
   --target-vcpus 256 512 \
@@ -212,10 +212,10 @@ spotbatch-spot-scout \
   --startup-overhead-seconds 90 \
   --cross-region-gb-per-1m-units 2 \
   --nat-gb-per-1m-units 0 \
-  --json-out artifacts/hello-001/spot_scout.json
+  --json-out artifacts/hello-001/scout.json
 
 # multi-lane dry-run submitter; lanes with expected_total_cost_per_1m_units are allocated cheapest-first among eligible placement scores
-spotbatch-lane-manager --config lanes.json
+sweetspot-lane-manager --config lanes.json
 ```
 
 ## OpenTofu
@@ -231,7 +231,7 @@ spotbatch-lane-manager --config lanes.json
 - CloudWatch dashboard and baseline alarms for queue age, DLQ depth, Batch failures, and runnable-job stalls
 - optional monthly AWS Budget alerts
 
-Runtime and dev dependency lock files (`requirements.lock`, `requirements-dev.lock`) pin the Python dependency graph used by Docker and CI. The worker Dockerfile pins its Python base image by digest and drops to an unprivileged `spotbatch` user. CI runs unit tests, Ruff formatting/linting, typing, OpenTofu lock/fmt/validate checks, and a container build with SBOM/provenance attestations plus Trivy scanning.
+Runtime and dev dependency lock files (`requirements.lock`, `requirements-dev.lock`) pin the Python dependency graph used by Docker and CI. The worker Dockerfile pins its Python base image by digest and drops to an unprivileged `sweetspot` user. CI runs unit tests, Ruff formatting/linting, typing, OpenTofu lock/fmt/validate checks, and a container build with SBOM/provenance attestations plus Trivy scanning.
 
 See `infra/opentofu/README.md`.
 

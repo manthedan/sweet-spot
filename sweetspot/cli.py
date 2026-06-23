@@ -55,7 +55,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _env_allowed_s3_prefixes() -> list[str]:
-    return list(parse_allowed_s3_prefixes(os.environ.get("SPOTBATCH_ALLOWED_S3_PREFIXES")))
+    return list(parse_allowed_s3_prefixes(os.environ.get("SWEETSPOT_ALLOWED_S3_PREFIXES")))
 
 
 def _validate_unique_task_ids(tasks: list[dict[str, Any]], *, context: str) -> None:
@@ -160,7 +160,7 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "schema": "spotbatch.enqueue_summary.v1",
+                "schema": "sweetspot.enqueue_summary.v1",
                 "checked_at": iso_now(),
                 "queue_url": args.queue_url,
                 "task_count": len(tasks),
@@ -212,17 +212,17 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
     canary_tasks_path.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in canary_tasks))
     if args.include_dlq_probe:
         bad_task = {
-            "schema": "spotbatch.task.v1",
+            "schema": "sweetspot.task.v1",
             "run_id": effective_run_id,
             "task_id": f"{effective_run_id}-intentional-dlq-probe",
-            "command": ["bash", "-lc", "echo intentional SpotBatch DLQ probe >&2; exit 42"],
+            "command": ["bash", "-lc", "echo intentional SweetSpot DLQ probe >&2; exit 42"],
             "timeout_seconds": 120,
             "purpose": "intentional_dlq_probe_not_part_of_valid_canary",
         }
         assert bad_task_path is not None
         bad_task_path.write_text(json.dumps(bad_task, sort_keys=True) + "\n")
     manifest = {
-        "schema": "spotbatch.canary_manifest.v1",
+        "schema": "sweetspot.canary_manifest.v1",
         "created_at": iso_now(),
         "run_id": effective_run_id,
         "requested_run_id": args.run_id,
@@ -244,7 +244,7 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "schema": "spotbatch.derive_canary_summary.v1",
+                "schema": "sweetspot.derive_canary_summary.v1",
                 "run_id": effective_run_id,
                 "requested_run_id": args.run_id,
                 "task_count": len(canary_tasks),
@@ -297,22 +297,22 @@ def _worker_overrides(
     memory: int | None = None,
 ) -> dict[str, Any]:
     base_env = [
-        {"name": "SPOTBATCH_SQS_QUEUE_URL", "value": sqs_queue_url},
-        {"name": "SPOTBATCH_MAX_MESSAGES", "value": str(messages_per_worker)},
-        {"name": "SPOTBATCH_VISIBILITY_TIMEOUT", "value": str(visibility_timeout)},
-        {"name": "SPOTBATCH_HEARTBEAT_SECONDS", "value": str(heartbeat_seconds)},
-        {"name": "SPOTBATCH_TASK_TIMEOUT_SECONDS", "value": str(task_timeout_seconds)},
+        {"name": "SWEETSPOT_SQS_QUEUE_URL", "value": sqs_queue_url},
+        {"name": "SWEETSPOT_MAX_MESSAGES", "value": str(messages_per_worker)},
+        {"name": "SWEETSPOT_VISIBILITY_TIMEOUT", "value": str(visibility_timeout)},
+        {"name": "SWEETSPOT_HEARTBEAT_SECONDS", "value": str(heartbeat_seconds)},
+        {"name": "SWEETSPOT_TASK_TIMEOUT_SECONDS", "value": str(task_timeout_seconds)},
     ]
     normalized_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
     if normalized_prefixes:
-        base_env.append({"name": "SPOTBATCH_ALLOWED_S3_PREFIXES", "value": ",".join(normalized_prefixes)})
+        base_env.append({"name": "SWEETSPOT_ALLOWED_S3_PREFIXES", "value": ",".join(normalized_prefixes)})
     if log_tail_bytes is not None:
-        base_env.append({"name": "SPOTBATCH_LOG_TAIL_BYTES", "value": str(log_tail_bytes)})
+        base_env.append({"name": "SWEETSPOT_LOG_TAIL_BYTES", "value": str(log_tail_bytes)})
     if max_log_bytes is not None:
-        base_env.append({"name": "SPOTBATCH_MAX_LOG_BYTES", "value": str(max_log_bytes)})
+        base_env.append({"name": "SWEETSPOT_MAX_LOG_BYTES", "value": str(max_log_bytes)})
     if redact_regexes:
         parse_redact_patterns(redact_regexes)
-        base_env.append({"name": "SPOTBATCH_REDACT_REGEXES", "value": "\n".join(redact_regexes)})
+        base_env.append({"name": "SWEETSPOT_REDACT_REGEXES", "value": "\n".join(redact_regexes)})
     base_env.extend(env or [])
     overrides: dict[str, Any] = {"environment": base_env}
     if vcpus is not None:
@@ -351,7 +351,7 @@ def _submit_worker_jobs(
 
 def cmd_submit_workers(args: argparse.Namespace) -> int:
     if not args.sqs_queue_url:
-        raise SystemExit("missing --sqs-queue-url or SPOTBATCH_SQS_QUEUE_URL")
+        raise SystemExit("missing --sqs-queue-url or SWEETSPOT_SQS_QUEUE_URL")
     try:
         validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
     except ValueError as exc:
@@ -395,7 +395,7 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "schema": "spotbatch.worker_submitter_summary.v1",
+                "schema": "sweetspot.worker_submitter_summary.v1",
                 "checked_at": iso_now(),
                 "submit": bool(args.submit),
                 "queue_depth": depth,
@@ -435,7 +435,7 @@ def _supervisor_desired_workers(*, backlog: int, messages_per_worker: int, targe
 
 def cmd_supervise_workers(args: argparse.Namespace) -> int:
     if not args.sqs_queue_url:
-        raise SystemExit("missing --sqs-queue-url or SPOTBATCH_SQS_QUEUE_URL")
+        raise SystemExit("missing --sqs-queue-url or SWEETSPOT_SQS_QUEUE_URL")
     if args.stop_on_dlq and not args.dlq_url:
         raise SystemExit("--stop-on-dlq requires --dlq-url")
     try:
@@ -451,7 +451,7 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
     summary_path = artifact_dir / "supervisor_summary.json"
     config_path = artifact_dir / "supervisor_config.json"
     config = {
-        "schema": "spotbatch.supervisor_config.v1",
+        "schema": "sweetspot.supervisor_config.v1",
         "created_at": iso_now(),
         "run_id": args.run_id,
         "sqs_queue_url": args.sqs_queue_url,
@@ -522,7 +522,7 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
                 retry_attempts=args.retry_attempts,
             )
         record = {
-            "schema": "spotbatch.supervisor_loop.v1",
+            "schema": "sweetspot.supervisor_loop.v1",
             "checked_at": iso_now(),
             "loop_index": loop_index,
             "submit": bool(args.submit),
@@ -549,7 +549,7 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
             time.sleep(args.interval_seconds)
 
     summary = {
-        "schema": "spotbatch.supervisor_summary.v1",
+        "schema": "sweetspot.supervisor_summary.v1",
         "finished_at": iso_now(),
         "run_id": args.run_id,
         "submit": bool(args.submit),
@@ -663,7 +663,7 @@ def _repair_done_marker_candidates(s3, canonical_done_s3: str) -> Iterator[str]:
 def _repair_task_candidates_for_marker_validation(task: dict[str, Any], repair_done_s3: str) -> Iterator[dict[str, Any]]:
     """Yield task payload variants that could have produced a repair marker.
 
-    Current repair tasks include spotbatch_repair_reason, which participates in
+    Current repair tasks include sweetspot_repair_reason, which participates in
     the full task hash. Older repair tasks did not, so validate both forms.
     """
     base = dict(task)
@@ -671,14 +671,14 @@ def _repair_task_candidates_for_marker_validation(task: dict[str, Any], repair_d
     yield base
     for reason in ("invalid_done_marker", "missing_output", "output_without_done", "incomplete"):
         with_reason = dict(base)
-        with_reason["spotbatch_repair_reason"] = reason
+        with_reason["sweetspot_repair_reason"] = reason
         yield with_reason
 
 
 def _valid_repair_done_marker(s3, task: dict[str, Any], canonical_done_s3: str) -> tuple[str, dict[str, Any]] | None:
     for repair_done_s3 in _repair_done_marker_candidates(s3, canonical_done_s3):
         repair_marker = _done_marker_for_task(s3, task, repair_done_s3, None)
-        if repair_marker is None or repair_marker.get("_spotbatch_marker_parse_error"):
+        if repair_marker is None or repair_marker.get("_sweetspot_marker_parse_error"):
             continue
         for repair_task in _repair_task_candidates_for_marker_validation(task, repair_done_s3):
             try:
@@ -699,9 +699,9 @@ def _done_marker_for_task(s3, task: dict[str, Any], done_s3: str, existence_inde
     try:
         marker = json.loads(s3_download_text(s3, done_s3))
     except json.JSONDecodeError as exc:
-        return {"_spotbatch_marker_parse_error": f"done marker is not valid JSON: {exc}"}
+        return {"_sweetspot_marker_parse_error": f"done marker is not valid JSON: {exc}"}
     if not isinstance(marker, dict):
-        return {"_spotbatch_marker_parse_error": f"done marker is not an object: {done_s3}"}
+        return {"_sweetspot_marker_parse_error": f"done marker is not an object: {done_s3}"}
     return marker
 
 
@@ -712,7 +712,7 @@ def _check_task(s3, task: dict[str, Any], existence_index: _S3ExistenceIndex | N
     marker = _done_marker_for_task(s3, task, done_s3, existence_index)
     marker_validation_error = None
     if marker is not None:
-        marker_validation_error = marker.get("_spotbatch_marker_parse_error")
+        marker_validation_error = marker.get("_sweetspot_marker_parse_error")
         if not marker_validation_error:
             try:
                 # validate_done_marker verifies schema/run/task/hash and, for
@@ -781,7 +781,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     args.ready_key = str(args.ready_key).strip("/")
     reserved_ready_keys = {"manifests/final_manifest.json", "manifests/repair_tasks.jsonl", "manifests/task_status.jsonl", "manifests/outputs.jsonl"}
     if args.publish_ready and (not args.ready_key or args.ready_key in reserved_ready_keys):
-        raise SystemExit("--ready-key must not be empty or collide with SpotBatch manifest paths")
+        raise SystemExit("--ready-key must not be empty or collide with SweetSpot manifest paths")
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
     s3 = boto3.client("s3")
@@ -855,7 +855,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             outputs_f.write(json.dumps({"task_id": record["task_id"], "output_s3": output_uri}, sort_keys=True) + "\n")
         status_f.write(json.dumps(record, sort_keys=True) + "\n")
         if args.progress_interval and checked % args.progress_interval == 0:
-            print(f"spotbatch finalize progress: checked={checked}", file=sys.stderr)
+            print(f"sweetspot finalize progress: checked={checked}", file=sys.stderr)
 
     def drain(done_futures: set[cf.Future], status_f, repair_f, outputs_f) -> None:
         nonlocal next_to_emit
@@ -888,10 +888,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             done_futures, _ = cf.wait(pending.keys(), return_when=cf.FIRST_COMPLETED)
             drain(done_futures, status_f, repair_f, outputs_f)
     if args.progress_interval and checked and checked % args.progress_interval != 0:
-        print(f"spotbatch finalize progress: checked={checked}", file=sys.stderr)
+        print(f"sweetspot finalize progress: checked={checked}", file=sys.stderr)
 
     final_manifest = {
-        "schema": "spotbatch.final_manifest.v1",
+        "schema": "sweetspot.final_manifest.v1",
         "run_id": args.run_id,
         "finalized_at": iso_now(),
         "output_prefix": args.output_prefix.rstrip("/"),
@@ -957,7 +957,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         return 2
 
     if args.upload and args.publish_ready:
-        ready = {"schema": "spotbatch.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
+        ready = {"schema": "sweetspot.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
         s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
     print(
         json.dumps(
@@ -1049,7 +1049,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
                 break
         if len(rows) >= args.max_jobs:
             break
-    print(json.dumps({"schema": "spotbatch.jobs.v1", "checked_at": iso_now(), "job_queue": args.job_queue, "statuses": statuses, "count": len(rows), "jobs": rows}, indent=2, sort_keys=True))
+    print(json.dumps({"schema": "sweetspot.jobs.v1", "checked_at": iso_now(), "job_queue": args.job_queue, "statuses": statuses, "count": len(rows), "jobs": rows}, indent=2, sort_keys=True))
     return 0
 
 
@@ -1059,7 +1059,7 @@ def cmd_describe_job(args: argparse.Namespace) -> int:
     job = _describe_one_job(batch, args.job_id)
     container = job.get("container") or {}
     report = {
-        "schema": "spotbatch.job_description.v1",
+        "schema": "sweetspot.job_description.v1",
         "checked_at": iso_now(),
         "jobId": job.get("jobId"),
         "jobName": job.get("jobName"),
@@ -1110,7 +1110,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "schema": "spotbatch.logs.v1",
+                "schema": "sweetspot.logs.v1",
                 "checked_at": iso_now(),
                 "log_group": log_group,
                 "log_stream": stream,
@@ -1134,7 +1134,7 @@ def cmd_watch_job(args: argparse.Namespace) -> int:
         job = _describe_one_job(batch, args.job_id)
         status = str(job.get("status"))
         last_report = {
-            "schema": "spotbatch.watch_job.v1",
+            "schema": "sweetspot.watch_job.v1",
             "checked_at": iso_now(),
             "jobId": job.get("jobId"),
             "jobName": job.get("jobName"),
@@ -1214,7 +1214,7 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
         status_path.write_text(
             json.dumps(
                 {
-                    "schema": "spotbatch.s3_delete_prefix_status.v1",
+                    "schema": "sweetspot.s3_delete_prefix_status.v1",
                     "updated_at": iso_now(),
                     "prefix": args.prefix,
                     "delete": bool(args.delete),
@@ -1237,7 +1237,7 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
         s3_upload_text(
             s3,
             json.dumps(
-                {"schema": "spotbatch.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "include_versions": bool(getattr(args, "include_versions", False)), "deleted": deleted},
+                {"schema": "sweetspot.s3_delete_prefix_marker.v1", "completed_at": iso_now(), "prefix": args.prefix, "include_versions": bool(getattr(args, "include_versions", False)), "deleted": deleted},
                 indent=2,
                 sort_keys=True,
             )
@@ -1245,7 +1245,7 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
             marker_s3,
         )
     summary = {
-        "schema": "spotbatch.s3_delete_prefix_summary.v1",
+        "schema": "sweetspot.s3_delete_prefix_summary.v1",
         "finished_at": iso_now(),
         "prefix": args.prefix,
         "bucket": bucket,
@@ -1299,7 +1299,7 @@ def cmd_dlq(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "schema": "spotbatch.dlq_redrive_summary.v1",
+                    "schema": "sweetspot.dlq_redrive_summary.v1",
                     "checked_at": iso_now(),
                     "native_redrive": True,
                     "source_arn": kwargs["SourceArn"],
@@ -1348,7 +1348,7 @@ def cmd_dlq(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "schema": "spotbatch.dlq_summary.v1",
+                "schema": "sweetspot.dlq_summary.v1",
                 "checked_at": iso_now(),
                 "apply": bool(args.apply),
                 "scanned": scanned,
@@ -1458,8 +1458,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix, MaxKeys=1)
                 probe_uri = None
                 if args.write_probe:
-                    probe_key = f"{list_prefix.rstrip('/')}/.spotbatch-doctor-{utc_stamp()}.json" if list_prefix else f".spotbatch-doctor-{utc_stamp()}.json"
-                    body = json.dumps({"schema": "spotbatch.doctor_probe.v1", "created_at": iso_now()}) + "\n"
+                    probe_key = f"{list_prefix.rstrip('/')}/.sweetspot-doctor-{utc_stamp()}.json" if list_prefix else f".sweetspot-doctor-{utc_stamp()}.json"
+                    body = json.dumps({"schema": "sweetspot.doctor_probe.v1", "created_at": iso_now()}) + "\n"
                     s3.put_object(Bucket=bucket, Key=probe_key, Body=body.encode("utf-8"), ContentType="application/json")
                     s3.delete_object(Bucket=bucket, Key=probe_key)
                     probe_uri = f"s3://{bucket}/{probe_key}"
@@ -1483,28 +1483,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         {"name": "service_quotas", "ok": None, "details": {"status": "not_checked", "reason": "AWS Batch quota codes vary by account/Region; verify max vCPUs and queue limits in Service Quotas for production runs."}}
     )
     ok = all(c.get("ok") is not False for c in checks)
-    print(json.dumps({"schema": "spotbatch.doctor.v1", "checked_at": iso_now(), "ok": ok, "region": args.region, "checks": checks}, indent=2, sort_keys=True))
+    print(json.dumps({"schema": "sweetspot.doctor.v1", "checked_at": iso_now(), "ok": ok, "region": args.region, "checks": checks}, indent=2, sort_keys=True))
     return 0 if ok else 2
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="spotbatch")
+    ap = argparse.ArgumentParser(prog="sweetspot")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("worker", help="Run an SQS worker inside AWS Batch")
-    p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
-    p.add_argument("--max-messages", type=int, default=int(os.environ.get("SPOTBATCH_MAX_MESSAGES", "1")))
-    p.add_argument("--visibility-timeout", type=int, default=int(os.environ.get("SPOTBATCH_VISIBILITY_TIMEOUT", "1800")))
-    p.add_argument("--heartbeat-seconds", type=int, default=int(os.environ.get("SPOTBATCH_HEARTBEAT_SECONDS", "300")))
+    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--max-messages", type=int, default=int(os.environ.get("SWEETSPOT_MAX_MESSAGES", "1")))
+    p.add_argument("--visibility-timeout", type=int, default=int(os.environ.get("SWEETSPOT_VISIBILITY_TIMEOUT", "1800")))
+    p.add_argument("--heartbeat-seconds", type=int, default=int(os.environ.get("SWEETSPOT_HEARTBEAT_SECONDS", "300")))
     p.add_argument(
-        "--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", str(SAFE_TASK_TIMEOUT_SECONDS))), help="Default per-task command timeout when a task omits timeout_seconds"
+        "--task-timeout-seconds", type=float, default=float(os.environ.get("SWEETSPOT_TASK_TIMEOUT_SECONDS", str(SAFE_TASK_TIMEOUT_SECONDS))), help="Default per-task command timeout when a task omits timeout_seconds"
     )
     p.add_argument("--wait-time", type=int, default=10)
-    p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SPOTBATCH_WORK_DIR", "/tmp/spotbatch-work")))
-    p.add_argument("--allowed-s3-prefix", action="append", default=_env_allowed_s3_prefixes(), help="S3 prefix allowed in task payloads; repeatable. Also read from SPOTBATCH_ALLOWED_S3_PREFIXES.")
-    p.add_argument("--log-tail-bytes", type=int, default=int(os.environ.get("SPOTBATCH_LOG_TAIL_BYTES", str(DEFAULT_LOG_TAIL_BYTES))), help="Bytes of redacted stdout/stderr tail to keep in task summaries")
-    p.add_argument("--max-log-bytes", type=int, default=int(os.environ.get("SPOTBATCH_MAX_LOG_BYTES", str(DEFAULT_MAX_LOG_BYTES))), help="Maximum redacted bytes per stdout/stderr stream to upload to S3")
-    p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from streamed/uploaded task logs; repeatable. SPOTBATCH_REDACT_REGEXES may provide newline-separated defaults.")
+    p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SWEETSPOT_WORK_DIR", "/tmp/sweetspot-work")))
+    p.add_argument("--allowed-s3-prefix", action="append", default=_env_allowed_s3_prefixes(), help="S3 prefix allowed in task payloads; repeatable. Also read from SWEETSPOT_ALLOWED_S3_PREFIXES.")
+    p.add_argument("--log-tail-bytes", type=int, default=int(os.environ.get("SWEETSPOT_LOG_TAIL_BYTES", str(DEFAULT_LOG_TAIL_BYTES))), help="Bytes of redacted stdout/stderr tail to keep in task summaries")
+    p.add_argument("--max-log-bytes", type=int, default=int(os.environ.get("SWEETSPOT_MAX_LOG_BYTES", str(DEFAULT_MAX_LOG_BYTES))), help="Maximum redacted bytes per stdout/stderr stream to upload to S3")
+    p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from streamed/uploaded task logs; repeatable. SWEETSPOT_REDACT_REGEXES may provide newline-separated defaults.")
     p.set_defaults(
         func=lambda a: run_worker(
             queue_url=a.queue_url,
@@ -1522,11 +1522,11 @@ def main() -> int:
     )
 
     p = sub.add_parser("enqueue-jsonl")
-    p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
+    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--run-id")
     p.add_argument("--artifact-dir", type=Path)
-    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Reject tasks containing S3 URIs outside this prefix; repeatable. Defaults to SPOTBATCH_ALLOWED_S3_PREFIXES when unset.")
+    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Reject tasks containing S3 URIs outside this prefix; repeatable. Defaults to SWEETSPOT_ALLOWED_S3_PREFIXES when unset.")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_enqueue_jsonl)
 
@@ -1541,10 +1541,10 @@ def main() -> int:
     p.set_defaults(func=cmd_derive_canary)
 
     p = sub.add_parser("submit-workers")
-    p.add_argument("--sqs-queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
+    p.add_argument("--sqs-queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--batch-job-queue", required=True)
     p.add_argument("--job-definition", required=True)
-    p.add_argument("--job-name-prefix", default="spotbatch-worker")
+    p.add_argument("--job-name-prefix", default="sweetspot-worker")
     p.add_argument("--messages-per-worker", type=int, default=1)
     p.add_argument("--max-workers", type=int, default=64)
     p.add_argument("--min-workers", type=int, default=0)
@@ -1557,7 +1557,7 @@ def main() -> int:
     p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
-    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SPOTBATCH_ALLOWED_S3_PREFIXES to workers; repeatable.")
+    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SWEETSPOT_ALLOWED_S3_PREFIXES to workers; repeatable.")
     p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
     p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
@@ -1568,13 +1568,13 @@ def main() -> int:
     p.add_argument("--run-id")
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--sqs-queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
+    p.add_argument("--sqs-queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--dlq-url")
     p.add_argument("--stop-on-dlq", action="store_true")
     p.add_argument("--fail-on-stop", action="store_true")
     p.add_argument("--batch-job-queue", required=True)
     p.add_argument("--job-definition", required=True)
-    p.add_argument("--job-name-prefix", default="spotbatch-worker")
+    p.add_argument("--job-name-prefix", default="sweetspot-worker")
     p.add_argument("--target-active-workers", type=int, default=64)
     p.add_argument("--max-active-workers", type=int, default=64)
     p.add_argument("--max-submit-per-loop", type=int, default=64)
@@ -1592,7 +1592,7 @@ def main() -> int:
     p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
-    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SPOTBATCH_ALLOWED_S3_PREFIXES to workers; repeatable.")
+    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SWEETSPOT_ALLOWED_S3_PREFIXES to workers; repeatable.")
     p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
     p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
@@ -1670,7 +1670,7 @@ def main() -> int:
     p = sub.add_parser("doctor", help="Validate common AWS/SQS/S3/Batch/CloudWatch operator prerequisites")
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
+    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--dlq-url")
     p.add_argument("--job-queue")
     p.add_argument("--job-definition")
@@ -1698,7 +1698,7 @@ def main() -> int:
 
     args = ap.parse_args()
     if getattr(args, "cmd", None) == "worker" and not args.queue_url:
-        raise SystemExit("worker requires --queue-url or SPOTBATCH_SQS_QUEUE_URL")
+        raise SystemExit("worker requires --queue-url or SWEETSPOT_SQS_QUEUE_URL")
     return int(args.func(args))
 
 

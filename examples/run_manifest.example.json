@@ -1,5 +1,5 @@
 {
-  "schema": "spotbatch.cost_case_study.v1",
+  "schema": "sweetspot.cost_case_study.v1",
   "run_id": "example-anonymized-2026-06",
   "workload": "trusted idempotent CPU annotation shards",
   "region_strategy": "multi-region Spot with On-Demand repair",
@@ -30,12 +30,12 @@
     "s3_requests_and_storage": 0.65,
     "sqs": 0.08,
     "cloudwatch_logs": 0.12,
-    "total_spotbatch": 50.55,
+    "total_sweetspot": 50.55,
     "estimated_all_on_demand": 133.40,
     "estimated_savings_fraction": 0.621
   },
   "artifacts": {
-    "spot_scout_report": "artifacts/example/spot_scout.json",
+    "scout_report": "artifacts/example/scout.json",
     "lane_manager_plan": "artifacts/example/lane_manager_plan.json",
     "final_manifest": "artifacts/example/final_manifest.json",
     "task_status_jsonl": "artifacts/example/task_status.jsonl"

@@ -16,7 +16,7 @@ echo "==> Ruff lint"
 "$PYTHON_BIN" -m ruff check .
 
 echo "==> mypy"
-"$PYTHON_BIN" -m mypy spotbatch
+"$PYTHON_BIN" -m mypy sweetspot
 
 echo "==> unit tests"
 "$PYTHON_BIN" -m unittest discover -s tests -v
@@ -39,9 +39,9 @@ echo "==> workflow artifact path consistency"
 from pathlib import Path
 workflow = Path('.github/workflows/ci.yml').read_text()
 required = [
-    'outputs: type=oci,dest=/tmp/spotbatch-worker.oci.tar',
-    'input: /tmp/spotbatch-worker.oci.tar',
-    'path: /tmp/spotbatch-worker.oci.tar',
+    'outputs: type=oci,dest=/tmp/sweetspot-worker.oci.tar',
+    'input: /tmp/sweetspot-worker.oci.tar',
+    'path: /tmp/sweetspot-worker.oci.tar',
 ]
 missing = [needle for needle in required if needle not in workflow]
 if missing:

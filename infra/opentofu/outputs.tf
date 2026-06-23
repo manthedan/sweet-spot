@@ -23,7 +23,7 @@ output "worker_task_role_arn" {
 }
 
 output "cloudwatch_dashboard_name" {
-  value = var.create_observability ? aws_cloudwatch_dashboard.spotbatch[0].dashboard_name : null
+  value = var.create_observability ? aws_cloudwatch_dashboard.sweetspot[0].dashboard_name : null
 }
 
 output "cloudwatch_log_group" {

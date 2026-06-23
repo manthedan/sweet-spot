@@ -36,7 +36,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import (
+from sweetspot.cli import (
     _auto_canary_indices,
     _job_log_group,
     _job_log_stream,
@@ -54,7 +54,7 @@ from spotbatch.cli import (
     cmd_s3_delete_prefix,
     cmd_supervise_workers,
 )
-from spotbatch.worker import task_hash
+from sweetspot.worker import task_hash
 
 
 class CanaryTests(unittest.TestCase):
@@ -63,7 +63,7 @@ class CanaryTests(unittest.TestCase):
             _parse_index_selection("5-3", 10)
 
     def test_auto_canary_indices_are_deterministic_and_include_tail(self) -> None:
-        tasks = [{"task_id": f"t{i}", "schema": "spotbatch.task.v1", "run_id": "r"} for i in range(8)]
+        tasks = [{"task_id": f"t{i}", "schema": "sweetspot.task.v1", "run_id": "r"} for i in range(8)]
         self.assertEqual(_auto_canary_indices(tasks, 3), [0, 7, 4])
 
     def test_derive_canary_rejects_overwriting_any_generated_output(self) -> None:
@@ -103,7 +103,7 @@ class CanaryTests(unittest.TestCase):
             self.assertEqual(tasks_path.read_text(), json.dumps({"task_id": "t0"}) + "\n")
 
     def test_derive_canary_dlq_probe_uses_preserved_single_source_run_id(self) -> None:
-        tasks = [{"schema": "spotbatch.task.v1", "run_id": "source-r", "task_id": "t0"}]
+        tasks = [{"schema": "sweetspot.task.v1", "run_id": "source-r", "task_id": "t0"}]
         with tempfile.TemporaryDirectory() as tmp:
             tasks_path = Path(tmp) / "tasks.jsonl"
             out_dir = Path(tmp) / "canary"
@@ -125,7 +125,7 @@ class CanaryTests(unittest.TestCase):
             self.assertEqual(probe["run_id"], "source-r")
 
     def test_derive_canary_rewrite_run_id_rejects_existing_s3_markers(self) -> None:
-        tasks = [{"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"}]
+        tasks = [{"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"}]
         with tempfile.TemporaryDirectory() as tmp:
             tasks_path = Path(tmp) / "tasks.jsonl"
             out_dir = Path(tmp) / "canary"
@@ -144,8 +144,8 @@ class CanaryTests(unittest.TestCase):
 
     def test_derive_canary_writes_manifest_and_dlq_probe(self) -> None:
         tasks = [
-            {"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"},
-            {"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t1", "done_s3": "s3://b/r/done/t1"},
+            {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"},
+            {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t1", "done_s3": "s3://b/r/done/t1"},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             tasks_path = Path(tmp) / "tasks.jsonl"
@@ -174,7 +174,7 @@ class CanaryTests(unittest.TestCase):
 class EnqueueValidationTests(unittest.TestCase):
     def test_enqueue_rejects_task_outside_allowed_s3_prefix(self) -> None:
         task = {
-            "schema": "spotbatch.task.v1",
+            "schema": "sweetspot.task.v1",
             "run_id": "r1",
             "task_id": "t0",
             "command": [sys.executable, "-c", "pass"],
@@ -189,8 +189,8 @@ class EnqueueValidationTests(unittest.TestCase):
 
     def test_enqueue_rejects_duplicate_task_ids(self) -> None:
         tasks = [
-            {"schema": "spotbatch.task.v1", "run_id": "r1", "task_id": "dup", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/dup-a.done.json"},
-            {"schema": "spotbatch.task.v1", "run_id": "r1", "task_id": "dup", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/dup-b.done.json"},
+            {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "dup", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/dup-a.done.json"},
+            {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "dup", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/dup-b.done.json"},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             tasks_path = Path(tmp) / "tasks.jsonl"
@@ -212,7 +212,7 @@ class EnqueueValidationTests(unittest.TestCase):
             memory=None,
         )
         env = {row["name"]: row["value"] for row in overrides["environment"]}
-        self.assertEqual(env["SPOTBATCH_ALLOWED_S3_PREFIXES"], "s3://bucket/runs/r1,s3://bucket/runs/r2")
+        self.assertEqual(env["SWEETSPOT_ALLOWED_S3_PREFIXES"], "s3://bucket/runs/r1,s3://bucket/runs/r2")
 
     def test_worker_overrides_pass_observability_controls(self) -> None:
         overrides = _worker_overrides(
@@ -228,9 +228,9 @@ class EnqueueValidationTests(unittest.TestCase):
             redact_regexes=["token=[^ ]+"],
         )
         env = {row["name"]: row["value"] for row in overrides["environment"]}
-        self.assertEqual(env["SPOTBATCH_LOG_TAIL_BYTES"], "123")
-        self.assertEqual(env["SPOTBATCH_MAX_LOG_BYTES"], "456")
-        self.assertEqual(env["SPOTBATCH_REDACT_REGEXES"], "token=[^ ]+")
+        self.assertEqual(env["SWEETSPOT_LOG_TAIL_BYTES"], "123")
+        self.assertEqual(env["SWEETSPOT_MAX_LOG_BYTES"], "456")
+        self.assertEqual(env["SWEETSPOT_REDACT_REGEXES"], "token=[^ ]+")
 
 
 class FakeLogsClient:
@@ -276,7 +276,7 @@ class FakeDoctorClient:
                 {
                     "jobDefinitionName": "jd",
                     "revision": 1,
-                    "containerProperties": {"image": "repo/worker:tag", "jobRoleArn": "arn", "command": ["spotbatch", "worker"], "logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}}},
+                    "containerProperties": {"image": "repo/worker:tag", "jobRoleArn": "arn", "command": ["sweetspot", "worker"], "logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}}},
                 }
             ]
         }
@@ -311,7 +311,7 @@ class DoctorTests(unittest.TestCase):
             redact_regex=[],
         )
         out = io.StringIO()
-        with patch("spotbatch.cli.boto3.Session", return_value=FakeDoctorSession()), contextlib.redirect_stdout(out):
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeDoctorSession()), contextlib.redirect_stdout(out):
             self.assertEqual(cmd_doctor(args), 0)
         report = json.loads(out.getvalue())
         self.assertTrue(report["ok"])
@@ -334,7 +334,7 @@ class BatchOperatorTests(unittest.TestCase):
             filter_regex=None,
             tail=0,
         )
-        with patch("spotbatch.cli.boto3.Session", return_value=FakeLogSession(logs)), contextlib.redirect_stdout(io.StringIO()):
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeLogSession(logs)), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cmd_logs(args), 0)
         self.assertEqual(logs.kwargs["startFromHead"], True)
 
@@ -378,7 +378,7 @@ class BatchOperatorTests(unittest.TestCase):
             tail=0,
         )
         session = FakeLogSession(logs, FakeBatchClient(job))
-        with patch("spotbatch.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(io.StringIO()):
+        with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cmd_logs(args), 0)
         self.assertEqual(logs.kwargs["logGroupName"], "/aws/batch/miser")
 
@@ -429,7 +429,7 @@ class S3DeletePrefixTests(unittest.TestCase):
                 artifact_dir=Path(tmp),
                 completion_marker_s3="s3://bucket/markers/done.json",
             )
-            with patch("spotbatch.cli.boto3.Session", return_value=Session(s3)), self.assertRaisesRegex(RuntimeError, "DeleteObjects"):
+            with patch("sweetspot.cli.boto3.Session", return_value=Session(s3)), self.assertRaisesRegex(RuntimeError, "DeleteObjects"):
                 cmd_s3_delete_prefix(args)
         self.assertFalse(s3.marker_written)
 
@@ -474,7 +474,7 @@ class S3DeletePrefixTests(unittest.TestCase):
                 artifact_dir=Path(tmp),
                 completion_marker_s3=None,
             )
-            with patch("spotbatch.cli.boto3.Session", return_value=Session(s3)), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.Session", return_value=Session(s3)), contextlib.redirect_stdout(io.StringIO()):
                 cmd_s3_delete_prefix(args)
         self.assertEqual(s3.name, "list_object_versions")
         self.assertEqual(s3.deleted, [{"Key": "runs/old-run/a", "VersionId": "v1"}, {"Key": "runs/old-run/a", "VersionId": "d1"}])
@@ -504,13 +504,13 @@ class DLQTests(unittest.TestCase):
             max_messages_per_second=50,
             apply=True,
         )
-        with patch("spotbatch.cli.boto3.client", return_value=sqs), contextlib.redirect_stdout(io.StringIO()):
+        with patch("sweetspot.cli.boto3.client", return_value=sqs), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cmd_dlq(args), 0)
         self.assertEqual(sqs.kwargs, {"SourceArn": "arn:aws:sqs:us-west-2:123:dlq", "DestinationArn": "arn:aws:sqs:us-west-2:123:q", "MaxNumberOfMessagesPerSecond": 50})
 
     def test_native_redrive_rejects_filters(self) -> None:
         args = types.SimpleNamespace(dlq_url="dlq", queue_url="q", run_id="r1", task_id_regex=None, native_redrive=True, apply=True)
-        with patch("spotbatch.cli.boto3.client"), self.assertRaisesRegex(SystemExit, "whole DLQ"):
+        with patch("sweetspot.cli.boto3.client"), self.assertRaisesRegex(SystemExit, "whole DLQ"):
             cmd_dlq(args)
 
 
@@ -624,13 +624,13 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=False,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=FakeFinalizeS3()):
+            with patch("sweetspot.cli.boto3.client", return_value=FakeFinalizeS3()):
                 with self.assertRaisesRegex(SystemExit, "duplicate task_id"):
                     cmd_finalize(args)
 
     def test_finalize_writes_repair_tasks_and_refuses_ready_when_incomplete(self) -> None:
         s3 = FakeFinalizeS3()
-        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": ""}).encode()}
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": json.dumps({"schema": "sweetspot.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": ""}).encode()}
         tasks = [
             {"run_id": "r1", "task_id": "task-1", "done_s3": "s3://bucket/runs/r1/done/task-1.done.json"},
             {"run_id": "r1", "task_id": "task-2", "done_s3": "s3://bucket/runs/r1/done/task-2.done.json"},
@@ -654,7 +654,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=False,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 rc = cmd_finalize(args)
             self.assertEqual(rc, 2)
             repair_rows = [json.loads(line) for line in repair_path.read_text().splitlines()]
@@ -668,7 +668,7 @@ class FinalizeTests(unittest.TestCase):
     def test_finalize_refuses_ready_when_done_exists_but_output_missing(self) -> None:
         s3 = FakeFinalizeS3()
         s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {
-            "Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt"}).encode()
+            "Body": json.dumps({"schema": "sweetspot.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt"}).encode()
         }
         tasks = [
             {
@@ -696,7 +696,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=False,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 rc = cmd_finalize(args)
             self.assertEqual(rc, 2)
             manifest = json.loads(s3.objects[("bucket", "runs/r1/manifests/final_manifest.json")]["Body"])
@@ -718,7 +718,7 @@ class FinalizeTests(unittest.TestCase):
             "done_s3": "s3://bucket/runs/r1/done/task-v2.done.json",
         }
         marker = {
-            "schema": "spotbatch.done_marker.v2",
+            "schema": "sweetspot.done_marker.v2",
             "run_id": "r1",
             "task_id": "task-v2",
             "task_hash": task_hash(task),
@@ -746,7 +746,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=True,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 rc = cmd_finalize(args)
             self.assertEqual(rc, 2)
             manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
@@ -757,10 +757,10 @@ class FinalizeTests(unittest.TestCase):
     def test_finalize_publishes_ready_after_complete_manifest_upload(self) -> None:
         s3 = FakeFinalizeS3()
         s3.objects[("bucket", "runs/r1/done/task-10.done.json")] = {
-            "Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-10", "output_s3": "s3://bucket/runs/r1/shards/task-10.txt"}).encode()
+            "Body": json.dumps({"schema": "sweetspot.done_marker.v1", "run_id": "r1", "task_id": "task-10", "output_s3": "s3://bucket/runs/r1/shards/task-10.txt"}).encode()
         }
         s3.objects[("bucket", "runs/r1/done/task-2.done.json")] = {
-            "Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-2", "output_s3": "s3://bucket/runs/r1/shards/task-2.txt"}).encode()
+            "Body": json.dumps({"schema": "sweetspot.done_marker.v1", "run_id": "r1", "task_id": "task-2", "output_s3": "s3://bucket/runs/r1/shards/task-2.txt"}).encode()
         }
         s3.objects[("bucket", "runs/r1/shards/task-10.txt")] = {"Body": b"ok"}
         s3.objects[("bucket", "runs/r1/shards/task-2.txt")] = {"Body": b"ok"}
@@ -796,7 +796,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=True,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 rc = cmd_finalize(args)
             self.assertEqual(rc, 0)
             self.assertEqual(s3.deleted, [("bucket", "runs/r1/READY")])
@@ -833,7 +833,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=True,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 rc = cmd_finalize(args)
             self.assertEqual(rc, 2)
             manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
@@ -849,12 +849,12 @@ class FinalizeTests(unittest.TestCase):
         repair_done = task["done_s3"] + ".repair-abc"
         repair_task = dict(task)
         repair_task["done_s3"] = repair_done
-        repair_task["spotbatch_repair_reason"] = "invalid_done_marker"
+        repair_task["sweetspot_repair_reason"] = "invalid_done_marker"
         s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"not-json"}
         s3.objects[("bucket", "runs/r1/done/task-1.done.json.repair-abc")] = {
             "Body": json.dumps(
                 {
-                    "schema": "spotbatch.done_marker.v2",
+                    "schema": "sweetspot.done_marker.v2",
                     "run_id": "r1",
                     "task_id": "task-1",
                     "task_hash": task_hash(repair_task),
@@ -885,7 +885,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=True,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cmd_finalize(args), 0)
             manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
             self.assertEqual(manifest["done_count"], 1)
@@ -904,7 +904,7 @@ class FinalizeTests(unittest.TestCase):
                 "done_s3": f"s3://bucket/runs/r1/done/task-{i}.done.json",
             }
             tasks.append(task)
-            s3.objects[("bucket", f"runs/r1/done/task-{i}.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": f"task-{i}", "output_s3": task["output_s3"]}).encode()}
+            s3.objects[("bucket", f"runs/r1/done/task-{i}.done.json")] = {"Body": json.dumps({"schema": "sweetspot.done_marker.v1", "run_id": "r1", "task_id": f"task-{i}", "output_s3": task["output_s3"]}).encode()}
             s3.objects[("bucket", f"runs/r1/shards/task-{i}.txt")] = {"Body": b"ok"}
         with tempfile.TemporaryDirectory() as tmp:
             task_path = Path(tmp) / "tasks.jsonl"
@@ -927,7 +927,7 @@ class FinalizeTests(unittest.TestCase):
                 allow_incomplete_ready=False,
                 require_complete=True,
             )
-            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cmd_finalize(args), 0)
             manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
             outputs_rows = [json.loads(line) for line in (Path(tmp) / "finalizer" / "outputs.jsonl").read_text().splitlines()]

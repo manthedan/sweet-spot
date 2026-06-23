@@ -1,6 +1,6 @@
-resource "aws_cloudwatch_dashboard" "spotbatch" {
+resource "aws_cloudwatch_dashboard" "sweetspot" {
   count          = var.create_observability ? 1 : 0
-  dashboard_name = "${var.project_name}-spotbatch"
+  dashboard_name = "${var.project_name}-sweetspot"
 
   dashboard_body = jsonencode({
     widgets = [
@@ -63,7 +63,7 @@ resource "aws_cloudwatch_dashboard" "spotbatch" {
         properties = {
           title  = "Recent structured worker events"
           region = var.aws_region
-          query  = "SOURCE '${aws_cloudwatch_log_group.batch.name}' | fields @timestamp, @message | filter @message like /spotbatch.worker_event.v1/ | sort @timestamp desc | limit 50"
+          query  = "SOURCE '${aws_cloudwatch_log_group.batch.name}' | fields @timestamp, @message | filter @message like /sweetspot.worker_event.v1/ | sort @timestamp desc | limit 50"
           view   = "table"
         }
       }
@@ -74,7 +74,7 @@ resource "aws_cloudwatch_dashboard" "spotbatch" {
 resource "aws_cloudwatch_metric_alarm" "work_queue_age" {
   count               = var.create_observability ? 1 : 0
   alarm_name          = "${var.project_name}-work-queue-oldest-message-age"
-  alarm_description   = "Oldest visible SpotBatch work-queue message age is above the configured threshold. Workers may be stalled or underprovisioned."
+  alarm_description   = "Oldest visible SweetSpot work-queue message age is above the configured threshold. Workers may be stalled or underprovisioned."
   namespace           = "AWS/SQS"
   metric_name         = "ApproximateAgeOfOldestMessage"
   dimensions          = { QueueName = aws_sqs_queue.work.name }
@@ -92,7 +92,7 @@ resource "aws_cloudwatch_metric_alarm" "work_queue_age" {
 resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
   count               = var.create_observability ? 1 : 0
   alarm_name          = "${var.project_name}-dlq-depth"
-  alarm_description   = "SpotBatch DLQ has visible messages. Inspect with `spotbatch dlq` before submitting more workers."
+  alarm_description   = "SweetSpot DLQ has visible messages. Inspect with `sweetspot dlq` before submitting more workers."
   namespace           = "AWS/SQS"
   metric_name         = "ApproximateNumberOfMessagesVisible"
   dimensions          = { QueueName = aws_sqs_queue.dlq.name }

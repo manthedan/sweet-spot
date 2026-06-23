@@ -16,7 +16,7 @@ All notable changes to this project are documented here. This project uses human
 
 ### Changed
 
-- The installed CLI remains `spotbatch`; public branding/repository identity may change separately.
+- Renamed the public project, Python distribution, import package, schemas, environment variables, Docker worker identity, and CLI to SweetSpot / `sweetspot`.
 - Source SQS retention defaults to 13 days and DLQ retention to 14 days to avoid destructive retention shrinkage during upgrades.
 - Spot pool ranking now prefers expected total cost per unit over raw Spot price when telemetry/assumptions are available.
 

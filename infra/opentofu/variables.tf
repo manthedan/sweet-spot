@@ -1,7 +1,7 @@
 variable "project_name" {
   type        = string
   description = "Name prefix for AWS resources."
-  default     = "spotbatch"
+  default     = "sweetspot"
 }
 
 variable "aws_region" {
@@ -41,7 +41,7 @@ variable "require_explicit_subnets" {
 
 variable "worker_image_uri" {
   type        = string
-  description = "ECR image URI for the generic spotbatch worker."
+  description = "ECR image URI for the generic sweetspot worker."
 }
 
 variable "worker_s3_bucket" {
@@ -57,7 +57,7 @@ variable "worker_s3_prefixes" {
 
 variable "worker_allowed_s3_prefixes" {
   type        = list(string)
-  description = "Optional s3:// prefixes injected into SPOTBATCH_ALLOWED_S3_PREFIXES for runtime task validation. Defaults to worker_s3_prefixes in worker_s3_bucket."
+  description = "Optional s3:// prefixes injected into SWEETSPOT_ALLOWED_S3_PREFIXES for runtime task validation. Defaults to worker_s3_prefixes in worker_s3_bucket."
   default     = []
 }
 

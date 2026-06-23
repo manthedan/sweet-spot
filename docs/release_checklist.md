@@ -1,6 +1,6 @@
 # Release and repository hygiene checklist
 
-This checklist is intentionally name-neutral until final public branding is chosen. The installed CLI should remain `spotbatch` for compatibility.
+This checklist is for SweetSpot releases. The public CLI, import package, schemas, and worker command should remain `sweetspot` / `SWEETSPOT_*` unless a future release deliberately plans another breaking rename.
 
 ## Before tagging
 
@@ -16,9 +16,9 @@ This checklist is intentionally name-neutral until final public branding is chos
    - container build/SBOM/provenance/Trivy scan
 
 3. Verify the workflow still scans and uploads the same OCI artifact path:
-   - build output: `/tmp/spotbatch-worker.oci.tar`
-   - Trivy input: `/tmp/spotbatch-worker.oci.tar`
-   - uploaded artifact path: `/tmp/spotbatch-worker.oci.tar`
+   - build output: `/tmp/sweetspot-worker.oci.tar`
+   - Trivy input: `/tmp/sweetspot-worker.oci.tar`
+   - uploaded artifact path: `/tmp/sweetspot-worker.oci.tar`
 
 4. Check supply-chain pins:
    - GitHub Actions are full commit SHAs, with version comments for maintainability.

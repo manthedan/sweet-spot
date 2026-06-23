@@ -13,7 +13,7 @@ The generic task shape should remain:
 
 ```json
 {
-  "schema": "spotbatch.task.v1",
+  "schema": "sweetspot.task.v1",
   "run_id": "stockfish-demo",
   "task_id": "shard_0000.rows0_25000.sf_d10_mpv2",
   "command": ["python", "/app/stockfish_task.py"],

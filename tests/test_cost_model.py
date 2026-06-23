@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from spotbatch import spot_lane_manager
-from spotbatch.spot_scout import expected_cost_per_1m_units, noncompute_cost_per_1m_units, observed_perf
+from sweetspot import lane_manager
+from sweetspot.scout import expected_cost_per_1m_units, noncompute_cost_per_1m_units, observed_perf
 
 
 class CostModelTests(unittest.TestCase):
@@ -21,7 +21,7 @@ class CostModelTests(unittest.TestCase):
             p.write_text(
                 json.dumps(
                     {
-                        "schema": "spotbatch.task_summary.v2",
+                        "schema": "sweetspot.task_summary.v2",
                         "telemetry": {
                             "instance_type": "c7i.large",
                             "completed_units": 1000,
@@ -107,14 +107,14 @@ class CostModelTests(unittest.TestCase):
             cfg_path.write_text(json.dumps(cfg))
             out = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["spotbatch-lane-manager", "--config", str(cfg_path), "--target-workers", "10"]),
-                mock.patch("spotbatch.spot_lane_manager.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
-                mock.patch("spotbatch.spot_lane_manager.queue_depth", return_value={"visible": 100, "not_visible": 0, "delayed": 0}),
-                mock.patch("spotbatch.spot_lane_manager.placement_score", return_value=7),
-                mock.patch("spotbatch.spot_lane_manager.active_jobs", side_effect=[10, 0]),
+                mock.patch.object(sys, "argv", ["sweetspot-lane-manager", "--config", str(cfg_path), "--target-workers", "10"]),
+                mock.patch("sweetspot.lane_manager.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.lane_manager.queue_depth", return_value={"visible": 100, "not_visible": 0, "delayed": 0}),
+                mock.patch("sweetspot.lane_manager.placement_score", return_value=7),
+                mock.patch("sweetspot.lane_manager.active_jobs", side_effect=[10, 0]),
                 contextlib.redirect_stdout(out),
             ):
-                spot_lane_manager.main()
+                lane_manager.main()
         report = json.loads(out.getvalue())
         self.assertEqual(report["active_workers_before_submit"], 10)
         self.assertEqual([lane["to_submit"] for lane in report["lanes"]], [0, 0])
@@ -151,14 +151,14 @@ class CostModelTests(unittest.TestCase):
             cfg_path.write_text(json.dumps(cfg))
             out = io.StringIO()
             with (
-                mock.patch.object(sys, "argv", ["spotbatch-lane-manager", "--config", str(cfg_path), "--target-workers", "3"]),
-                mock.patch("spotbatch.spot_lane_manager.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
-                mock.patch("spotbatch.spot_lane_manager.queue_depth", return_value={"visible": 3, "not_visible": 0, "delayed": 0}),
-                mock.patch("spotbatch.spot_lane_manager.placement_score", return_value=7),
-                mock.patch("spotbatch.spot_lane_manager.active_jobs", return_value=0),
+                mock.patch.object(sys, "argv", ["sweetspot-lane-manager", "--config", str(cfg_path), "--target-workers", "3"]),
+                mock.patch("sweetspot.lane_manager.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.lane_manager.queue_depth", return_value={"visible": 3, "not_visible": 0, "delayed": 0}),
+                mock.patch("sweetspot.lane_manager.placement_score", return_value=7),
+                mock.patch("sweetspot.lane_manager.active_jobs", return_value=0),
                 contextlib.redirect_stdout(out),
             ):
-                spot_lane_manager.main()
+                lane_manager.main()
         report = json.loads(out.getvalue())
         self.assertEqual([lane["name"] for lane in report["lanes"]], ["cheap", "expensive"])
         self.assertEqual(report["lanes"][0]["desired_for_lane"], 2)

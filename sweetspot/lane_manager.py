@@ -7,14 +7,14 @@ bounded number of worker jobs across pre-existing lanes.
 
 Example config:
 {
-  "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/ACCOUNT/spotbatch-work",
+  "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/ACCOUNT/sweetspot-work",
   "instance_types": ["c6i.large", "c6a.large", "m6i.large", "m6a.large"],
   "lanes": [
     {
       "name": "us-west-2-x86",
       "region": "us-west-2",
-      "batch_job_queue": "arn:aws:batch:us-west-2:ACCOUNT:job-queue/spotbatch-cpu-spot-queue",
-      "job_definition": "arn:aws:batch:us-west-2:ACCOUNT:job-definition/spotbatch-worker:1",
+      "batch_job_queue": "arn:aws:batch:us-west-2:ACCOUNT:job-queue/sweetspot-cpu-spot-queue",
+      "job_definition": "arn:aws:batch:us-west-2:ACCOUNT:job-definition/sweetspot-worker:1",
       "job_name_prefix": "my-run-worker",
       "max_workers": 128,
       "messages_per_worker": 4,
@@ -99,8 +99,8 @@ def submit_jobs(batch, lane: dict[str, Any], sqs_queue_url: str, count: int, dry
     if dry_run or count <= 0:
         return []
     env = [
-        {"name": "SPOTBATCH_SQS_QUEUE_URL", "value": sqs_queue_url},
-        {"name": "SPOTBATCH_MAX_MESSAGES", "value": str(lane.get("messages_per_worker", 1))},
+        {"name": "SWEETSPOT_SQS_QUEUE_URL", "value": sqs_queue_url},
+        {"name": "SWEETSPOT_MAX_MESSAGES", "value": str(lane.get("messages_per_worker", 1))},
     ]
     for k, v in (lane.get("env") or {}).items():
         env.append({"name": str(k), "value": str(v)})
@@ -198,7 +198,7 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "schema": "spotbatch.spot_lane_manager.v1",
+                "schema": "sweetspot.lane_manager.v1",
                 "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "submit": bool(args.submit),
                 "queue_depth": depth,

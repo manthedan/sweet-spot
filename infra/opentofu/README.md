@@ -1,13 +1,13 @@
 # OpenTofu AWS infra
 
-Creates the AWS primitives used by `SpotBatch`:
+Creates the AWS primitives used by `SweetSpot`:
 
 - SQS work queue + DLQ with SSE, longer DLQ retention, and a narrow redrive allow policy
 - AWS Batch Spot compute environment + queue
 - optional On-Demand repair queue
 - no-ingress Batch security group by default, unless explicit security groups are supplied
 - Batch launch template requiring IMDSv2 and encrypted gp3 root volumes
-- generic worker job definition that explicitly runs `spotbatch worker`
+- generic worker job definition that explicitly runs `sweetspot worker`
 - IAM roles for Batch/ECS/worker task
 - optional CloudWatch dashboard and baseline alarms
 - optional monthly AWS Budget alert
@@ -15,9 +15,9 @@ Creates the AWS primitives used by `SpotBatch`:
 ## Example
 
 ```hcl
-project_name     = "my-spotbatch"
+project_name     = "my-sweetspot"
 aws_region       = "us-west-2"
-worker_image_uri  = "ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/my-spotbatch-worker:latest"
+worker_image_uri  = "ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/my-sweetspot-worker:latest"
 worker_s3_bucket  = "my-work-bucket"
 worker_s3_prefixes = ["runs/hello-001"]
 max_vcpus_spot      = 256
@@ -28,7 +28,7 @@ cost_tags = {
 }
 monthly_budget_limit_usd   = 500
 budget_notification_emails = ["ops@example.com"]
-alarm_sns_topic_arns = ["arn:aws:sns:us-west-2:ACCOUNT:spotbatch-alerts"]
+alarm_sns_topic_arns = ["arn:aws:sns:us-west-2:ACCOUNT:sweetspot-alerts"]
 ```
 
 ```bash
@@ -47,9 +47,9 @@ tofu apply -var-file=example.tfvars
 - SQS SSE is enabled. The DLQ defaults to the SQS maximum 14-day retention while the source queue defaults to 13 days to avoid destructive retention shrinkage during upgrades, and the DLQ redrive allow policy only permits the module's source queue.
 - `cost_tags` are merged onto resources for cost allocation. Set `monthly_budget_limit_usd` and `budget_notification_emails` to create an account-scoped AWS Budget alert as a guardrail.
 - The worker task role is scoped to the work queue plus `worker_s3_bucket`/`worker_s3_prefixes`. Set prefixes to the run roots that contain inputs, outputs, summaries, logs, and done markers.
-- The job definition injects matching `SPOTBATCH_ALLOWED_S3_PREFIXES` so workers reject task payloads that reference S3 URIs outside the configured prefixes.
+- The job definition injects matching `SWEETSPOT_ALLOWED_S3_PREFIXES` so workers reject task payloads that reference S3 URIs outside the configured prefixes.
 - `create_observability` defaults to true and creates a CloudWatch dashboard plus alarms for work-queue age, DLQ depth, Batch failures, and runnable-job stalls. Set `alarm_sns_topic_arns` to wire notifications.
-- The dashboard includes a Logs Insights widget over structured `spotbatch.worker_event.v1` events emitted by the worker.
+- The dashboard includes a Logs Insights widget over structured `sweetspot.worker_event.v1` events emitted by the worker.
 - The reliability contract depends on SQS visibility timeout + deterministic S3 done markers, not Batch retries.
-- For S3 buckets with versioning enabled, pair run prefixes with lifecycle rules that expire noncurrent versions/delete markers, or use `spotbatch s3-delete-prefix --include-versions` for explicit teardown. Deleting current objects only is not a complete cost cleanup on versioned buckets.
+- For S3 buckets with versioning enabled, pair run prefixes with lifecycle rules that expire noncurrent versions/delete markers, or use `sweetspot s3-delete-prefix --include-versions` for explicit teardown. Deleting current objects only is not a complete cost cleanup on versioned buckets.
 - Automatic teardown guidance: set low `max_vcpus_*` for tests, keep `monthly_budget_limit_usd` nonzero, tag every run prefix, finalize/repair before deleting SQS messages, run version-aware S3 cleanup, then `tofu destroy` idle stacks rather than leaving Batch queues and log/storage resources behind.

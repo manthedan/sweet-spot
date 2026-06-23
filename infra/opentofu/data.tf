@@ -20,7 +20,7 @@ data "aws_security_group" "default" {
 locals {
   subnet_ids         = length(var.subnet_ids) > 0 ? var.subnet_ids : data.aws_subnets.selected[0].ids
   security_group_ids = length(var.security_group_ids) > 0 ? var.security_group_ids : (var.create_no_ingress_security_group ? [aws_security_group.batch_no_ingress[0].id] : [data.aws_security_group.default[0].id])
-  tags               = merge({ Project = var.project_name, ManagedBy = "opentofu", CostManagedBy = "spotbatch" }, var.tags, var.cost_tags)
+  tags               = merge({ Project = var.project_name, ManagedBy = "opentofu", CostManagedBy = "sweetspot" }, var.tags, var.cost_tags)
 
   worker_s3_prefixes_normalized = length(var.worker_s3_prefixes) == 0 ? [""] : [for p in var.worker_s3_prefixes : trim(p, "/")]
   worker_s3_object_resources = [

@@ -1,6 +1,6 @@
 # Cost case study template
 
-Use this template to publish a reproducible, anonymized SpotBatch cost claim without exposing private payloads, S3 keys, account IDs, or billing data.
+Use this template to publish a reproducible, anonymized SweetSpot cost claim without exposing private payloads, S3 keys, account IDs, or billing data.
 
 Pair every case study with a machine-readable manifest shaped like `examples/run_manifest.example.json`.
 
@@ -12,7 +12,7 @@ Pair every case study with a machine-readable manifest shaped like `examples/run
 - Completed units: `<N>`
 - Deadline / completeness target: `<e.g. finish 100M units within 24h; require 99.9% completed before READY>`
 - Worker image digest: `<sha256:...>`
-- SpotBatch commit: `<git sha>`
+- SweetSpot commit: `<git sha>`
 
 ## Reliability result
 
@@ -48,7 +48,7 @@ Use public price references or explicitly stated internal rates. If AWS Cost Exp
 
 | Scenario | Compute | Replay/startup | Non-compute | Total | Cost / 1M units |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| SpotBatch observed | `$...` | `$...` | `$...` | `$...` | `$...` |
+| SweetSpot observed | `$...` | `$...` | `$...` | `$...` | `$...` |
 | On-Demand baseline | `$...` | `$...` | `$...` | `$...` | `$...` |
 
 Estimated savings: `<X%>`
@@ -66,4 +66,4 @@ Estimated savings: `<X%>`
 - [ ] No account IDs, private bucket names, private S3 keys, queue URLs, job IDs, or logs with secrets.
 - [ ] Rates are timestamped and labeled as observed, public-price estimate, or manual assumption.
 - [ ] Unit definition is unambiguous.
-- [ ] Case study states that SpotBatch runs trusted/idempotent jobs and is not an untrusted-code sandbox.
+- [ ] Case study states that SweetSpot runs trusted/idempotent jobs and is not an untrusted-code sandbox.

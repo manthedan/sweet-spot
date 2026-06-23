@@ -26,8 +26,8 @@ from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_env_ove
 
 SQS_MAX_VISIBILITY_SECONDS = 12 * 60 * 60
 SAFE_TASK_TIMEOUT_SECONDS = 11 * 60 * 60
-DONE_MARKER_SCHEMA_V1 = "spotbatch.done_marker.v1"
-DONE_MARKER_SCHEMA_V2 = "spotbatch.done_marker.v2"
+DONE_MARKER_SCHEMA_V1 = "sweetspot.done_marker.v1"
+DONE_MARKER_SCHEMA_V2 = "sweetspot.done_marker.v2"
 DEFAULT_LOG_TAIL_BYTES = 12_000
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
 REDACTION_CARRY_CHARS = 65_536
@@ -35,7 +35,7 @@ METADATA_TIMEOUT_SECONDS = 0.25
 
 
 def _emit_event(event: str, **fields: Any) -> None:
-    payload = {"schema": "spotbatch.worker_event.v1", "event": event, "emitted_at": iso_now(), **fields}
+    payload = {"schema": "sweetspot.worker_event.v1", "event": event, "emitted_at": iso_now(), **fields}
     print(json.dumps(payload, sort_keys=True), flush=True)
 
 
@@ -75,16 +75,16 @@ def _worker_runtime_metadata(env: dict[str, str]) -> dict[str, Any]:
     metadata_uri = env.get("ECS_CONTAINER_METADATA_URI_V4") or env.get("ECS_CONTAINER_METADATA_URI") or ""
     container_meta = _http_json(metadata_uri) if metadata_uri else {}
     task_meta = _http_json(f"{metadata_uri.rstrip('/')}/task") if metadata_uri else {}
-    az = env.get("SPOTBATCH_AVAILABILITY_ZONE") or str(task_meta.get("AvailabilityZone") or "") or None
-    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or env.get("SPOTBATCH_REGION") or _region_from_az(az)
-    image_id = env.get("SPOTBATCH_IMAGE_DIGEST") or str(container_meta.get("ImageID") or "") or None
+    az = env.get("SWEETSPOT_AVAILABILITY_ZONE") or str(task_meta.get("AvailabilityZone") or "") or None
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or env.get("SWEETSPOT_REGION") or _region_from_az(az)
+    image_id = env.get("SWEETSPOT_IMAGE_DIGEST") or str(container_meta.get("ImageID") or "") or None
     return {
         "hostname": env.get("HOSTNAME"),
-        "instance_type": env.get("SPOTBATCH_INSTANCE_TYPE") or env.get("EC2_INSTANCE_TYPE"),
-        "architecture": env.get("SPOTBATCH_ARCHITECTURE") or platform.machine(),
+        "instance_type": env.get("SWEETSPOT_INSTANCE_TYPE") or env.get("EC2_INSTANCE_TYPE"),
+        "architecture": env.get("SWEETSPOT_ARCHITECTURE") or platform.machine(),
         "region": region,
         "availability_zone": az,
-        "image": env.get("SPOTBATCH_IMAGE") or str(container_meta.get("Image") or "") or None,
+        "image": env.get("SWEETSPOT_IMAGE") or str(container_meta.get("Image") or "") or None,
         "image_digest": image_id,
         "aws_batch_job_id": env.get("AWS_BATCH_JOB_ID"),
         "aws_batch_job_attempt": _parse_int(env.get("AWS_BATCH_JOB_ATTEMPT")),
@@ -345,7 +345,7 @@ def _heartbeat(sqs, queue_url: str, receipt_handle: str, timeout: int, every: in
             print(
                 json.dumps(
                     {
-                        "schema": "spotbatch.heartbeat_error.v1",
+                        "schema": "sweetspot.heartbeat_error.v1",
                         "checked_at": iso_now(),
                         "queue_url": queue_url,
                         "visibility_timeout": timeout,
@@ -401,9 +401,9 @@ def _head_matches_output_marker(s3, output: dict[str, Any], *, expected_uri: str
         raise ValueError(f"done marker output size mismatch for {uri}: marker={expected_size} s3={actual_size}")
     if actual_sha != expected_sha:
         raise ValueError(f"done marker output sha256 metadata mismatch for {uri}")
-    if metadata.get("spotbatch-task-hash") != expected_task_hash:
+    if metadata.get("sweetspot-task-hash") != expected_task_hash:
         raise ValueError(f"done marker output task hash metadata mismatch for {uri}")
-    if metadata.get("spotbatch-attempt-id") != expected_attempt_id:
+    if metadata.get("sweetspot-attempt-id") != expected_attempt_id:
         raise ValueError(f"done marker output attempt metadata mismatch for {uri}")
 
 
@@ -520,16 +520,16 @@ def run_task(
         env = os.environ.copy()
         env.update(
             {
-                "SPOTBATCH_TASK_JSON": str(task_json),
-                "SPOTBATCH_TASK_ID": task_id,
-                "SPOTBATCH_RUN_ID": run_id,
-                "SPOTBATCH_TASK_HASH": this_task_hash,
-                "SPOTBATCH_ATTEMPT_ID": attempt_id,
-                "SPOTBATCH_OUTPUT_PATH": str(output_path),
-                "SPOTBATCH_METRICS_PATH": str(metrics_path),
-                "SPOTBATCH_OUTPUT_S3": attempt_output_s3 or output_s3,
-                "SPOTBATCH_SUMMARY_S3": attempt_summary_s3 or summary_s3,
-                "SPOTBATCH_DONE_S3": done_s3,
+                "SWEETSPOT_TASK_JSON": str(task_json),
+                "SWEETSPOT_TASK_ID": task_id,
+                "SWEETSPOT_RUN_ID": run_id,
+                "SWEETSPOT_TASK_HASH": this_task_hash,
+                "SWEETSPOT_ATTEMPT_ID": attempt_id,
+                "SWEETSPOT_OUTPUT_PATH": str(output_path),
+                "SWEETSPOT_METRICS_PATH": str(metrics_path),
+                "SWEETSPOT_OUTPUT_S3": attempt_output_s3 or output_s3,
+                "SWEETSPOT_SUMMARY_S3": attempt_summary_s3 or summary_s3,
+                "SWEETSPOT_DONE_S3": done_s3,
             }
         )
         env.update(task_env_overrides(task))
@@ -604,7 +604,7 @@ def run_task(
                     output_path,
                     attempt_output_s3,
                     task.get("output_content_type"),
-                    metadata={"sha256": sha256, "spotbatch-task-hash": this_task_hash, "spotbatch-attempt-id": attempt_id},
+                    metadata={"sha256": sha256, "sweetspot-task-hash": this_task_hash, "sweetspot-attempt-id": attempt_id},
                 )
                 uploaded_output = True
                 output_record = {"logical_uri": output_s3, "uri": attempt_output_s3, "size_bytes": size, "sha256": sha256}
@@ -630,7 +630,7 @@ def run_task(
         _emit_event("telemetry", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, **telemetry)
 
         summary = {
-            "schema": "spotbatch.task_summary.v2",
+            "schema": "sweetspot.task_summary.v2",
             "run_id": run_id,
             "task_id": task_id,
             "task_hash": this_task_hash,
@@ -746,7 +746,7 @@ def run_worker(
     validate_worker_timing(visibility_timeout=visibility_timeout, heartbeat_seconds=heartbeat_seconds, task_timeout_seconds=task_timeout_seconds)
     allowed_s3_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
     redact_regexes = list(redact_regexes or []) if not isinstance(redact_regexes, str) else [redact_regexes]
-    env_redact_regexes = os.environ.get("SPOTBATCH_REDACT_REGEXES", "")
+    env_redact_regexes = os.environ.get("SWEETSPOT_REDACT_REGEXES", "")
     if env_redact_regexes:
         redact_regexes.extend([p for p in env_redact_regexes.splitlines() if p.strip()])
     parse_redact_patterns(redact_regexes)
@@ -806,5 +806,5 @@ def run_worker(
             raise
         finally:
             stop.set()
-    print(json.dumps({"schema": "spotbatch.worker_summary.v1", "processed": processed, "finished_at": iso_now()}), flush=True)
+    print(json.dumps({"schema": "sweetspot.worker_summary.v1", "processed": processed, "finished_at": iso_now()}), flush=True)
     return 0

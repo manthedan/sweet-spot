@@ -1,10 +1,10 @@
-# Miser / SpotBatch production-hardening roadmap
+# SweetSpot / SweetSpot production-hardening roadmap
 
 This roadmap tracks the static-review findings that separate the current runner from a production-quality, portfolio-ready distributed work system.
 
 Current positioning:
 
-> Miser is a durable, at-least-once AWS Batch Spot runner for trusted, idempotent, embarrassingly parallel workloads.
+> SweetSpot is a durable, at-least-once AWS Batch Spot runner for trusted, idempotent, embarrassingly parallel workloads.
 
 Do **not** claim arbitrary-job safety, exactly-once side effects, or globally optimal cost until the relevant milestones below are complete and measured.
 
@@ -17,7 +17,7 @@ Goal: remove the sharpest correctness hazards without redesigning the commit pro
 - [x] Reject default or per-task timeouts above the safe cap.
 - [x] Emit structured heartbeat/lease-renewal failure events instead of swallowing errors silently.
 - [x] Document that the queue is a trusted control plane and tasks must be idempotent.
-- [x] Reject task environment keys that can override framework/AWS/ECS state (`SPOTBATCH_*`, `AWS_*`, `ECS_*`).
+- [x] Reject task environment keys that can override framework/AWS/ECS state (`SWEETSPOT_*`, `AWS_*`, `ECS_*`).
 - [x] Fix the README/log tooling mismatch around the OpenTofu log group.
 - [x] Add focused tests for timeout caps, heartbeat validation, reserved env rejection, and log-group behavior.
 
@@ -54,7 +54,7 @@ Goal: preserve diagnostics during Spot interruption and make operators faster.
 - [x] Keep bounded ring buffers for summary tails instead of reading whole log files.
 - [x] Cap per-task log bytes and support redaction patterns.
 - [x] Emit structured JSON events for lease renewal, retry, timeout, upload, commit, and skip decisions.
-- [x] Add `spotbatch doctor` to validate queue/DLQ/S3 permissions, job definition, log group, timeouts, architecture, and quotas. Quota validation is currently advisory because AWS Batch quota codes vary by account/Region.
+- [x] Add `sweetspot doctor` to validate queue/DLQ/S3 permissions, job definition, log group, timeouts, architecture, and quotas. Quota validation is currently advisory because AWS Batch quota codes vary by account/Region.
 - [x] Add CloudWatch dashboard and alarms for queue age, DLQ depth, Batch failures, and stalled runnable jobs.
 
 ## Milestone 5 — scale/cost correctness
@@ -85,7 +85,7 @@ Goal: make the infrastructure demonstrably reproducible and safer by default.
 Goal: turn the Spot scout/lane manager into a measured controller and publish an honest case study.
 
 - [x] Have workers emit instance type, architecture, Region/AZ, image digest, startup delay, useful units completed, useful compute seconds, bytes transferred, retry/interruption status, attempt count, and discarded compute seconds.
-- [x] Teach `spot_scout` and lane manager to optimize expected total cost, not just instance price.
+- [x] Teach `scout` and lane manager to optimize expected total cost, not just instance price.
 - [x] Include compute, interruption replay, startup overhead, cross-region transfer, NAT/endpoints, S3/SQS/CloudWatch, storage, and On-Demand repair costs.
 - [x] Publish an anonymized machine-readable run manifest and short case study comparing Spot vs On-Demand under a fixed deadline and completeness target.
 
@@ -93,6 +93,6 @@ Goal: turn the Spot scout/lane manager into a measured controller and publish an
 
 Pick one public identity and make the others subordinate. Preferred framing:
 
-> **Miser — a cost-aware AWS Batch Spot work runner.**
+> **SweetSpot — a cost-aware AWS Batch Spot work runner.**
 
-Use `spotbatch` as the CLI name, but explain that relationship once and remove stale names from prominent docs.
+Public identity is now SweetSpot end-to-end: distribution/import package, schemas, environment variables, container command, and CLI all use `sweetspot` / `SWEETSPOT_*`.
