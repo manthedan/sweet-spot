@@ -99,6 +99,18 @@ spotbatch submit-workers \
 
 # add --submit after reviewing the dry-run
 
+# keep a bounded worker pool topped up across one or more loops
+spotbatch supervise-workers \
+  --sqs-queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --batch-job-queue my-batch-spot-queue \
+  --job-definition my-worker-jobdef:1 \
+  --job-name-prefix hello-001-worker \
+  --target-active-workers 64 \
+  --max-active-workers 64 \
+  --max-submit-per-loop 16
+
+# add --submit after reviewing the dry-run
+
 # finalize by checking S3 done markers
 spotbatch finalize \
   --run-id hello-001 \

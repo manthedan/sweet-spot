@@ -79,6 +79,68 @@ def _parse_env_pair(s: str) -> dict[str, str]:
     return {"name": k, "value": v}
 
 
+def _redact_env(env: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [{"name": str(x.get("name", "")), "value": "<redacted>"} for x in env]
+
+
+def _status_counts(jobs: list[dict[str, Any]]) -> dict[str, int]:
+    return dict(Counter(str(j.get("status", "UNKNOWN")) for j in jobs))
+
+
+def _worker_overrides(
+    *,
+    sqs_queue_url: str,
+    messages_per_worker: int,
+    visibility_timeout: int,
+    heartbeat_seconds: int,
+    task_timeout_seconds: float,
+    env: list[dict[str, str]],
+    vcpus: int | None,
+    memory: int | None,
+) -> dict[str, Any]:
+    base_env = [
+        {"name": "SPOTBATCH_SQS_QUEUE_URL", "value": sqs_queue_url},
+        {"name": "SPOTBATCH_MAX_MESSAGES", "value": str(messages_per_worker)},
+        {"name": "SPOTBATCH_VISIBILITY_TIMEOUT", "value": str(visibility_timeout)},
+        {"name": "SPOTBATCH_HEARTBEAT_SECONDS", "value": str(heartbeat_seconds)},
+        {"name": "SPOTBATCH_TASK_TIMEOUT_SECONDS", "value": str(task_timeout_seconds)},
+    ]
+    base_env.extend(env or [])
+    overrides: dict[str, Any] = {"environment": base_env}
+    if vcpus is not None:
+        overrides["vcpus"] = vcpus
+    if memory is not None:
+        overrides["memory"] = memory
+    return overrides
+
+
+def _submit_worker_jobs(
+    batch,
+    *,
+    count: int,
+    job_name_prefix: str,
+    batch_job_queue: str,
+    job_definition: str,
+    overrides: dict[str, Any],
+    retry_attempts: int | None,
+) -> list[dict[str, Any]]:
+    submitted = []
+    stamp = utc_stamp()
+    for i in range(count):
+        job_name = f"{job_name_prefix}-{stamp}-{i:04d}"
+        kwargs: dict[str, Any] = {
+            "jobName": job_name,
+            "jobQueue": batch_job_queue,
+            "jobDefinition": job_definition,
+            "containerOverrides": overrides,
+        }
+        if retry_attempts is not None:
+            kwargs["retryStrategy"] = {"attempts": retry_attempts}
+        resp = batch.submit_job(**kwargs)
+        submitted.append({"jobName": job_name, "jobId": resp.get("jobId"), "jobArn": resp.get("jobArn")})
+    return submitted
+
+
 def cmd_submit_workers(args: argparse.Namespace) -> int:
     if not args.sqs_queue_url:
         raise SystemExit("missing --sqs-queue-url or SPOTBATCH_SQS_QUEUE_URL")
@@ -91,35 +153,28 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
     to_submit = max(0, raw_desired - len(active)) if args.subtract_active else raw_desired
     to_submit = min(to_submit, args.max_workers)
 
-    base_env = [
-        {"name": "SPOTBATCH_SQS_QUEUE_URL", "value": args.sqs_queue_url},
-        {"name": "SPOTBATCH_MAX_MESSAGES", "value": str(args.messages_per_worker)},
-        {"name": "SPOTBATCH_VISIBILITY_TIMEOUT", "value": str(args.visibility_timeout)},
-        {"name": "SPOTBATCH_HEARTBEAT_SECONDS", "value": str(args.heartbeat_seconds)},
-        {"name": "SPOTBATCH_TASK_TIMEOUT_SECONDS", "value": str(args.task_timeout_seconds)},
-    ]
-    base_env.extend(args.env or [])
-    overrides: dict[str, Any] = {"environment": base_env}
-    if args.vcpus is not None:
-        overrides["vcpus"] = args.vcpus
-    if args.memory is not None:
-        overrides["memory"] = args.memory
+    overrides = _worker_overrides(
+        sqs_queue_url=args.sqs_queue_url,
+        messages_per_worker=args.messages_per_worker,
+        visibility_timeout=args.visibility_timeout,
+        heartbeat_seconds=args.heartbeat_seconds,
+        task_timeout_seconds=args.task_timeout_seconds,
+        env=args.env or [],
+        vcpus=args.vcpus,
+        memory=args.memory,
+    )
 
     submitted = []
     if args.submit and to_submit > 0:
-        stamp = utc_stamp()
-        for i in range(to_submit):
-            job_name = f"{args.job_name_prefix}-{stamp}-{i:04d}"
-            kwargs: dict[str, Any] = {
-                "jobName": job_name,
-                "jobQueue": args.batch_job_queue,
-                "jobDefinition": args.job_definition,
-                "containerOverrides": overrides,
-            }
-            if args.retry_attempts is not None:
-                kwargs["retryStrategy"] = {"attempts": args.retry_attempts}
-            resp = batch.submit_job(**kwargs)
-            submitted.append({"jobName": job_name, "jobId": resp.get("jobId"), "jobArn": resp.get("jobArn")})
+        submitted = _submit_worker_jobs(
+            batch,
+            count=to_submit,
+            job_name_prefix=args.job_name_prefix,
+            batch_job_queue=args.batch_job_queue,
+            job_definition=args.job_definition,
+            overrides=overrides,
+            retry_attempts=args.retry_attempts,
+        )
 
     print(json.dumps({
         "schema": "spotbatch.worker_submitter_summary.v1",
@@ -136,6 +191,144 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
         "active_examples": active[:20],
     }, indent=2, sort_keys=True))
     return 0
+
+
+def _terminal_job_counts(batch, job_queue: str, job_name_prefix: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for status in ("SUCCEEDED", "FAILED"):
+        total = 0
+        paginator = batch.get_paginator("list_jobs")
+        for page in paginator.paginate(jobQueue=job_queue, jobStatus=status):
+            total += sum(1 for j in page.get("jobSummaryList", []) if not job_name_prefix or str(j.get("jobName", "")).startswith(job_name_prefix))
+        counts[status] = total
+    return counts
+
+
+def _supervisor_desired_workers(*, backlog: int, messages_per_worker: int, target_active_workers: int, max_active_workers: int, keep_full_pool: bool) -> int:
+    if backlog <= 0 and not keep_full_pool:
+        return 0
+    desired = target_active_workers if keep_full_pool else min(target_active_workers, desired_worker_count(backlog, messages_per_worker, 0, target_active_workers))
+    return min(desired, max_active_workers)
+
+
+def cmd_supervise_workers(args: argparse.Namespace) -> int:
+    if not args.sqs_queue_url:
+        raise SystemExit("missing --sqs-queue-url or SPOTBATCH_SQS_QUEUE_URL")
+    if args.stop_on_dlq and not args.dlq_url:
+        raise SystemExit("--stop-on-dlq requires --dlq-url")
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    sqs = session.client("sqs", region_name=args.region)
+    batch = session.client("batch", region_name=args.region)
+    artifact_dir = args.artifact_dir or Path("artifacts") / (args.run_id or f"supervise-{utc_stamp()}")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    status_path = artifact_dir / "supervisor_status.jsonl"
+    summary_path = artifact_dir / "supervisor_summary.json"
+    config_path = artifact_dir / "supervisor_config.json"
+    config = {
+        "schema": "spotbatch.supervisor_config.v1",
+        "created_at": iso_now(),
+        "run_id": args.run_id,
+        "sqs_queue_url": args.sqs_queue_url,
+        "dlq_url": args.dlq_url,
+        "batch_job_queue": args.batch_job_queue,
+        "job_definition": args.job_definition,
+        "job_name_prefix": args.job_name_prefix,
+        "target_active_workers": args.target_active_workers,
+        "max_active_workers": args.max_active_workers,
+        "max_submit_per_loop": args.max_submit_per_loop,
+        "messages_per_worker": args.messages_per_worker,
+        "keep_full_pool": bool(args.keep_full_pool),
+        "submit": bool(args.submit),
+        "env": _redact_env(args.env or []),
+    }
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+    loops: list[dict[str, Any]] = []
+    stop_reason = None
+    for loop_index in range(args.loops):
+        depth = queue_depth(sqs, args.sqs_queue_url)
+        backlog = depth["visible"] + (depth["not_visible"] if args.include_not_visible else 0)
+        dlq_depth = queue_depth(sqs, args.dlq_url) if args.dlq_url else None
+        dlq_total = sum(dlq_depth.values()) if dlq_depth else 0
+        active = active_jobs(batch, args.batch_job_queue, args.job_name_prefix)
+        active_count = len(active)
+        desired = _supervisor_desired_workers(
+            backlog=backlog,
+            messages_per_worker=args.messages_per_worker,
+            target_active_workers=args.target_active_workers,
+            max_active_workers=args.max_active_workers,
+            keep_full_pool=bool(args.keep_full_pool),
+        )
+        capacity_left = max(0, args.max_active_workers - active_count)
+        to_submit = min(args.max_submit_per_loop, capacity_left, max(0, desired - active_count))
+        loop_stop_reason = None
+        if args.stop_on_dlq and dlq_total > 0:
+            to_submit = 0
+            loop_stop_reason = "dlq_not_empty"
+            stop_reason = loop_stop_reason
+        overrides = _worker_overrides(
+            sqs_queue_url=args.sqs_queue_url,
+            messages_per_worker=args.messages_per_worker,
+            visibility_timeout=args.visibility_timeout,
+            heartbeat_seconds=args.heartbeat_seconds,
+            task_timeout_seconds=args.task_timeout_seconds,
+            env=args.env or [],
+            vcpus=args.vcpus,
+            memory=args.memory,
+        )
+        submitted = []
+        if args.submit and to_submit > 0:
+            submitted = _submit_worker_jobs(
+                batch,
+                count=to_submit,
+                job_name_prefix=args.job_name_prefix,
+                batch_job_queue=args.batch_job_queue,
+                job_definition=args.job_definition,
+                overrides=overrides,
+                retry_attempts=args.retry_attempts,
+            )
+        record = {
+            "schema": "spotbatch.supervisor_loop.v1",
+            "checked_at": iso_now(),
+            "loop_index": loop_index,
+            "submit": bool(args.submit),
+            "queue_depth": depth,
+            "dlq_depth": dlq_depth,
+            "backlog_used_for_sizing": backlog,
+            "target_active_workers": args.target_active_workers,
+            "max_active_workers": args.max_active_workers,
+            "desired_active_workers": desired,
+            "active_count": active_count,
+            "active_status_counts": _status_counts(active),
+            "terminal_status_counts": _terminal_job_counts(batch, args.batch_job_queue, args.job_name_prefix) if args.include_terminal_counts else None,
+            "to_submit": to_submit,
+            "submitted_count": len(submitted),
+            "submitted": submitted[:50],
+            "stop_reason": loop_stop_reason,
+        }
+        with status_path.open("a") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+        loops.append(record)
+        if loop_stop_reason:
+            break
+        if loop_index + 1 < args.loops:
+            time.sleep(args.interval_seconds)
+
+    summary = {
+        "schema": "spotbatch.supervisor_summary.v1",
+        "finished_at": iso_now(),
+        "run_id": args.run_id,
+        "submit": bool(args.submit),
+        "loops": len(loops),
+        "submitted_count": sum(int(r["submitted_count"]) for r in loops),
+        "last_loop": loops[-1] if loops else None,
+        "stop_reason": stop_reason,
+        "status_jsonl": str(status_path),
+        "config_json": str(config_path),
+    }
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({**summary, "summary_json": str(summary_path)}, indent=2, sort_keys=True))
+    return 2 if stop_reason and args.fail_on_stop else 0
 
 
 def _read_tasks_for_finalizer(args: argparse.Namespace, s3) -> list[dict[str, Any]]:
@@ -284,6 +477,37 @@ def main() -> int:
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_submit_workers)
+
+    p = sub.add_parser("supervise-workers")
+    p.add_argument("--run-id")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--sqs-queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
+    p.add_argument("--dlq-url")
+    p.add_argument("--stop-on-dlq", action="store_true")
+    p.add_argument("--fail-on-stop", action="store_true")
+    p.add_argument("--batch-job-queue", required=True)
+    p.add_argument("--job-definition", required=True)
+    p.add_argument("--job-name-prefix", default="spotbatch-worker")
+    p.add_argument("--target-active-workers", type=int, default=64)
+    p.add_argument("--max-active-workers", type=int, default=64)
+    p.add_argument("--max-submit-per-loop", type=int, default=64)
+    p.add_argument("--messages-per-worker", type=int, default=1)
+    p.add_argument("--include-not-visible", action="store_true")
+    p.add_argument("--include-terminal-counts", action="store_true")
+    p.add_argument("--keep-full-pool", action="store_true")
+    p.add_argument("--loops", type=int, default=1)
+    p.add_argument("--interval-seconds", type=float, default=60.0)
+    p.add_argument("--artifact-dir", type=Path)
+    p.add_argument("--vcpus", type=int)
+    p.add_argument("--memory", type=int)
+    p.add_argument("--visibility-timeout", type=int, default=1800)
+    p.add_argument("--heartbeat-seconds", type=int, default=300)
+    p.add_argument("--task-timeout-seconds", type=float, default=86400, help="Default per-task command timeout to pass to workers")
+    p.add_argument("--retry-attempts", type=int)
+    p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
+    p.add_argument("--submit", action="store_true")
+    p.set_defaults(func=cmd_supervise_workers)
 
     p = sub.add_parser("finalize")
     p.add_argument("--run-id", required=True)
