@@ -34,6 +34,19 @@ def s3_upload_text(s3, text: str, uri: str, content_type: str = "application/jso
     s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType=content_type)
 
 
+def s3_upload_text_if_absent(s3, text: str, uri: str, content_type: str = "application/json") -> bool:
+    bucket, key = parse_s3_uri(uri)
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType=content_type, IfNoneMatch="*")
+        return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in {"PreconditionFailed", "ConditionalRequestConflict"} or status in {409, 412}:
+            return False
+        raise
+
+
 def s3_download_text(s3, uri: str) -> str:
     bucket, key = parse_s3_uri(uri)
     return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
@@ -44,10 +57,19 @@ def s3_delete(s3, uri: str) -> None:
     s3.delete_object(Bucket=bucket, Key=key)
 
 
-def s3_upload_file(s3, path: Path, uri: str, content_type: str | None = None) -> None:
+def s3_upload_file(s3, path: Path, uri: str, content_type: str | None = None, metadata: dict[str, str] | None = None) -> None:
     bucket, key = parse_s3_uri(uri)
-    extra = {"ContentType": content_type} if content_type else None
+    extra: dict[str, object] = {}
+    if content_type:
+        extra["ContentType"] = content_type
+    if metadata:
+        extra["Metadata"] = metadata
     if extra:
         s3.upload_file(str(path), bucket, key, ExtraArgs=extra)
     else:
         s3.upload_file(str(path), bucket, key)
+
+
+def s3_head_object(s3, uri: str) -> dict[str, object]:
+    bucket, key = parse_s3_uri(uri)
+    return s3.head_object(Bucket=bucket, Key=key)

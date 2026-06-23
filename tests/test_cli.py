@@ -36,6 +36,7 @@ except ModuleNotFoundError:
 ClientError = _ClientError
 
 from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
+from spotbatch.worker import task_hash
 
 
 class CanaryTests(unittest.TestCase):
@@ -339,10 +340,17 @@ class FakeFinalizeS3:
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
         if (Bucket, Key) not in self.objects:
             raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
-        return {}
+        obj = self.objects[(Bucket, Key)]
+        body = obj.get("Body", b"")
+        return {"ContentLength": len(body), "Metadata": obj.get("Metadata", {})}
 
-    def put_object(self, *, Bucket: str, Key: str, Body: bytes, ContentType: str) -> dict[str, object]:
-        self.objects[(Bucket, Key)] = {"Body": Body, "ContentType": ContentType}
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
+        if (Bucket, Key) not in self.objects:
+            raise ClientError({"Error": {"Code": "404"}}, "GetObject")
+        return {"Body": io.BytesIO(self.objects[(Bucket, Key)].get("Body", b""))}
+
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes, ContentType: str, **kwargs) -> dict[str, object]:
+        self.objects[(Bucket, Key)] = {"Body": Body, "ContentType": ContentType, "Metadata": kwargs.get("Metadata", {})}
         return {}
 
     def delete_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
@@ -364,7 +372,7 @@ class FinalizeTests(unittest.TestCase):
 
     def test_finalize_writes_repair_tasks_and_refuses_ready_when_incomplete(self) -> None:
         s3 = FakeFinalizeS3()
-        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"{}"}
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": ""}).encode()}
         tasks = [
             {"run_id": "r1", "task_id": "task-1", "done_s3": "s3://bucket/runs/r1/done/task-1.done.json"},
             {"run_id": "r1", "task_id": "task-2", "done_s3": "s3://bucket/runs/r1/done/task-2.done.json"},
@@ -401,7 +409,7 @@ class FinalizeTests(unittest.TestCase):
 
     def test_finalize_refuses_ready_when_done_exists_but_output_missing(self) -> None:
         s3 = FakeFinalizeS3()
-        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": b"{}"}
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt"}).encode()}
         tasks = [
             {
                 "run_id": "r1",
@@ -440,10 +448,56 @@ class FinalizeTests(unittest.TestCase):
             self.assertFalse(manifest["complete"])
             self.assertNotIn(("bucket", "runs/r1/READY"), s3.objects)
 
+    def test_finalize_treats_missing_v2_attempt_output_as_repairable(self) -> None:
+        s3 = FakeFinalizeS3()
+        task = {
+            "run_id": "r1",
+            "task_id": "task-v2",
+            "command": ["echo", "ok"],
+            "output_s3": "s3://bucket/runs/r1/shards/task-v2.txt",
+            "done_s3": "s3://bucket/runs/r1/done/task-v2.done.json",
+        }
+        marker = {
+            "schema": "spotbatch.done_marker.v2",
+            "run_id": "r1",
+            "task_id": "task-v2",
+            "task_hash": task_hash(task),
+            "attempt_id": "attempt-a",
+            "done_s3": task["done_s3"],
+            "output_s3": task["output_s3"],
+            "output": {"logical_uri": task["output_s3"], "uri": "s3://bucket/runs/r1/shards/task-v2.txt.attempts/attempt-a/output", "size_bytes": 2, "sha256": "0" * 64},
+        }
+        s3.objects[("bucket", "runs/r1/done/task-v2.done.json")] = {"Body": json.dumps(marker).encode()}
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=1,
+                progress_interval=0,
+                write_repair_jsonl=None,
+                upload=False,
+                publish_ready=False,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                require_complete=True,
+            )
+            with patch("spotbatch.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
+                rc = cmd_finalize(args)
+            self.assertEqual(rc, 2)
+            manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
+            self.assertEqual(manifest["missing_output_count"], 1)
+            repair_rows = [json.loads(line) for line in (Path(tmp) / "finalizer" / "repair_tasks.jsonl").read_text().splitlines()]
+            self.assertEqual(repair_rows[0]["output_s3"], task["output_s3"])
+
     def test_finalize_publishes_ready_after_complete_manifest_upload(self) -> None:
         s3 = FakeFinalizeS3()
-        s3.objects[("bucket", "runs/r1/done/task-10.done.json")] = {"Body": b"{}"}
-        s3.objects[("bucket", "runs/r1/done/task-2.done.json")] = {"Body": b"{}"}
+        s3.objects[("bucket", "runs/r1/done/task-10.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-10", "output_s3": "s3://bucket/runs/r1/shards/task-10.txt"}).encode()}
+        s3.objects[("bucket", "runs/r1/done/task-2.done.json")] = {"Body": json.dumps({"schema": "spotbatch.done_marker.v1", "run_id": "r1", "task_id": "task-2", "output_s3": "s3://bucket/runs/r1/shards/task-2.txt"}).encode()}
         s3.objects[("bucket", "runs/r1/shards/task-10.txt")] = {"Body": b"ok"}
         s3.objects[("bucket", "runs/r1/shards/task-2.txt")] = {"Body": b"ok"}
         tasks = [

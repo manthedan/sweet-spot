@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -25,7 +26,7 @@ if "botocore.exceptions" not in sys.modules:
     exceptions.ClientError = ClientError
     sys.modules["botocore.exceptions"] = exceptions
 
-from spotbatch.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, run_task, validate_worker_timing
+from spotbatch.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, run_task, task_hash, validate_worker_timing
 
 
 class RunTaskTests(unittest.TestCase):
@@ -37,8 +38,10 @@ class RunTaskTests(unittest.TestCase):
             "command": "not-a-list",
             "done_s3": "s3://bucket/run/done/already-done.done.json",
         }
+        marker = {"schema": "spotbatch.done_marker.v1", "run_id": "run-1", "task_id": "already-done", "output_s3": ""}
         with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("spotbatch.worker.s3_exists", return_value=True):
+             mock.patch("spotbatch.worker.s3_exists", return_value=True), \
+             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
             result = run_task(task, s3=object(), work_root=Path(tmp))
         self.assertEqual(result["event"], "skip_existing_done")
 
@@ -65,7 +68,7 @@ class RunTaskTests(unittest.TestCase):
 
         upload_file.assert_not_called()
         uploaded_uris = [uri for uri, _payload in text_uploads]
-        self.assertIn("s3://bucket/run/summaries/task-1.summary.json", uploaded_uris)
+        self.assertTrue(any(uri.startswith("s3://bucket/run/summaries/task-1.summary.json.attempts/") for uri in uploaded_uris))
         self.assertNotIn("s3://bucket/run/done/task-1.done.json", uploaded_uris)
         summary = text_uploads[0][1]
         self.assertIn("expected output file was not produced", str(summary["framework_error"]))
@@ -73,7 +76,7 @@ class RunTaskTests(unittest.TestCase):
     def test_task_id_collisions_do_not_reuse_stale_output(self) -> None:
         file_uploads: list[tuple[str, str]] = []
 
-        def capture_file(_s3, path: Path, uri: str, _content_type: str | None = None) -> None:
+        def capture_file(_s3, path: Path, uri: str, _content_type: str | None = None, **_kwargs) -> None:
             file_uploads.append((uri, path.read_text()))
 
         base = {
@@ -97,7 +100,8 @@ class RunTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("spotbatch.worker.s3_exists", return_value=False), \
              mock.patch("spotbatch.worker.s3_upload_file", side_effect=capture_file), \
-             mock.patch("spotbatch.worker.s3_upload_text"):
+             mock.patch("spotbatch.worker.s3_upload_text"), \
+             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
             # This is the stale path the previous implementation would have reused for both ids.
             stale_dir = Path(tmp) / "a_b"
             stale_dir.mkdir()
@@ -107,7 +111,9 @@ class RunTaskTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "expected output file was not produced"):
                 run_task(second, s3=object(), work_root=Path(tmp))
 
-        self.assertEqual(file_uploads, [("s3://bucket/run/shards/a-b.txt", "fresh")])
+        self.assertEqual(len(file_uploads), 1)
+        self.assertTrue(file_uploads[0][0].startswith("s3://bucket/run/shards/a-b.txt.attempts/"))
+        self.assertEqual(file_uploads[0][1], "fresh")
 
     def test_default_timeout_bounds_hung_commands_and_writes_summary(self) -> None:
         text_uploads: list[tuple[str, dict[str, object]]] = []
@@ -129,7 +135,7 @@ class RunTaskTests(unittest.TestCase):
                 run_task(task, s3=object(), work_root=Path(tmp), default_timeout_seconds=0.05)
 
         self.assertEqual(len(text_uploads), 1)
-        self.assertEqual(text_uploads[0][0], "s3://bucket/run/summaries/slow.summary.json")
+        self.assertTrue(text_uploads[0][0].startswith("s3://bucket/run/summaries/slow.summary.json.attempts/"))
         self.assertTrue(text_uploads[0][1]["timed_out"])
         self.assertIn("timed out", str(text_uploads[0][1]["framework_error"]))
 
@@ -147,13 +153,21 @@ class RunTaskTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text):
+             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
+             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
             work_root = Path(tmp) / "missing-work-root"
             result = run_task(task, s3=object(), work_root=work_root)
             self.assertTrue(work_root.is_dir())
 
         self.assertEqual(result["event"], "processed")
-        self.assertIn("s3://bucket/run/done/task-1.done.json", [uri for uri, _payload in text_uploads])
+        self.assertEqual(text_uploads, [])
+
+    def test_task_hash_covers_custom_payload_fields(self) -> None:
+        base = {"run_id": "run-1", "task_id": "hash", "command": ["echo", "ok"], "done_s3": "s3://bucket/run/done/hash.done.json"}
+        changed = {**base, "input_s3": "s3://bucket/other/input.json"}
+        changed_attempt = {**base, "attempt_id": "user-data"}
+        self.assertNotEqual(task_hash(base), task_hash(changed))
+        self.assertNotEqual(task_hash(base), task_hash(changed_attempt))
 
     def test_rejects_non_finite_timeouts(self) -> None:
         task = {
@@ -223,6 +237,76 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(event["schema"], "spotbatch.heartbeat_error.v1")
         self.assertEqual(event["error"], "lease lost")
 
+    def test_conditional_done_marker_conflict_validates_winner(self) -> None:
+        task = {
+            "run_id": "run-1",
+            "task_id": "race",
+            "command": [sys.executable, "-c", "from pathlib import Path; import os; Path(os.environ['SPOTBATCH_OUTPUT_PATH']).write_text('ok')"],
+            "output_s3": "s3://bucket/run/shards/race.txt",
+            "done_s3": "s3://bucket/run/done/race.done.json",
+        }
+        winner_output = "s3://bucket/run/shards/race.txt.attempts/winner/output"
+        winner = {
+            "schema": "spotbatch.done_marker.v2",
+            "run_id": "run-1",
+            "task_id": "race",
+            "task_hash": task_hash(task),
+            "attempt_id": "winner",
+            "done_at": "now",
+            "done_s3": "s3://bucket/run/done/race.done.json",
+            "output_s3": "s3://bucket/run/shards/race.txt",
+            "summary_s3": "",
+            "output": {"logical_uri": "s3://bucket/run/shards/race.txt", "uri": winner_output, "size_bytes": 2, "sha256": hashlib.sha256(b"ok").hexdigest()},
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", side_effect=[False, True]), \
+             mock.patch("spotbatch.worker.s3_upload_file"), \
+             mock.patch("spotbatch.worker.s3_upload_text"), \
+             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=False), \
+             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(winner)), \
+             mock.patch("spotbatch.worker.s3_head_object", return_value={"ContentLength": 2, "Metadata": {"sha256": hashlib.sha256(b"ok").hexdigest(), "spotbatch-task-hash": task_hash(task), "spotbatch-attempt-id": "winner"}}):
+            result = run_task(task, s3=object(), work_root=Path(tmp))
+        self.assertEqual(result["event"], "commit_lost_existing_done")
+        self.assertEqual(result["winning_attempt_id"], "winner")
+
+    def test_v2_done_marker_rejects_wrong_attempt_output_uri(self) -> None:
+        task = {
+            "run_id": "run-1",
+            "task_id": "wrong-output",
+            "command": [sys.executable, "-c", "pass"],
+            "output_s3": "s3://bucket/run/shards/wrong-output.txt",
+            "done_s3": "s3://bucket/run/done/wrong-output.done.json",
+        }
+        marker = {
+            "schema": "spotbatch.done_marker.v2",
+            "run_id": "run-1",
+            "task_id": "wrong-output",
+            "task_hash": task_hash(task),
+            "attempt_id": "attempt-a",
+            "done_s3": task["done_s3"],
+            "output_s3": task["output_s3"],
+            "output": {"logical_uri": task["output_s3"], "uri": "s3://bucket/other/object", "size_bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()},
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=True), \
+             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
+            with self.assertRaisesRegex(ValueError, "output uri"):
+                run_task(task, s3=object(), work_root=Path(tmp))
+
+    def test_corrupt_existing_done_marker_is_not_skipped(self) -> None:
+        task = {
+            "run_id": "run-1",
+            "task_id": "stale",
+            "command": [sys.executable, "-c", "pass"],
+            "done_s3": "s3://bucket/run/done/stale.done.json",
+        }
+        marker = {"schema": "spotbatch.done_marker.v2", "run_id": "run-1", "task_id": "stale", "task_hash": "0" * 64, "done_s3": task["done_s3"], "output_s3": ""}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=True), \
+             mock.patch("spotbatch.worker.s3_download_text", return_value=json.dumps(marker)):
+            with self.assertRaisesRegex(ValueError, "task_hash mismatch"):
+                run_task(task, s3=object(), work_root=Path(tmp))
+
     def test_successful_task_cleans_up_background_descendants(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "background-ran"
@@ -241,7 +325,8 @@ class RunTaskTests(unittest.TestCase):
                 "done_s3": "s3://bucket/run/done/background.done.json",
             }
             with mock.patch("spotbatch.worker.s3_exists", return_value=False), \
-                 mock.patch("spotbatch.worker.s3_upload_text"):
+                 mock.patch("spotbatch.worker.s3_upload_text"), \
+                 mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True):
                 run_task(task, s3=object(), work_root=Path(tmp), default_timeout_seconds=2)
             time.sleep(0.7)
             self.assertFalse(marker.exists())

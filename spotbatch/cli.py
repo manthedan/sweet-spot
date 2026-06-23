@@ -14,7 +14,7 @@ import boto3
 
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
-from .worker import SAFE_TASK_TIMEOUT_SECONDS, default_done_s3, run_worker, validate_worker_timing
+from .worker import SAFE_TASK_TIMEOUT_SECONDS, default_done_s3, run_worker, task_hash, validate_done_marker, validate_worker_timing
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -486,19 +486,44 @@ def _read_tasks_for_finalizer(args: argparse.Namespace, s3) -> list[dict[str, An
     return tmp
 
 
+def _done_marker_for_task(s3, task: dict[str, Any], done_s3: str) -> dict[str, Any] | None:
+    if not s3_exists(s3, done_s3):
+        return None
+    marker = json.loads(s3_download_text(s3, done_s3))
+    if not isinstance(marker, dict):
+        raise ValueError(f"done marker is not an object: {done_s3}")
+    return marker
+
+
 def _check_task(s3, task: dict[str, Any]) -> dict[str, Any]:
-    output_s3 = str(task.get("output_s3") or "")
+    logical_output_s3 = str(task.get("output_s3") or "")
     summary_s3 = str(task.get("summary_s3") or "")
     done_s3 = default_done_s3(task)
-    done_exists = s3_exists(s3, done_s3)
-    output_exists = s3_exists(s3, output_s3) if output_s3 else False
+    marker = _done_marker_for_task(s3, task, done_s3)
+    marker_validation_error = None
+    if marker is not None:
+        try:
+            validate_done_marker(s3, task, marker, task_hash(task))
+        except ValueError as exc:
+            marker_validation_error = str(exc)
+            if "output is missing" not in marker_validation_error:
+                raise
+    done_exists = marker is not None
+    output_s3 = logical_output_s3
+    output_exists = s3_exists(s3, logical_output_s3) if logical_output_s3 else False
     summary_exists = s3_exists(s3, summary_s3) if summary_s3 else False
+    if marker and isinstance(marker.get("output"), dict):
+        output_s3 = str(marker["output"].get("uri") or logical_output_s3)
+        output_exists = False if marker_validation_error else True
+    if marker and marker.get("attempt_summary_s3"):
+        summary_s3 = str(marker.get("attempt_summary_s3"))
+        summary_exists = s3_exists(s3, summary_s3)
     state = "done" if done_exists else "incomplete"
-    if done_exists and output_s3 and not output_exists:
+    if done_exists and logical_output_s3 and not output_exists:
         state = "missing_output"
     elif output_exists and not done_exists:
         state = "output_without_done"
-    return {"task_id": task.get("task_id"), "output_s3": output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "output_exists": output_exists, "summary_exists": summary_exists, "state": state}
+    return {"task_id": task.get("task_id"), "output_s3": output_s3, "logical_output_s3": logical_output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "output_exists": output_exists, "summary_exists": summary_exists, "state": state, "marker_validation_error": marker_validation_error}
 
 
 def _repair_task_for_record(task: dict[str, Any], record: dict[str, Any], repair_suffix: str) -> dict[str, Any]:
