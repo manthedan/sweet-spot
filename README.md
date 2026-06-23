@@ -142,6 +142,11 @@ spotbatch describe-job --job-id AWS_BATCH_JOB_ID
 spotbatch logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERROR'
 spotbatch watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
 
+# dry-run a guarded S3 prefix cleanup; add --delete and exact --confirm-prefix to mutate
+spotbatch s3-delete-prefix \
+  --prefix s3://my-bucket/runs/old-run/ \
+  --artifact-dir artifacts/old-run/delete-dryrun
+
 # inspect DLQ
 spotbatch dlq \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
