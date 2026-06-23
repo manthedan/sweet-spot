@@ -18,7 +18,7 @@ SQS task message
 
 If a Spot host dies before ack, SQS visibility timeout returns the task. If a task repeatedly fails, SQS redrives it to the DLQ.
 
-Miser is an at-least-once runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent, or use `task_id` as their own idempotency key for external side effects.
+Miser is an at-least-once runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent, or use `task_id` as their own idempotency key for external side effects. Do not expose the queue to untrusted producers.
 
 ## What it is
 
@@ -83,7 +83,9 @@ If `output_s3` is present, the command must create `SPOTBATCH_OUTPUT_PATH` befor
 
 For v2 markers, `output_s3` in the task is the logical output URI used for task hashing; the actual immutable object URI is recorded in the done marker's `output.uri` and in the final manifest `outputs` list.
 
-Task-provided `env` keys may not start with `SPOTBATCH_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
+Task payloads are validated as `spotbatch.task.v1` before execution: `run_id`, `task_id`, `command`, timeout, env, marker URIs, and S3 URI syntax must pass bounded checks. Task-provided `env` keys may not start with `SPOTBATCH_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
+
+For production, set `SPOTBATCH_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `spotbatch worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be inside one of those prefixes.
 
 Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much shorter shards, and checkpoint/split work that cannot fit safely under the default 11-hour cap.
 
@@ -95,6 +97,7 @@ spotbatch enqueue-jsonl \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --tasks-jsonl examples/hello_world/tasks.jsonl \
   --artifact-dir artifacts/hello-001 \
+  --allowed-s3-prefix s3://my-bucket/runs/hello-001 \
   --submit
 
 # derive a deterministic canary subset before large launches
@@ -112,6 +115,7 @@ spotbatch submit-workers \
   --job-name-prefix hello-001-worker \
   --messages-per-worker 4 \
   --max-workers 64 \
+  --allowed-s3-prefix s3://my-bucket/runs/hello-001 \
   --subtract-active
 
 # add --submit after reviewing the dry-run
@@ -181,8 +185,8 @@ spotbatch-lane-manager --config lanes.json
 - SQS work queue + DLQ
 - AWS Batch Spot compute environment and queue
 - optional On-Demand repair queue
-- IAM roles needed by workers
-- generic worker job definition
+- least-privilege IAM roles scoped to the work queue and configured S3 bucket/prefixes
+- generic worker job definition with runtime S3-prefix validation
 
 See `infra/opentofu/README.md`.
 

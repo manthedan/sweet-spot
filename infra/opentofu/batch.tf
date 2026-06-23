@@ -80,7 +80,8 @@ resource "aws_batch_job_definition" "worker" {
     command    = ["spotbatch", "worker"]
     environment = [
       { name = "SPOTBATCH_SQS_QUEUE_URL", value = aws_sqs_queue.work.url },
-      { name = "SPOTBATCH_MAX_MESSAGES", value = "1" }
+      { name = "SPOTBATCH_MAX_MESSAGES", value = "1" },
+      { name = "SPOTBATCH_ALLOWED_S3_PREFIXES", value = join(",", local.worker_allowed_s3_prefixes_effective) }
     ]
     logConfiguration = {
       logDriver = "awslogs"

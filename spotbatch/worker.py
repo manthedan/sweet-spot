@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import signal
@@ -20,11 +19,11 @@ from botocore.exceptions import ClientError
 
 from .aws_batch import iso_now
 from .s3util import s3_download_text, s3_exists, s3_head_object, s3_upload_file, s3_upload_text, s3_upload_text_if_absent
+from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_env_overrides, task_hash, validate_task_model, validate_task_s3_prefixes, validate_timeout_seconds
 
 
 SQS_MAX_VISIBILITY_SECONDS = 12 * 60 * 60
 SAFE_TASK_TIMEOUT_SECONDS = 11 * 60 * 60
-RESERVED_TASK_ENV_PREFIXES = ("SPOTBATCH_", "AWS_", "ECS_")
 DONE_MARKER_SCHEMA_V1 = "spotbatch.done_marker.v1"
 DONE_MARKER_SCHEMA_V2 = "spotbatch.done_marker.v2"
 def _tail(s: str, n: int = 12000) -> str:
@@ -38,16 +37,7 @@ def _task_dir_prefix(task_id: str) -> str:
 
 
 def _timeout_seconds(task: dict[str, Any], default_timeout_seconds: float, *, max_timeout_seconds: float = SAFE_TASK_TIMEOUT_SECONDS) -> float:
-    raw = task.get("timeout_seconds", default_timeout_seconds)
-    try:
-        timeout = float(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("timeout_seconds must be a positive number") from exc
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout_seconds must be a positive finite number")
-    if timeout > max_timeout_seconds:
-        raise ValueError(f"timeout_seconds must be <= {max_timeout_seconds:g}s to stay below the SQS 12h visibility limit")
-    return timeout
+    return validate_timeout_seconds(task.get("timeout_seconds"), default_timeout_seconds, max_timeout_seconds=max_timeout_seconds)
 
 
 def validate_worker_timing(*, visibility_timeout: int, heartbeat_seconds: int, task_timeout_seconds: float) -> None:
@@ -56,35 +46,6 @@ def validate_worker_timing(*, visibility_timeout: int, heartbeat_seconds: int, t
     if heartbeat_seconds <= 0 or heartbeat_seconds >= visibility_timeout:
         raise ValueError("heartbeat_seconds must be positive and less than visibility_timeout")
     _timeout_seconds({}, task_timeout_seconds)
-
-
-def _task_env_overrides(task: dict[str, Any]) -> dict[str, str]:
-    raw = task.get("env") or {}
-    if not isinstance(raw, dict):
-        raise ValueError("task env must be an object mapping string keys to values")
-    out: dict[str, str] = {}
-    for k, v in raw.items():
-        key = str(k)
-        if any(key.startswith(prefix) for prefix in RESERVED_TASK_ENV_PREFIXES):
-            raise ValueError(f"task env key {key!r} uses a reserved prefix")
-        out[key] = str(v)
-    return out
-
-
-def default_done_s3(task: dict[str, Any]) -> str:
-    if task.get("done_s3"):
-        return str(task["done_s3"])
-    output = str(task.get("output_s3") or "")
-    if not output:
-        raise ValueError("task needs done_s3 or output_s3")
-    return output.replace("/shards/", "/done/") + ".done.json"
-
-
-def task_hash(task: dict[str, Any]) -> str:
-    stable = dict(task)
-    stable["done_s3"] = default_done_s3(task)
-    payload = json.dumps(stable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _safe_attempt_component(s: str) -> str:
@@ -230,11 +191,13 @@ def run_task(
     s3,
     work_root: Path,
     default_timeout_seconds: float = SAFE_TASK_TIMEOUT_SECONDS,
+    allowed_s3_prefixes: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     run_id = str(task.get("run_id", ""))
     task_id = str(task.get("task_id", ""))
     if not run_id or not task_id:
         raise ValueError("task requires run_id and task_id")
+    validate_task_s3_prefixes(task, allowed_s3_prefixes)
     done_s3 = default_done_s3(task)
     output_s3 = str(task.get("output_s3") or "")
     summary_s3 = str(task.get("summary_s3") or "")
@@ -252,9 +215,9 @@ def run_task(
             "checked_at": iso_now(),
         }
 
+    validate_task_model(task, default_timeout_seconds=default_timeout_seconds, max_timeout_seconds=SAFE_TASK_TIMEOUT_SECONDS, allowed_s3_prefixes=allowed_s3_prefixes)
     command = task.get("command")
-    if not isinstance(command, list) or not all(isinstance(x, str) for x in command) or not command:
-        raise ValueError("task requires command: list[str]")
+    assert isinstance(command, list)
     timeout = _timeout_seconds(task, default_timeout_seconds)
     attempt_id = _new_attempt_id(task_id)
     attempt_output_s3 = _attempt_uri(output_s3, attempt_id, "output") if output_s3 else ""
@@ -281,7 +244,7 @@ def run_task(
             "SPOTBATCH_SUMMARY_S3": attempt_summary_s3 or summary_s3,
             "SPOTBATCH_DONE_S3": done_s3,
         })
-        env.update(_task_env_overrides(task))
+        env.update(task_env_overrides(task))
 
         started = time.time()
         stdout_path = task_dir / "stdout.txt"
@@ -435,8 +398,10 @@ def run_worker(
     wait_time: int,
     work_dir: Path,
     task_timeout_seconds: float,
+    allowed_s3_prefixes: list[str] | tuple[str, ...] | None = None,
 ) -> int:
     validate_worker_timing(visibility_timeout=visibility_timeout, heartbeat_seconds=heartbeat_seconds, task_timeout_seconds=task_timeout_seconds)
+    allowed_s3_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
     sqs = boto3.client("sqs")
     s3 = boto3.client("s3")
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -463,7 +428,7 @@ def run_worker(
         hb.start()
         try:
             task = json.loads(msg.get("Body", "{}"))
-            result = run_task(task, s3=s3, work_root=work_dir, default_timeout_seconds=task_timeout_seconds)
+            result = run_task(task, s3=s3, work_root=work_dir, default_timeout_seconds=task_timeout_seconds, allowed_s3_prefixes=allowed_s3_prefixes)
             print(json.dumps(result, sort_keys=True), flush=True)
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
             processed += 1

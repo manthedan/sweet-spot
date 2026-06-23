@@ -32,6 +32,23 @@ variable "worker_image_uri" {
   description = "ECR image URI for the generic spotbatch worker."
 }
 
+variable "worker_s3_bucket" {
+  type        = string
+  description = "S3 bucket containing worker inputs, outputs, summaries, logs, and done markers. Use a bucket name, not an s3:// URI."
+}
+
+variable "worker_s3_prefixes" {
+  type        = list(string)
+  description = "Object key prefixes within worker_s3_bucket that workers may read/write. Empty list means the whole bucket."
+  default     = []
+}
+
+variable "worker_allowed_s3_prefixes" {
+  type        = list(string)
+  description = "Optional s3:// prefixes injected into SPOTBATCH_ALLOWED_S3_PREFIXES for runtime task validation. Defaults to worker_s3_prefixes in worker_s3_bucket."
+  default     = []
+}
+
 variable "worker_vcpus" {
   type    = number
   default = 2

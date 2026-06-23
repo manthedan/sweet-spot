@@ -10,6 +10,7 @@ Worker algorithm:
 receive SQS message
 parse task JSON
 validate heartbeat/visibility/timeouts below SQS hard limits
+validate task schema, identifiers, command shape, env, timeout, marker URIs, and allowed S3 prefixes
 compute stable task hash and generated attempt id
 if done_s3 exists:
   validate marker schema/run/task/hash/output/checksum
@@ -38,6 +39,7 @@ Failure behavior:
 - Attempt output exists without done marker: task is considered incomplete and will be reprocessed; orphan attempt objects are safe to garbage-collect after retention.
 - Repeated poison task: SQS redrive policy moves message to DLQ.
 - Task-provided environment variables may not override reserved `SPOTBATCH_*`, `AWS_*`, or `ECS_*` names.
+- If allowed S3 prefixes are configured, every `s3://...` URI in the task payload must stay inside those prefixes; this complements the worker task role's bucket/prefix IAM scope.
 
 Why done markers are the source of truth:
 

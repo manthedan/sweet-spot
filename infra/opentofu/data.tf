@@ -21,4 +21,18 @@ locals {
   subnet_ids         = length(var.subnet_ids) > 0 ? var.subnet_ids : data.aws_subnets.selected[0].ids
   security_group_ids = length(var.security_group_ids) > 0 ? var.security_group_ids : [data.aws_security_group.default[0].id]
   tags               = merge(var.tags, { Project = var.project_name, ManagedBy = "opentofu" })
+
+  worker_s3_prefixes_normalized = length(var.worker_s3_prefixes) == 0 ? [""] : [for p in var.worker_s3_prefixes : trim(p, "/")]
+  worker_s3_object_resources = [
+    for p in local.worker_s3_prefixes_normalized :
+    p == "" ? "arn:aws:s3:::${var.worker_s3_bucket}/*" : "arn:aws:s3:::${var.worker_s3_bucket}/${p}/*"
+  ]
+  worker_s3_list_prefixes = distinct(flatten([
+    for p in local.worker_s3_prefixes_normalized :
+    p == "" ? ["*"] : [p, "${p}/*"]
+  ]))
+  worker_allowed_s3_prefixes_effective = length(var.worker_allowed_s3_prefixes) > 0 ? var.worker_allowed_s3_prefixes : [
+    for p in local.worker_s3_prefixes_normalized :
+    p == "" ? "s3://${var.worker_s3_bucket}/" : "s3://${var.worker_s3_bucket}/${p}"
+  ]
 }
