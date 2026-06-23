@@ -486,7 +486,9 @@ def _check_task(s3, task: dict[str, Any]) -> dict[str, Any]:
     output_exists = s3_exists(s3, output_s3) if output_s3 else False
     summary_exists = s3_exists(s3, summary_s3) if summary_s3 else False
     state = "done" if done_exists else "incomplete"
-    if output_exists and not done_exists:
+    if done_exists and output_s3 and not output_exists:
+        state = "missing_output"
+    elif output_exists and not done_exists:
         state = "output_without_done"
     return {"task_id": task.get("task_id"), "output_s3": output_s3, "summary_s3": summary_s3, "done_s3": done_s3, "done_exists": done_exists, "output_exists": output_exists, "summary_exists": summary_exists, "state": state}
 
@@ -519,7 +521,9 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     output = sum(r["output_exists"] for r in records)
     summary = sum(r["summary_exists"] for r in records)
     output_without_done = [r for r in records if r["state"] == "output_without_done"]
-    missing = [r for r in records if not r["done_exists"]]
+    missing_output = [r for r in records if r["output_s3"] and not r["output_exists"]]
+    missing_done = [r for r in records if not r["done_exists"]]
+    missing = [r for r in records if not r["done_exists"] or (r["output_s3"] and not r["output_exists"])]
     repair_tasks = [by_task_id.get(r["task_id"], {"task_id": r["task_id"]}) for r in missing]
     final_s3 = s3_join(args.output_prefix, "manifests", "final_manifest.json")
     repair_s3 = s3_join(args.output_prefix, "manifests", "repair_tasks.jsonl")
@@ -534,12 +538,14 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         "output_count": output,
         "summary_count": summary,
         "missing_count": len(missing),
-        "missing_done_count": len(missing),
+        "missing_done_count": len(missing_done),
         "output_without_done_count": len(output_without_done),
-        "complete": done == len(records),
+        "missing_output_count": len(missing_output),
+        "complete": len(missing) == 0,
         "missing_task_ids": [r["task_id"] for r in missing[:1000]],
         "output_without_done_task_ids": [r["task_id"] for r in output_without_done[:1000]],
-        "outputs": [r["output_s3"] for r in records if r["done_exists"]],
+        "missing_output_task_ids": [r["task_id"] for r in missing_output[:1000]],
+        "outputs": [r["output_s3"] for r in records if r["done_exists"] and (not r["output_s3"] or r["output_exists"])],
         "repair_task_count": len(repair_tasks),
         "final_manifest_s3": final_s3 if args.upload else None,
         "repair_tasks_s3": repair_s3 if args.upload and repair_tasks else None,
@@ -561,7 +567,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             s3_upload_text(s3, json.dumps(final_manifest, indent=2, sort_keys=True) + "\n", final_s3)
             if repair_tasks:
                 s3_upload_text(s3, repair_path.read_text(), repair_s3, "application/jsonl")
-        print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": None, "refused_ready": True}, indent=2, sort_keys=True))
+        print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": None, "refused_ready": True}, indent=2, sort_keys=True))
         return 2
 
     if args.upload:
@@ -573,7 +579,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         if args.publish_ready:
             ready = {"schema": "spotbatch.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
             s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
-    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": ready_s3 if args.publish_ready and args.upload else None}, indent=2, sort_keys=True))
+    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "missing_output_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": ready_s3 if args.publish_ready and args.upload else None}, indent=2, sort_keys=True))
     return 2 if args.require_complete and not final_manifest["complete"] else 0
 
 
