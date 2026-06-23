@@ -61,6 +61,12 @@ variable "worker_allowed_s3_prefixes" {
   default     = []
 }
 
+variable "worker_kms_key_arns" {
+  type        = list(string)
+  description = "Optional KMS key ARNs workers need for SSE-KMS encrypted S3 inputs/outputs/logs/done markers. The key policy must also allow the worker role."
+  default     = []
+}
+
 variable "worker_vcpus" {
   type    = number
   default = 2

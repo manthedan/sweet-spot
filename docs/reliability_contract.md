@@ -13,7 +13,7 @@ validate heartbeat/visibility/timeouts below SQS hard limits
 validate task schema, identifiers, command shape, env, timeout, marker URIs, and allowed S3 prefixes
 compute stable task hash and generated attempt id
 if done_s3 exists:
-  validate marker schema/run/task/hash/output/checksum
+  validate marker schema/run/task/hash/output/checksum (legacy v1 markers require explicit migration mode)
   delete message only if the marker is valid
   exit/sleep for next message
 start heartbeat to extend visibility timeout
@@ -25,6 +25,7 @@ if command wrote SWEETSPOT_OUTPUT_PATH and output_s3 exists:
   upload output to an immutable attempt-scoped URI with sha256 metadata
 upload attempt-scoped summary plus capped/redacted stdout and stderr logs
 conditionally upload canonical done_s3 with If-None-Match: *
+if S3 reports 409 ConditionalRequestConflict, retry; if it reports 412 PreconditionFailed, treat the marker as already present
 if another attempt already wrote done_s3, validate the winning marker
 only then delete SQS message
 ```
@@ -39,7 +40,7 @@ Failure behavior:
 - Attempt output exists without done marker: task is considered incomplete and will be reprocessed; orphan attempt objects are safe to garbage-collect after retention.
 - Repeated poison task: SQS redrive policy moves message to DLQ.
 - Task-provided environment variables may not override reserved `SWEETSPOT_*`, `AWS_*`, or `ECS_*` names.
-- If allowed S3 prefixes are configured, every `s3://...` URI in the task payload must stay inside those prefixes; this complements the worker task role's bucket/prefix IAM scope.
+- If allowed S3 prefixes are configured, every `s3://...` URI in the task payload must stay under those prefixes; exact-key equality to a non-root prefix is rejected to match the worker task role's `${prefix}/*` IAM object scope.
 - Task stdout/stderr summaries are bounded tails, not whole-file reads. Uploaded attempt logs are capped by `SWEETSPOT_MAX_LOG_BYTES` / `--max-log-bytes` and redacted by configured regexes before streaming/upload. Redaction fails closed for overlong unterminated records by suppressing the record with a placeholder.
 
 Why done markers are the source of truth:
@@ -55,14 +56,15 @@ Cost telemetry and optimization:
 - Commands may write a JSON object to `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, `output_bytes`, or `bytes_transferred`.
 - Task summaries include best-effort runtime metadata plus startup delay, retry/receive count, interruption/failure status, transferred bytes, useful throughput, and discarded compute seconds.
 - `sweetspot-scout` consumes summary telemetry and ranks pools by expected total cost, including compute, replay, startup overhead, transfer, NAT/endpoints, CloudWatch logs, and S3 storage/request assumptions.
-- `sweetspot-lane-manager` allocates cost-annotated lanes cheapest-first among placement-score-eligible lanes.
+- `sweetspot-lane-manager` allocates cost-annotated lanes cheapest-first among placement-score-eligible lanes. If `min_placement_score` is set and AWS cannot return a score, the lane fails closed unless that lane explicitly sets `allow_unknown_placement_score`.
 
 Finalization and cleanup:
 
 - `sweetspot finalize` streams task JSONL and writes `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` instead of retaining every task/status record in memory.
-- The finalizer rejects duplicate task IDs while streaming, validates marker contents, and verifies v2 output size/SHA metadata before counting a task complete.
+- The finalizer rejects duplicate task IDs while streaming, validates marker contents, and verifies v2 output size/SHA metadata before counting a task complete. Legacy v1 markers require `--allow-legacy-done-markers` for migration runs.
 - `--use-listing-index` preloads default run prefixes (`done/`, `shards/`, `summaries/`) with S3 listings to avoid many per-task existence HEAD requests; extra prefixes can be added with `--preload-s3-prefix`.
 - The final manifest inlines only a bounded `outputs` sample (`--max-inline-outputs`) and points to the complete outputs manifest.
+- Attempt-scoped artifacts should have a documented S3 lifecycle policy; retain canonical manifests/done markers as long as you need reproducibility, but expire `*.attempts/*` outputs/logs/summaries after the repair/audit window.
 - For versioned buckets, cleanup must use `sweetspot s3-delete-prefix --include-versions` or an S3 lifecycle policy that expires noncurrent versions/delete markers; deleting only current keys does not reclaim all storage.
 - Whole-DLQ redrive should use native SQS `StartMessageMoveTask` via `sweetspot dlq --native-redrive --apply` when unfiltered redrive is acceptable. Filtered/manual receive-send-delete redrive remains available for small targeted repairs.
 
@@ -70,4 +72,4 @@ Deployment reproducibility and safety:
 
 - CI is expected to run unit tests, Ruff formatting/linting, typing, OpenTofu formatting/validation with the committed provider lock, and a worker-image build that emits SBOM/provenance attestations and runs vulnerability scanning.
 - The worker image pins its base image by digest and runs as an unprivileged `sweetspot` user.
-- The OpenTofu module defaults to a no-ingress Batch security group, SQS SSE, IMDSv2-required Batch instances, encrypted root volumes, longer DLQ retention than source retention, and a redrive allow policy restricted to the module's source queue.
+- The OpenTofu module defaults to a no-ingress Batch security group, SQS SSE, IMDSv2-required Batch instances, encrypted root volumes, longer DLQ retention than source retention, and a redrive allow policy restricted to the module's source queue. For SSE-KMS S3 buckets, configure worker KMS grants and the KMS key policy explicitly.

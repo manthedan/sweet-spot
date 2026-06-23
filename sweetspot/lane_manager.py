@@ -156,9 +156,12 @@ def main() -> int:
         lane_target_vcpus = max_workers * int(lane.get("vcpus", 2))
         score = placement_score(ec2_home, lane, instance_types, lane_target_vcpus)
         min_score = int(lane.get("min_placement_score", 0))
-        eligible = score is None or score >= min_score
+        allow_unknown_score = bool(lane.get("allow_unknown_placement_score", False))
+        eligible = (score is not None and score >= min_score) or (score is None and (min_score <= 0 or allow_unknown_score))
         expected_cost = lane_expected_cost(lane)
-        scored_lanes.append({"index": index, "lane": lane, "batch": batch, "active": active, "score": score, "min_score": min_score, "eligible": eligible, "expected_cost": expected_cost})
+        scored_lanes.append(
+            {"index": index, "lane": lane, "batch": batch, "active": active, "score": score, "min_score": min_score, "allow_unknown_score": allow_unknown_score, "eligible": eligible, "expected_cost": expected_cost}
+        )
     scored_lanes.sort(key=lambda x: (not bool(x["eligible"]), x["expected_cost"] is None, x["expected_cost"] if x["expected_cost"] is not None else math.inf, -(x["score"] or -1), x["index"]))
 
     total_active = sum(int(x["active"]) for x in scored_lanes)
@@ -186,6 +189,7 @@ def main() -> int:
                 "allocation_order": allocation_index,
                 "expected_total_cost_per_1m_units": scored["expected_cost"],
                 "eligible": eligible,
+                "allow_unknown_placement_score": bool(scored.get("allow_unknown_score")),
                 "active": active,
                 "max_workers": max_workers,
                 "desired_for_lane": desired_for_lane,

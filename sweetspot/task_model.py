@@ -124,7 +124,7 @@ def _s3_uri_allowed(uri: str, allowed_prefixes: Sequence[str]) -> bool:
         allowed_key = allowed_key.strip("/")
         if bucket != allowed_bucket:
             continue
-        if not allowed_key or key == allowed_key or key.startswith(allowed_key + "/"):
+        if not allowed_key or key.startswith(allowed_key.rstrip("/") + "/"):
             return True
     return False
 

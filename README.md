@@ -90,13 +90,15 @@ SWEETSPOT_DONE_S3         canonical conditional done marker URI
 SWEETSPOT_TASK_TIMEOUT_SECONDS default task timeout used by the worker (default: 39600 / 11h)
 ```
 
-If `output_s3` is present, the command must create `SWEETSPOT_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. Successful workers upload output, summaries, and stdout/stderr under attempt-scoped S3 paths, then publish the canonical done marker with a conditional `If-None-Match: *` write. If another duplicate attempt won first, the worker validates the winning marker before deleting the SQS message.
+If `output_s3` is present, the command must create `SWEETSPOT_OUTPUT_PATH` before exiting successfully; otherwise the task is treated as failed and no done marker is written. Successful workers upload output, summaries, and stdout/stderr under attempt-scoped S3 paths, then publish the canonical done marker with a conditional `If-None-Match: *` write (412 means an existing marker won; transient 409 conditional conflicts are retried). If another duplicate attempt won first, the worker validates the winning marker before deleting the SQS message.
 
 For v2 markers, `output_s3` in the task is the logical output URI used for task hashing; the actual immutable object URI is recorded in the done marker's `output.uri` and in finalizer outputs manifests.
 
 Task payloads are validated as `sweetspot.task.v1` before execution: `run_id`, `task_id`, `command`, timeout, env, marker URIs, and S3 URI syntax must pass bounded checks. Task-provided `env` keys may not start with `SWEETSPOT_`, `AWS_`, or `ECS_`; those namespaces are reserved for the framework and runtime.
 
-For production, set `SWEETSPOT_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `sweetspot worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be inside one of those prefixes.
+For production, set `SWEETSPOT_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `sweetspot worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be under one of those prefixes. Exact-key equality to a non-root prefix is rejected so runtime validation matches the OpenTofu IAM policy's `${prefix}/*` object scope.
+
+Legacy v1 done markers are not accepted by default because they do not bind the full task hash or immutable attempt output. Use `--allow-legacy-done-markers` / `SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1` only for an explicit migration pass, including `sweetspot finalize --allow-legacy-done-markers` for old runs.
 
 Finalization is streaming and scale-oriented: `sweetspot finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
 
@@ -122,7 +124,8 @@ sweetspot derive-canary \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
   --out-dir artifacts/hello-001/canary \
   --task-count 4 \
-  --include-dlq-probe
+  --include-dlq-probe \
+  --dlq-probe-prefix s3://my-bucket/runs/hello-001/dlq-probes
 
 # submit AWS Batch workers, dry-run by default
 sweetspot submit-workers \
@@ -155,7 +158,8 @@ sweetspot doctor \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
   --job-queue my-batch-spot-queue \
   --job-definition my-worker-jobdef:1 \
-  --s3-prefix s3://my-bucket/runs/hello-001
+  --s3-prefix s3://my-bucket/runs/hello-001 \
+  --validate-batch-metrics
 
 # finalize by streaming tasks, checking S3 done markers, and writing manifests
 sweetspot finalize \
@@ -215,6 +219,7 @@ sweetspot-scout \
   --json-out artifacts/hello-001/scout.json
 
 # multi-lane dry-run submitter; lanes with expected_total_cost_per_1m_units are allocated cheapest-first among eligible placement scores
+# If min_placement_score is set and AWS cannot return a score, the lane is ineligible unless allow_unknown_placement_score=true.
 sweetspot-lane-manager --config lanes.json
 ```
 

@@ -407,12 +407,14 @@ def _head_matches_output_marker(s3, output: dict[str, Any], *, expected_uri: str
         raise ValueError(f"done marker output attempt metadata mismatch for {uri}")
 
 
-def validate_done_marker(s3, task: dict[str, Any], marker: dict[str, Any], expected_task_hash: str) -> None:
+def validate_done_marker(s3, task: dict[str, Any], marker: dict[str, Any], expected_task_hash: str, *, allow_legacy_done_markers: bool = False) -> None:
     run_id = str(task.get("run_id", ""))
     task_id = str(task.get("task_id", ""))
     output_s3 = str(task.get("output_s3") or "")
     schema = marker.get("schema")
     if schema == DONE_MARKER_SCHEMA_V1:
+        if not allow_legacy_done_markers:
+            raise ValueError("legacy v1 done markers require explicit migration mode")
         # Backward-compatible legacy markers are accepted only after checking the
         # original identifiers and the canonical output object, if any. They do
         # not provide the v2 checksum/attempt guarantees.
@@ -461,6 +463,7 @@ def run_task(
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
     redact_regexes: Iterable[str] | str | None = None,
     worker_context: dict[str, Any] | None = None,
+    allow_legacy_done_markers: bool = False,
 ) -> dict[str, Any]:
     run_id = str(task.get("run_id", ""))
     task_id = str(task.get("task_id", ""))
@@ -478,7 +481,7 @@ def run_task(
 
     existing_marker = _load_done_marker(s3, done_s3)
     if existing_marker is not None:
-        validate_done_marker(s3, task, existing_marker, this_task_hash)
+        validate_done_marker(s3, task, existing_marker, this_task_hash, allow_legacy_done_markers=allow_legacy_done_markers)
         _emit_event("skip_existing_done", run_id=run_id, task_id=task_id, task_hash=this_task_hash, done_s3=done_s3)
         return {
             "event": "skip_existing_done",
@@ -715,7 +718,7 @@ def run_task(
         winning_marker = _load_done_marker(s3, done_s3)
         if winning_marker is None:
             raise RuntimeError(f"conditional done marker write lost but no marker is readable: {done_s3}")
-        validate_done_marker(s3, task, winning_marker, this_task_hash)
+        validate_done_marker(s3, task, winning_marker, this_task_hash, allow_legacy_done_markers=allow_legacy_done_markers)
         return {
             "event": "commit_lost_existing_done",
             "run_id": run_id,
@@ -742,6 +745,7 @@ def run_worker(
     log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
     redact_regexes: Iterable[str] | str | None = None,
+    allow_legacy_done_markers: bool = False,
 ) -> int:
     validate_worker_timing(visibility_timeout=visibility_timeout, heartbeat_seconds=heartbeat_seconds, task_timeout_seconds=task_timeout_seconds)
     allowed_s3_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
@@ -796,6 +800,7 @@ def run_worker(
                 max_log_bytes=max_log_bytes,
                 redact_regexes=redact_regexes,
                 worker_context={"receive_count": attrs.get("ApproximateReceiveCount"), "sent_timestamp_ms": attrs.get("SentTimestamp")},
+                allow_legacy_done_markers=allow_legacy_done_markers,
             )
             print(json.dumps(result, sort_keys=True), flush=True)
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)

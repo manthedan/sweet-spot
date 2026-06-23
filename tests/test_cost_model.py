@@ -119,6 +119,40 @@ class CostModelTests(unittest.TestCase):
         self.assertEqual(report["active_workers_before_submit"], 10)
         self.assertEqual([lane["to_submit"] for lane in report["lanes"]], [0, 0])
 
+    def test_lane_manager_fails_closed_on_unknown_placement_score_when_min_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123/q",
+                "instance_types": ["c7i.large"],
+                "lanes": [
+                    {
+                        "name": "unknown-score",
+                        "region": "us-west-2",
+                        "batch_job_queue": "q1",
+                        "job_definition": "jd1",
+                        "job_name_prefix": "lane",
+                        "max_workers": 2,
+                        "messages_per_worker": 1,
+                        "min_placement_score": 7,
+                    }
+                ],
+            }
+            cfg_path = Path(tmp) / "lanes.json"
+            cfg_path.write_text(json.dumps(cfg))
+            out = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["sweetspot-lane-manager", "--config", str(cfg_path), "--target-workers", "2"]),
+                mock.patch("sweetspot.lane_manager.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.lane_manager.queue_depth", return_value={"visible": 2, "not_visible": 0, "delayed": 0}),
+                mock.patch("sweetspot.lane_manager.placement_score", return_value=None),
+                mock.patch("sweetspot.lane_manager.active_jobs", return_value=0),
+                contextlib.redirect_stdout(out),
+            ):
+                lane_manager.main()
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["lanes"][0]["eligible"])
+        self.assertEqual(report["lanes"][0]["to_submit"], 0)
+
     def test_lane_manager_allocates_cheapest_eligible_lanes_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {

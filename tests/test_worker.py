@@ -26,7 +26,7 @@ if "botocore.exceptions" not in sys.modules:
     exceptions.ClientError = ClientError
     sys.modules["botocore.exceptions"] = exceptions
 
-from sweetspot.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, run_task, task_hash, validate_worker_timing
+from sweetspot.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, run_task, task_hash, validate_done_marker, validate_worker_timing
 
 
 class RunTaskTests(unittest.TestCase):
@@ -41,8 +41,20 @@ class RunTaskTests(unittest.TestCase):
         }
         marker = {"schema": "sweetspot.done_marker.v1", "run_id": "run-1", "task_id": "already-done", "output_s3": ""}
         with tempfile.TemporaryDirectory() as tmp, mock.patch("sweetspot.worker.s3_exists", return_value=True), mock.patch("sweetspot.worker.s3_download_text", return_value=json.dumps(marker)):
-            result = run_task(task, s3=object(), work_root=Path(tmp))
+            result = run_task(task, s3=object(), work_root=Path(tmp), allow_legacy_done_markers=True)
         self.assertEqual(result["event"], "skip_existing_done")
+
+    def test_legacy_done_marker_requires_migration_mode(self) -> None:
+        task = {
+            "schema": "sweetspot.task.v1",
+            "run_id": "run-1",
+            "task_id": "already-done",
+            "command": [sys.executable, "-c", "pass"],
+            "done_s3": "s3://bucket/run/done/already-done.done.json",
+        }
+        marker = {"schema": "sweetspot.done_marker.v1", "run_id": "run-1", "task_id": "already-done", "output_s3": ""}
+        with self.assertRaisesRegex(ValueError, "migration mode"):
+            validate_done_marker(object(), task, marker, task_hash(task))
 
     def test_missing_expected_output_does_not_publish_done_marker(self) -> None:
         text_uploads: list[tuple[str, dict[str, object]]] = []

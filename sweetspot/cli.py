@@ -58,6 +58,13 @@ def _env_allowed_s3_prefixes() -> list[str]:
     return list(parse_allowed_s3_prefixes(os.environ.get("SWEETSPOT_ALLOWED_S3_PREFIXES")))
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _validate_unique_task_ids(tasks: list[dict[str, Any]], *, context: str) -> None:
     seen: dict[str, int] = {}
     duplicates: list[str] = []
@@ -206,17 +213,32 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
     canary_tasks_path = out_dir / "canary_tasks.jsonl"
     manifest_path = out_dir / "canary_manifest.json"
     bad_task_path = out_dir / "dlq_probe_task.jsonl" if args.include_dlq_probe else None
+    dlq_probe_done_s3 = None
     generated_paths = [canary_tasks_path, manifest_path] + ([bad_task_path] if bad_task_path else [])
     if args.tasks_jsonl.resolve() in {p.resolve() for p in generated_paths}:
         raise SystemExit("--out-dir would overwrite --tasks-jsonl; choose a different output directory")
     canary_tasks_path.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in canary_tasks))
     if args.include_dlq_probe:
+        probe_task_id = f"{effective_run_id}-intentional-dlq-probe"
+        probe_prefix = getattr(args, "dlq_probe_prefix", None)
+        if not probe_prefix:
+            for task in canary_tasks:
+                done_s3 = _done_marker_or_none(task)
+                if done_s3:
+                    bucket, key = parse_s3_uri(done_s3)
+                    parent = key.rsplit("/", 1)[0] if "/" in key else ""
+                    probe_prefix = f"s3://{bucket}/{parent}" if parent else f"s3://{bucket}/"
+                    break
+        if not probe_prefix:
+            raise SystemExit("--include-dlq-probe requires --dlq-probe-prefix when selected tasks do not expose an S3 done-marker prefix")
+        dlq_probe_done_s3 = s3_join(probe_prefix, f"{probe_task_id}.done.json")
         bad_task = {
             "schema": "sweetspot.task.v1",
             "run_id": effective_run_id,
-            "task_id": f"{effective_run_id}-intentional-dlq-probe",
+            "task_id": probe_task_id,
             "command": ["bash", "-lc", "echo intentional SweetSpot DLQ probe >&2; exit 42"],
             "timeout_seconds": 120,
+            "done_s3": dlq_probe_done_s3,
             "purpose": "intentional_dlq_probe_not_part_of_valid_canary",
         }
         assert bad_task_path is not None
@@ -234,6 +256,7 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
         "canary_tasks_jsonl": str(canary_tasks_path),
         "canary_tasks_sha256": _sha256_file(canary_tasks_path),
         "dlq_probe_task_jsonl": str(bad_task_path) if bad_task_path else None,
+        "dlq_probe_done_s3": dlq_probe_done_s3,
         "rewrite_run_id": bool(args.rewrite_run_id),
         "expected_task_ids": [t.get("task_id") for t in canary_tasks],
         "expected_output_s3": [_marker_or_none(t, "output_s3") for t in canary_tasks],
@@ -252,6 +275,7 @@ def cmd_derive_canary(args: argparse.Namespace) -> int:
                 "canary_tasks_jsonl": str(canary_tasks_path),
                 "canary_manifest": str(manifest_path),
                 "dlq_probe_task_jsonl": str(bad_task_path) if bad_task_path else None,
+                "dlq_probe_done_s3": dlq_probe_done_s3,
             },
             indent=2,
             sort_keys=True,
@@ -293,6 +317,7 @@ def _worker_overrides(
     log_tail_bytes: int | None = None,
     max_log_bytes: int | None = None,
     redact_regexes: list[str] | tuple[str, ...] | None = None,
+    allow_legacy_done_markers: bool = False,
     vcpus: int | None = None,
     memory: int | None = None,
 ) -> dict[str, Any]:
@@ -313,6 +338,8 @@ def _worker_overrides(
     if redact_regexes:
         parse_redact_patterns(redact_regexes)
         base_env.append({"name": "SWEETSPOT_REDACT_REGEXES", "value": "\n".join(redact_regexes)})
+    if allow_legacy_done_markers:
+        base_env.append({"name": "SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS", "value": "1"})
     base_env.extend(env or [])
     overrides: dict[str, Any] = {"environment": base_env}
     if vcpus is not None:
@@ -376,6 +403,7 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
         log_tail_bytes=args.log_tail_bytes,
         max_log_bytes=args.max_log_bytes,
         redact_regexes=args.redact_regex or [],
+        allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
         vcpus=args.vcpus,
         memory=args.memory,
     )
@@ -507,6 +535,7 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
             log_tail_bytes=args.log_tail_bytes,
             max_log_bytes=args.max_log_bytes,
             redact_regexes=args.redact_regex or [],
+            allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
             vcpus=args.vcpus,
             memory=args.memory,
         )
@@ -675,14 +704,14 @@ def _repair_task_candidates_for_marker_validation(task: dict[str, Any], repair_d
         yield with_reason
 
 
-def _valid_repair_done_marker(s3, task: dict[str, Any], canonical_done_s3: str) -> tuple[str, dict[str, Any]] | None:
+def _valid_repair_done_marker(s3, task: dict[str, Any], canonical_done_s3: str, *, allow_legacy_done_markers: bool = False) -> tuple[str, dict[str, Any]] | None:
     for repair_done_s3 in _repair_done_marker_candidates(s3, canonical_done_s3):
         repair_marker = _done_marker_for_task(s3, task, repair_done_s3, None)
         if repair_marker is None or repair_marker.get("_sweetspot_marker_parse_error"):
             continue
         for repair_task in _repair_task_candidates_for_marker_validation(task, repair_done_s3):
             try:
-                validate_done_marker(s3, repair_task, repair_marker, task_hash(repair_task))
+                validate_done_marker(s3, repair_task, repair_marker, task_hash(repair_task), allow_legacy_done_markers=allow_legacy_done_markers)
             except ValueError:
                 continue
             return repair_done_s3, repair_marker
@@ -705,7 +734,7 @@ def _done_marker_for_task(s3, task: dict[str, Any], done_s3: str, existence_inde
     return marker
 
 
-def _check_task(s3, task: dict[str, Any], existence_index: _S3ExistenceIndex | None = None) -> dict[str, Any]:
+def _check_task(s3, task: dict[str, Any], existence_index: _S3ExistenceIndex | None = None, *, allow_legacy_done_markers: bool = False) -> dict[str, Any]:
     logical_output_s3 = str(task.get("output_s3") or "")
     summary_s3 = str(task.get("summary_s3") or "")
     done_s3 = default_done_s3(task)
@@ -719,11 +748,11 @@ def _check_task(s3, task: dict[str, Any], existence_index: _S3ExistenceIndex | N
                 # v2, HEADs the immutable attempt output to check size/SHA
                 # metadata. Validation failures are status/repair inputs, not
                 # finalizer crashes.
-                validate_done_marker(s3, task, marker, task_hash(task))
+                validate_done_marker(s3, task, marker, task_hash(task), allow_legacy_done_markers=allow_legacy_done_markers)
             except ValueError as exc:
                 marker_validation_error = str(exc)
     if marker is not None and marker_validation_error:
-        repair_candidate = _valid_repair_done_marker(s3, task, done_s3)
+        repair_candidate = _valid_repair_done_marker(s3, task, done_s3, allow_legacy_done_markers=allow_legacy_done_markers)
         if repair_candidate is not None:
             done_s3, marker = repair_candidate
             marker_validation_error = None
@@ -879,7 +908,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                 raise SystemExit(f"duplicate task_id values in finalizer tasks: {task_id!r} at lines {seen_task_ids[task_id]} and {line_no}")
             if task_id:
                 seen_task_ids[task_id] = line_no
-            pending[ex.submit(_check_task, s3, task, existence_index)] = (submitted, task)
+            pending[ex.submit(_check_task, s3, task, existence_index, allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)))] = (submitted, task)
             submitted += 1
             while len(pending) + len(ready_records) >= buffer_limit and pending:
                 done_futures, _ = cf.wait(pending.keys(), return_when=cf.FIRST_COMPLETED)
@@ -1467,6 +1496,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
             checks.append(_doctor_check(f"s3_prefix:{prefix}", check_s3))
 
+    if getattr(args, "validate_batch_metrics", False) and args.job_queue:
+
+        def check_batch_metrics() -> dict[str, Any]:
+            cloudwatch = session.client("cloudwatch", region_name=args.region)
+            job_queue_name = str(args.job_queue).split("/")[-1]
+            metric_names = ["RunnableJobs", "FailedJobs"]
+            found: dict[str, int] = {}
+            for metric_name in metric_names:
+                metrics = cloudwatch.list_metrics(
+                    Namespace="AWS/Batch",
+                    MetricName=metric_name,
+                    Dimensions=[{"Name": "JobQueue", "Value": job_queue_name}],
+                ).get("Metrics", [])
+                found[metric_name] = len(metrics)
+            if not any(found.values()):
+                raise RuntimeError(f"no AWS/Batch metrics found for JobQueue={job_queue_name}; validate dimensions after jobs have emitted data or use worker logs/EventBridge alarms")
+            return {"job_queue": job_queue_name, "metrics_found": found}
+
+        checks.append(_doctor_check("batch_metrics", check_batch_metrics))
+
     if discovered_log_group:
 
         def check_logs() -> dict[str, Any]:
@@ -1505,6 +1554,7 @@ def main() -> int:
     p.add_argument("--log-tail-bytes", type=int, default=int(os.environ.get("SWEETSPOT_LOG_TAIL_BYTES", str(DEFAULT_LOG_TAIL_BYTES))), help="Bytes of redacted stdout/stderr tail to keep in task summaries")
     p.add_argument("--max-log-bytes", type=int, default=int(os.environ.get("SWEETSPOT_MAX_LOG_BYTES", str(DEFAULT_MAX_LOG_BYTES))), help="Maximum redacted bytes per stdout/stderr stream to upload to S3")
     p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from streamed/uploaded task logs; repeatable. SWEETSPOT_REDACT_REGEXES may provide newline-separated defaults.")
+    p.add_argument("--allow-legacy-done-markers", action="store_true", default=_env_bool("SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS"), help="Migration mode: accept v1 done markers without task hashes/attempt checks")
     p.set_defaults(
         func=lambda a: run_worker(
             queue_url=a.queue_url,
@@ -1518,6 +1568,7 @@ def main() -> int:
             log_tail_bytes=a.log_tail_bytes,
             max_log_bytes=a.max_log_bytes,
             redact_regexes=a.redact_regex,
+            allow_legacy_done_markers=a.allow_legacy_done_markers,
         )
     )
 
@@ -1538,6 +1589,7 @@ def main() -> int:
     p.add_argument("--task-count", type=int, default=4)
     p.add_argument("--rewrite-run-id", action="store_true", help="rewrite selected tasks to use --run-id")
     p.add_argument("--include-dlq-probe", action="store_true")
+    p.add_argument("--dlq-probe-prefix", help="S3 prefix for the intentional DLQ probe done marker; required when selected tasks do not already have a done-marker prefix")
     p.set_defaults(func=cmd_derive_canary)
 
     p = sub.add_parser("submit-workers")
@@ -1561,6 +1613,7 @@ def main() -> int:
     p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
     p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
+    p.add_argument("--allow-legacy-done-markers", action="store_true", help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to submitted workers")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_submit_workers)
 
@@ -1596,6 +1649,7 @@ def main() -> int:
     p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
     p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
+    p.add_argument("--allow-legacy-done-markers", action="store_true", help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to supervised workers")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_supervise_workers)
 
@@ -1615,6 +1669,7 @@ def main() -> int:
     p.add_argument("--publish-ready", action="store_true")
     p.add_argument("--ready-key", default="READY")
     p.add_argument("--allow-incomplete-ready", action="store_true", help="unsafe: publish READY even when tasks are incomplete")
+    p.add_argument("--allow-legacy-done-markers", action="store_true", help="Migration mode: accept legacy v1 done markers without task hashes/attempt checks")
     p.add_argument("--require-complete", action="store_true")
     p.set_defaults(func=cmd_finalize)
 
@@ -1675,6 +1730,7 @@ def main() -> int:
     p.add_argument("--job-queue")
     p.add_argument("--job-definition")
     p.add_argument("--log-group")
+    p.add_argument("--validate-batch-metrics", action="store_true", help="Check CloudWatch AWS/Batch JobQueue metric dimensions for this account/Region")
     p.add_argument("--s3-prefix", action="append", default=[], help="S3 prefix to validate with ListBucket; repeatable")
     p.add_argument("--write-probe", action="store_true", help="Also write/delete a tiny object under each --s3-prefix")
     p.add_argument("--visibility-timeout", type=int, default=1800)

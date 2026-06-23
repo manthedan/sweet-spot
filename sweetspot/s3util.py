@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import sleep
 from urllib.parse import urlparse
 
 from botocore.exceptions import ClientError
+
+
+CONDITIONAL_PUT_MAX_ATTEMPTS = 4
+CONDITIONAL_PUT_RETRY_SLEEP_SECONDS = 0.25
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -34,17 +39,35 @@ def s3_upload_text(s3, text: str, uri: str, content_type: str = "application/jso
     s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType=content_type)
 
 
-def s3_upload_text_if_absent(s3, text: str, uri: str, content_type: str = "application/json") -> bool:
+def s3_upload_text_if_absent(
+    s3,
+    text: str,
+    uri: str,
+    content_type: str = "application/json",
+    *,
+    max_attempts: int = CONDITIONAL_PUT_MAX_ATTEMPTS,
+    retry_sleep_seconds: float = CONDITIONAL_PUT_RETRY_SLEEP_SECONDS,
+) -> bool:
     bucket, key = parse_s3_uri(uri)
-    try:
-        s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType=content_type, IfNoneMatch="*")
-        return True
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        if code in {"PreconditionFailed", "ConditionalRequestConflict"} or status in {409, 412}:
-            return False
-        raise
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    for attempt in range(max_attempts):
+        try:
+            s3.put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"), ContentType=content_type, IfNoneMatch="*")
+            return True
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code == "PreconditionFailed" or status == 412:
+                return False
+            if code == "ConditionalRequestConflict" or status == 409:
+                if attempt == max_attempts - 1:
+                    raise
+                if retry_sleep_seconds > 0:
+                    sleep(retry_sleep_seconds)
+                continue
+            raise
+    raise AssertionError("unreachable conditional put loop exit")
 
 
 def s3_download_text(s3, uri: str) -> str:

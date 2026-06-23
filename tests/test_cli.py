@@ -54,6 +54,7 @@ from sweetspot.cli import (
     cmd_s3_delete_prefix,
     cmd_supervise_workers,
 )
+from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
 
 
@@ -116,6 +117,7 @@ class CanaryTests(unittest.TestCase):
                 task_count=1,
                 rewrite_run_id=False,
                 include_dlq_probe=True,
+                dlq_probe_prefix="s3://b/r/dlq-probes",
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 cmd_derive_canary(args)
@@ -123,6 +125,8 @@ class CanaryTests(unittest.TestCase):
             probe = json.loads((out_dir / "dlq_probe_task.jsonl").read_text())
             self.assertEqual(manifest["run_id"], "source-r")
             self.assertEqual(probe["run_id"], "source-r")
+            self.assertEqual(probe["done_s3"], "s3://b/r/dlq-probes/source-r-intentional-dlq-probe.done.json")
+            validate_task_model(probe, default_timeout_seconds=1800, max_timeout_seconds=43200)
 
     def test_derive_canary_rewrite_run_id_rejects_existing_s3_markers(self) -> None:
         tasks = [{"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"}]
@@ -168,7 +172,9 @@ class CanaryTests(unittest.TestCase):
             manifest = json.loads((out_dir / "canary_manifest.json").read_text())
             self.assertEqual(manifest["selected_indices"], [1])
             self.assertEqual(manifest["expected_done_s3"], ["s3://b/r/done/t1"])
-            self.assertTrue((out_dir / "dlq_probe_task.jsonl").exists())
+            probe = json.loads((out_dir / "dlq_probe_task.jsonl").read_text())
+            self.assertEqual(probe["done_s3"], "s3://b/r/done/r-intentional-dlq-probe.done.json")
+            validate_task_model(probe, default_timeout_seconds=1800, max_timeout_seconds=43200)
 
 
 class EnqueueValidationTests(unittest.TestCase):
@@ -179,6 +185,21 @@ class EnqueueValidationTests(unittest.TestCase):
             "task_id": "t0",
             "command": [sys.executable, "-c", "pass"],
             "done_s3": "s3://other/runs/r1/done/t0.done.json",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(queue_url="", tasks_jsonl=tasks_path, run_id=None, artifact_dir=Path(tmp) / "artifacts", allowed_s3_prefix=["s3://bucket/runs/r1"], submit=False)
+            with self.assertRaisesRegex(SystemExit, "outside allowed prefixes"):
+                cmd_enqueue_jsonl(args)
+
+    def test_enqueue_rejects_exact_object_equal_to_allowed_prefix(self) -> None:
+        task = {
+            "schema": "sweetspot.task.v1",
+            "run_id": "r1",
+            "task_id": "t0",
+            "command": [sys.executable, "-c", "pass"],
+            "done_s3": "s3://bucket/runs/r1",
         }
         with tempfile.TemporaryDirectory() as tmp:
             tasks_path = Path(tmp) / "tasks.jsonl"
@@ -287,6 +308,9 @@ class FakeDoctorClient:
     def list_objects_v2(self, **kwargs):
         return {"Contents": []}
 
+    def list_metrics(self, **kwargs):
+        return {"Metrics": [{"Namespace": kwargs.get("Namespace"), "MetricName": kwargs.get("MetricName"), "Dimensions": kwargs.get("Dimensions", [])}]}
+
 
 class FakeDoctorSession:
     def client(self, service: str, region_name=None):
@@ -303,6 +327,7 @@ class DoctorTests(unittest.TestCase):
             job_queue="jq",
             job_definition="jd",
             log_group=None,
+            validate_batch_metrics=True,
             s3_prefix=["s3://bucket/runs/r1"],
             write_probe=False,
             visibility_timeout=1800,
@@ -317,6 +342,7 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         names = [c["name"] for c in report["checks"]]
         self.assertIn("cloudwatch_log_group", names)
+        self.assertIn("batch_metrics", names)
 
 
 class BatchOperatorTests(unittest.TestCase):
@@ -622,6 +648,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=False,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=False,
             )
             with patch("sweetspot.cli.boto3.client", return_value=FakeFinalizeS3()):
@@ -652,6 +679,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=True,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=False,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
@@ -694,6 +722,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=True,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=False,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
@@ -744,6 +773,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=False,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=True,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
@@ -794,6 +824,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=True,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=True,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
@@ -831,6 +862,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=False,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=True,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
@@ -883,6 +915,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=False,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=True,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):
@@ -925,6 +958,7 @@ class FinalizeTests(unittest.TestCase):
                 publish_ready=False,
                 ready_key="READY",
                 allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
                 require_complete=True,
             )
             with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(io.StringIO()):

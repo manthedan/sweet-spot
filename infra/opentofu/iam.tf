@@ -94,6 +94,19 @@ data "aws_iam_policy_document" "worker_policy" {
     ]
     resources = local.worker_s3_object_resources
   }
+
+  dynamic "statement" {
+    for_each = length(var.worker_kms_key_arns) == 0 ? [] : [1]
+    content {
+      actions = [
+        "kms:Decrypt",
+        "kms:Encrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ]
+      resources = var.worker_kms_key_arns
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "worker_policy" {
