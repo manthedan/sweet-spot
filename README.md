@@ -87,6 +87,13 @@ spotbatch enqueue-jsonl \
   --artifact-dir artifacts/hello-001 \
   --submit
 
+# derive a deterministic canary subset before large launches
+spotbatch derive-canary \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --out-dir artifacts/hello-001/canary \
+  --task-count 4 \
+  --include-dlq-probe
+
 # submit AWS Batch workers, dry-run by default
 spotbatch submit-workers \
   --sqs-queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,68 @@ def _chunks(xs: list[dict[str, Any]], n: int) -> Iterable[list[dict[str, Any]]]:
         yield xs[i : i + n]
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _parse_index_selection(raw: str, n: int) -> list[int]:
+    if raw in {"", "auto"}:
+        return []
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start = int(a)
+            end = int(b)
+            if start > end:
+                raise SystemExit(f"invalid descending index range: {part}")
+            out.extend(range(start, end + 1))
+        else:
+            out.append(int(part))
+    if not out:
+        raise SystemExit("explicit --selected-indices did not select any tasks")
+    bad = [i for i in out if i < 0 or i >= n]
+    if bad:
+        raise SystemExit(f"selected indices out of range for {n} tasks: {bad}")
+    return sorted(dict.fromkeys(out))
+
+
+def _auto_canary_indices(tasks: list[dict[str, Any]], task_count: int) -> list[int]:
+    if task_count <= 0:
+        raise SystemExit("--task-count must be positive")
+    if not tasks:
+        raise SystemExit("empty tasks JSONL")
+    n = len(tasks)
+    selected: list[int] = []
+
+    def add(i: int | None) -> None:
+        if i is not None and 0 <= i < n and i not in selected and len(selected) < task_count:
+            selected.append(i)
+
+    add(0)
+    add(n - 1)
+    first_schema = tasks[0].get("schema")
+    add(next((i for i, t in enumerate(tasks) if t.get("schema") != first_schema), None))
+    first_run = tasks[0].get("run_id")
+    add(next((i for i, t in enumerate(tasks) if t.get("run_id") != first_run), None))
+    if len(selected) < task_count:
+        candidates = [round(i * (n - 1) / max(1, task_count - 1)) for i in range(task_count)]
+        for i in candidates:
+            add(int(i))
+    for i in range(n):
+        add(i)
+        if len(selected) >= task_count:
+            break
+    return selected
+
+
 def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
     tasks = _read_jsonl(args.tasks_jsonl)
     if args.run_id:
@@ -67,6 +130,72 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
         "submitted": bool(args.submit),
         "tasks_jsonl": str(tasks_out),
     }, indent=2, sort_keys=True))
+    return 0
+
+
+def _marker_or_none(task: dict[str, Any], key: str) -> str | None:
+    val = task.get(key)
+    return str(val) if val else None
+
+
+def _done_marker_or_none(task: dict[str, Any]) -> str | None:
+    try:
+        return default_done_s3(task)
+    except ValueError:
+        return None
+
+
+def cmd_derive_canary(args: argparse.Namespace) -> int:
+    source_hash = _sha256_file(args.tasks_jsonl)
+    tasks = _read_jsonl(args.tasks_jsonl)
+    selected = _parse_index_selection(args.selected_indices, len(tasks)) or _auto_canary_indices(tasks, args.task_count)
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    canary_tasks = [dict(tasks[i]) for i in selected]
+    if args.rewrite_run_id:
+        for task in canary_tasks:
+            task["run_id"] = args.run_id
+    selected_run_ids = sorted({str(t.get("run_id")) for t in canary_tasks if t.get("run_id") is not None})
+    effective_run_id = args.run_id if args.rewrite_run_id or len(selected_run_ids) != 1 else selected_run_ids[0]
+    canary_tasks_path = out_dir / "canary_tasks.jsonl"
+    manifest_path = out_dir / "canary_manifest.json"
+    bad_task_path = out_dir / "dlq_probe_task.jsonl" if args.include_dlq_probe else None
+    generated_paths = [canary_tasks_path, manifest_path] + ([bad_task_path] if bad_task_path else [])
+    if args.tasks_jsonl.resolve() in {p.resolve() for p in generated_paths}:
+        raise SystemExit("--out-dir would overwrite --tasks-jsonl; choose a different output directory")
+    canary_tasks_path.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in canary_tasks))
+    if args.include_dlq_probe:
+        bad_task = {
+            "schema": "spotbatch.task.v1",
+            "run_id": effective_run_id,
+            "task_id": f"{effective_run_id}-intentional-dlq-probe",
+            "command": ["bash", "-lc", "echo intentional SpotBatch DLQ probe >&2; exit 42"],
+            "timeout_seconds": 120,
+            "purpose": "intentional_dlq_probe_not_part_of_valid_canary",
+        }
+        assert bad_task_path is not None
+        bad_task_path.write_text(json.dumps(bad_task, sort_keys=True) + "\n")
+    manifest = {
+        "schema": "spotbatch.canary_manifest.v1",
+        "created_at": iso_now(),
+        "run_id": effective_run_id,
+        "requested_run_id": args.run_id,
+        "selected_source_run_ids": selected_run_ids,
+        "source_tasks_jsonl": str(args.tasks_jsonl),
+        "source_tasks_sha256": source_hash,
+        "selected_indices": selected,
+        "task_count": len(canary_tasks),
+        "canary_tasks_jsonl": str(canary_tasks_path),
+        "canary_tasks_sha256": _sha256_file(canary_tasks_path),
+        "dlq_probe_task_jsonl": str(bad_task_path) if bad_task_path else None,
+        "rewrite_run_id": bool(args.rewrite_run_id),
+        "expected_task_ids": [t.get("task_id") for t in canary_tasks],
+        "expected_output_s3": [_marker_or_none(t, "output_s3") for t in canary_tasks],
+        "expected_summary_s3": [_marker_or_none(t, "summary_s3") for t in canary_tasks],
+        "expected_done_s3": [_done_marker_or_none(t) for t in canary_tasks],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"schema": "spotbatch.derive_canary_summary.v1", "run_id": effective_run_id, "requested_run_id": args.run_id, "task_count": len(canary_tasks), "selected_indices": selected, "canary_tasks_jsonl": str(canary_tasks_path), "canary_manifest": str(manifest_path), "dlq_probe_task_jsonl": str(bad_task_path) if bad_task_path else None}, indent=2, sort_keys=True))
     return 0
 
 
@@ -503,6 +632,16 @@ def main() -> int:
     p.add_argument("--artifact-dir", type=Path)
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_enqueue_jsonl)
+
+    p = sub.add_parser("derive-canary")
+    p.add_argument("--tasks-jsonl", type=Path, required=True)
+    p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--run-id", default=f"canary-{utc_stamp()}")
+    p.add_argument("--selected-indices", default="auto", help="auto or comma/range list, e.g. 0,5,10-12")
+    p.add_argument("--task-count", type=int, default=4)
+    p.add_argument("--rewrite-run-id", action="store_true", help="rewrite selected tasks to use --run-id")
+    p.add_argument("--include-dlq-probe", action="store_true")
+    p.set_defaults(func=cmd_derive_canary)
 
     p = sub.add_parser("submit-workers")
     p.add_argument("--sqs-queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))

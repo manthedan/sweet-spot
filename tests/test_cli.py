@@ -35,7 +35,103 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _redact_env, _supervisor_desired_workers, cmd_finalize, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _parse_index_selection, _redact_env, _supervisor_desired_workers, cmd_derive_canary, cmd_finalize, cmd_supervise_workers
+
+
+class CanaryTests(unittest.TestCase):
+    def test_explicit_descending_canary_range_is_rejected(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "descending"):
+            _parse_index_selection("5-3", 10)
+
+    def test_auto_canary_indices_are_deterministic_and_include_tail(self) -> None:
+        tasks = [{"task_id": f"t{i}", "schema": "spotbatch.task.v1", "run_id": "r"} for i in range(8)]
+        self.assertEqual(_auto_canary_indices(tasks, 3), [0, 7, 4])
+
+    def test_derive_canary_rejects_overwriting_any_generated_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            tasks_path = out_dir / "canary_manifest.json"
+            tasks_path.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            args = types.SimpleNamespace(
+                tasks_jsonl=tasks_path,
+                out_dir=out_dir,
+                run_id="r",
+                selected_indices="0",
+                task_count=1,
+                rewrite_run_id=False,
+                include_dlq_probe=False,
+            )
+            with self.assertRaisesRegex(SystemExit, "overwrite"):
+                cmd_derive_canary(args)
+            self.assertEqual(tasks_path.read_text(), json.dumps({"task_id": "t0"}) + "\n")
+
+    def test_derive_canary_rejects_overwriting_source_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            tasks_path = out_dir / "canary_tasks.jsonl"
+            tasks_path.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            args = types.SimpleNamespace(
+                tasks_jsonl=tasks_path,
+                out_dir=out_dir,
+                run_id="r",
+                selected_indices="0",
+                task_count=1,
+                rewrite_run_id=False,
+                include_dlq_probe=False,
+            )
+            with self.assertRaisesRegex(SystemExit, "overwrite"):
+                cmd_derive_canary(args)
+            self.assertEqual(tasks_path.read_text(), json.dumps({"task_id": "t0"}) + "\n")
+
+    def test_derive_canary_dlq_probe_uses_preserved_single_source_run_id(self) -> None:
+        tasks = [{"schema": "spotbatch.task.v1", "run_id": "source-r", "task_id": "t0"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            out_dir = Path(tmp) / "canary"
+            tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(
+                tasks_jsonl=tasks_path,
+                out_dir=out_dir,
+                run_id="requested-r",
+                selected_indices="0",
+                task_count=1,
+                rewrite_run_id=False,
+                include_dlq_probe=True,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_derive_canary(args)
+            manifest = json.loads((out_dir / "canary_manifest.json").read_text())
+            probe = json.loads((out_dir / "dlq_probe_task.jsonl").read_text())
+            self.assertEqual(manifest["run_id"], "source-r")
+            self.assertEqual(probe["run_id"], "source-r")
+
+    def test_derive_canary_writes_manifest_and_dlq_probe(self) -> None:
+        tasks = [
+            {"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t0", "output_s3": "s3://b/r/shards/t0"},
+            {"schema": "spotbatch.task.v1", "run_id": "r", "task_id": "t1", "done_s3": "s3://b/r/done/t1"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            out_dir = Path(tmp) / "canary"
+            tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(
+                tasks_jsonl=tasks_path,
+                out_dir=out_dir,
+                run_id="canary-r",
+                selected_indices="1",
+                task_count=1,
+                rewrite_run_id=True,
+                include_dlq_probe=True,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cmd_derive_canary(args)
+            self.assertEqual(rc, 0)
+            canary_task = json.loads((out_dir / "canary_tasks.jsonl").read_text())
+            self.assertEqual(canary_task["run_id"], "canary-r")
+            manifest = json.loads((out_dir / "canary_manifest.json").read_text())
+            self.assertEqual(manifest["selected_indices"], [1])
+            self.assertEqual(manifest["expected_done_s3"], ["s3://b/r/done/t1"])
+            self.assertTrue((out_dir / "dlq_probe_task.jsonl").exists())
 
 
 class SupervisorPlanningTests(unittest.TestCase):
