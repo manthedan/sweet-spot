@@ -213,7 +213,11 @@ def _redact_env(env: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def _status_counts(jobs: list[dict[str, Any]]) -> dict[str, int]:
-    return dict(Counter(str(j.get("status", "UNKNOWN")) for j in jobs))
+    counts: dict[str, int] = {}
+    for job in jobs:
+        status = str(job.get("status", "UNKNOWN"))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def _worker_overrides(
