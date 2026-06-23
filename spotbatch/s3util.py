@@ -39,6 +39,11 @@ def s3_download_text(s3, uri: str) -> str:
     return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
 
 
+def s3_delete(s3, uri: str) -> None:
+    bucket, key = parse_s3_uri(uri)
+    s3.delete_object(Bucket=bucket, Key=key)
+
+
 def s3_upload_file(s3, path: Path, uri: str, content_type: str | None = None) -> None:
     bucket, key = parse_s3_uri(uri)
     extra = {"ContentType": content_type} if content_type else None

@@ -116,6 +116,17 @@ spotbatch finalize \
   --run-id hello-001 \
   --output-prefix s3://my-bucket/runs/hello-001 \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --workers 32 \
+  --write-repair-jsonl artifacts/hello-001/repair_tasks.jsonl \
+  --require-complete
+
+# optionally upload final_manifest.json and publish READY only when complete
+spotbatch finalize \
+  --run-id hello-001 \
+  --output-prefix s3://my-bucket/runs/hello-001 \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --upload \
+  --publish-ready \
   --require-complete
 
 # inspect DLQ

@@ -12,7 +12,7 @@ from typing import Any, Iterable
 import boto3
 
 from .aws_batch import active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
-from .s3util import s3_download_text, s3_exists, s3_join, s3_upload_text
+from .s3util import s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
 from .worker import default_done_s3, run_worker
 
 
@@ -357,17 +357,37 @@ def _check_task(s3, task: dict[str, Any]) -> dict[str, Any]:
 
 def cmd_finalize(args: argparse.Namespace) -> int:
     import concurrent.futures as cf
+    import sys
+
+    if args.publish_ready and not args.upload:
+        raise SystemExit("--publish-ready requires --upload")
+    args.ready_key = str(args.ready_key).strip("/")
+    if args.publish_ready and (not args.ready_key or args.ready_key in {"manifests/final_manifest.json", "manifests/repair_tasks.jsonl"}):
+        raise SystemExit("--ready-key must not be empty or collide with SpotBatch manifest paths")
     s3 = boto3.client("s3")
     tasks = _read_tasks_for_finalizer(args, s3)
     artifact_dir = args.artifact_dir or Path("artifacts") / args.run_id / "finalizer"
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    records_by_index: list[dict[str, Any] | None] = [None] * len(tasks)
+    by_task_id: dict[Any, dict[str, Any]] = {t.get("task_id"): t for t in tasks}
+    checked = 0
     with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        records = list(ex.map(lambda t: _check_task(s3, t), tasks))
+        future_map = {ex.submit(_check_task, s3, t): i for i, t in enumerate(tasks)}
+        for fut in cf.as_completed(future_map):
+            records_by_index[future_map[fut]] = fut.result()
+            checked += 1
+            if args.progress_interval and (checked == len(tasks) or checked % args.progress_interval == 0):
+                print(f"spotbatch finalize progress: checked={checked}/{len(tasks)}", file=sys.stderr)
+    records = [r for r in records_by_index if r is not None]
     done = sum(r["done_exists"] for r in records)
     output = sum(r["output_exists"] for r in records)
     summary = sum(r["summary_exists"] for r in records)
     output_without_done = [r for r in records if r["state"] == "output_without_done"]
     missing = [r for r in records if not r["done_exists"]]
+    repair_tasks = [by_task_id.get(r["task_id"], {"task_id": r["task_id"]}) for r in missing]
+    final_s3 = s3_join(args.output_prefix, "manifests", "final_manifest.json")
+    repair_s3 = s3_join(args.output_prefix, "manifests", "repair_tasks.jsonl")
+    ready_s3 = s3_join(args.output_prefix, args.ready_key)
     final_manifest = {
         "schema": "spotbatch.final_manifest.v1",
         "run_id": args.run_id,
@@ -377,21 +397,47 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         "done_count": done,
         "output_count": output,
         "summary_count": summary,
+        "missing_count": len(missing),
         "missing_done_count": len(missing),
         "output_without_done_count": len(output_without_done),
         "complete": done == len(records),
         "missing_task_ids": [r["task_id"] for r in missing[:1000]],
         "output_without_done_task_ids": [r["task_id"] for r in output_without_done[:1000]],
         "outputs": [r["output_s3"] for r in records if r["done_exists"]],
+        "repair_task_count": len(repair_tasks),
+        "final_manifest_s3": final_s3 if args.upload else None,
+        "repair_tasks_s3": repair_s3 if args.upload and repair_tasks else None,
+        "ready_s3": ready_s3 if args.publish_ready else None,
     }
+    if args.publish_ready and not final_manifest["complete"] and not args.allow_incomplete_ready:
+        final_manifest["ready_s3"] = None
+
     final_path = artifact_dir / "final_manifest.json"
-    missing_path = artifact_dir / "missing_or_incomplete_tasks.jsonl"
+    repair_path = args.write_repair_jsonl or artifact_dir / "repair_tasks.jsonl"
+    status_path = artifact_dir / "task_status.jsonl"
     final_path.write_text(json.dumps(final_manifest, indent=2, sort_keys=True) + "\n")
-    missing_path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in missing))
-    final_s3 = s3_join(args.output_prefix, "manifests", "final_manifest.json")
+    repair_path.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in repair_tasks))
+    status_path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in records))
+
+    if args.publish_ready and not final_manifest["complete"] and not args.allow_incomplete_ready:
+        if args.upload:
+            s3_delete(s3, ready_s3)
+            s3_upload_text(s3, json.dumps(final_manifest, indent=2, sort_keys=True) + "\n", final_s3)
+            if repair_tasks:
+                s3_upload_text(s3, repair_path.read_text(), repair_s3, "application/jsonl")
+        print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": None, "refused_ready": True}, indent=2, sort_keys=True))
+        return 2
+
     if args.upload:
+        if args.publish_ready:
+            s3_delete(s3, ready_s3)
         s3_upload_text(s3, json.dumps(final_manifest, indent=2, sort_keys=True) + "\n", final_s3)
-    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_done_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "missing_or_incomplete": str(missing_path), "final_manifest_s3": final_s3 if args.upload else None}, indent=2, sort_keys=True))
+        if repair_tasks:
+            s3_upload_text(s3, repair_path.read_text(), repair_s3, "application/jsonl")
+        if args.publish_ready:
+            ready = {"schema": "spotbatch.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
+            s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
+    print(json.dumps({**{k: final_manifest[k] for k in ["schema", "run_id", "task_count", "done_count", "output_count", "summary_count", "missing_count", "output_without_done_count", "complete"]}, "final_manifest": str(final_path), "repair_tasks": str(repair_path), "task_status": str(status_path), "final_manifest_s3": final_s3 if args.upload else None, "ready_s3": ready_s3 if args.publish_ready and args.upload else None}, indent=2, sort_keys=True))
     return 2 if args.require_complete and not final_manifest["complete"] else 0
 
 
@@ -516,7 +562,12 @@ def main() -> int:
     p.add_argument("--tasks-s3")
     p.add_argument("--artifact-dir", type=Path)
     p.add_argument("--workers", type=int, default=32)
+    p.add_argument("--progress-interval", type=int, default=1000)
+    p.add_argument("--write-repair-jsonl", type=Path)
     p.add_argument("--upload", action="store_true")
+    p.add_argument("--publish-ready", action="store_true")
+    p.add_argument("--ready-key", default="READY")
+    p.add_argument("--allow-incomplete-ready", action="store_true", help="unsafe: publish READY even when tasks are incomplete")
     p.add_argument("--require-complete", action="store_true")
     p.set_defaults(func=cmd_finalize)
 
