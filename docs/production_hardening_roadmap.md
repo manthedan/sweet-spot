@@ -50,12 +50,12 @@ Goal: make the trust boundary explicit and least-privileged.
 
 Goal: preserve diagnostics during Spot interruption and make operators faster.
 
-- [ ] Stream child stdout/stderr to container logs for CloudWatch visibility.
-- [ ] Keep bounded ring buffers for summary tails instead of reading whole log files.
-- [ ] Cap per-task log bytes and support redaction patterns.
-- [ ] Emit structured JSON events for lease renewal, retry, timeout, upload, commit, and skip decisions.
-- [ ] Add `spotbatch doctor` to validate queue/DLQ/S3 permissions, job definition, log group, timeouts, architecture, and quotas.
-- [ ] Add CloudWatch dashboard and alarms for queue age, DLQ depth, Batch failures, and stalled runnable jobs.
+- [x] Stream child stdout/stderr to container logs for CloudWatch visibility.
+- [x] Keep bounded ring buffers for summary tails instead of reading whole log files.
+- [x] Cap per-task log bytes and support redaction patterns.
+- [x] Emit structured JSON events for lease renewal, retry, timeout, upload, commit, and skip decisions.
+- [x] Add `spotbatch doctor` to validate queue/DLQ/S3 permissions, job definition, log group, timeouts, architecture, and quotas. Quota validation is currently advisory because AWS Batch quota codes vary by account/Region.
+- [x] Add CloudWatch dashboard and alarms for queue age, DLQ depth, Batch failures, and stalled runnable jobs.
 
 ## Milestone 5 — scale/cost correctness
 

@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, _worker_overrides, cmd_derive_canary, cmd_enqueue_jsonl, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, _worker_overrides, cmd_derive_canary, cmd_doctor, cmd_enqueue_jsonl, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
 from spotbatch.worker import task_hash
 
 
@@ -196,6 +196,24 @@ class EnqueueValidationTests(unittest.TestCase):
         env = {row["name"]: row["value"] for row in overrides["environment"]}
         self.assertEqual(env["SPOTBATCH_ALLOWED_S3_PREFIXES"], "s3://bucket/runs/r1,s3://bucket/runs/r2")
 
+    def test_worker_overrides_pass_observability_controls(self) -> None:
+        overrides = _worker_overrides(
+            sqs_queue_url="https://sqs.example/q",
+            messages_per_worker=1,
+            visibility_timeout=1800,
+            heartbeat_seconds=300,
+            task_timeout_seconds=3600,
+            env=[],
+            allowed_s3_prefixes=[],
+            log_tail_bytes=123,
+            max_log_bytes=456,
+            redact_regexes=["token=[^ ]+"],
+        )
+        env = {row["name"]: row["value"] for row in overrides["environment"]}
+        self.assertEqual(env["SPOTBATCH_LOG_TAIL_BYTES"], "123")
+        self.assertEqual(env["SPOTBATCH_MAX_LOG_BYTES"], "456")
+        self.assertEqual(env["SPOTBATCH_REDACT_REGEXES"], "token=[^ ]+")
+
 
 class FakeLogsClient:
     def __init__(self) -> None:
@@ -225,6 +243,54 @@ class FakeLogSession:
         if service == "batch" and self.batch_client is not None:
             return self.batch_client
         raise AssertionError(service)
+
+
+class FakeDoctorClient:
+    def get_queue_attributes(self, **kwargs):
+        return {"Attributes": {"ApproximateNumberOfMessages": "0", "VisibilityTimeout": "1800", "RedrivePolicy": "{}"}}
+
+    def describe_job_queues(self, **kwargs):
+        return {"jobQueues": [{"jobQueueName": "jq", "state": "ENABLED", "status": "VALID", "computeEnvironmentOrder": []}]}
+
+    def describe_job_definitions(self, **kwargs):
+        return {"jobDefinitions": [{"jobDefinitionName": "jd", "revision": 1, "containerProperties": {"image": "repo/worker:tag", "jobRoleArn": "arn", "command": ["spotbatch", "worker"], "logConfiguration": {"options": {"awslogs-group": "/aws/batch/miser"}}}}]}
+
+    def describe_log_groups(self, **kwargs):
+        return {"logGroups": [{"logGroupName": "/aws/batch/miser", "retentionInDays": 14, "storedBytes": 0}]}
+
+    def list_objects_v2(self, **kwargs):
+        return {"Contents": []}
+
+
+class FakeDoctorSession:
+    def client(self, service: str, region_name=None):
+        return FakeDoctorClient()
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_reports_ok_for_basic_resources(self) -> None:
+        args = types.SimpleNamespace(
+            profile=None,
+            region="us-west-2",
+            queue_url="https://sqs.us-west-2.amazonaws.com/123/q",
+            dlq_url="https://sqs.us-west-2.amazonaws.com/123/dlq",
+            job_queue="jq",
+            job_definition="jd",
+            log_group=None,
+            s3_prefix=["s3://bucket/runs/r1"],
+            write_probe=False,
+            visibility_timeout=1800,
+            heartbeat_seconds=300,
+            task_timeout_seconds=3600,
+            redact_regex=[],
+        )
+        out = io.StringIO()
+        with patch("spotbatch.cli.boto3.Session", return_value=FakeDoctorSession()), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_doctor(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["ok"])
+        names = [c["name"] for c in report["checks"]]
+        self.assertIn("cloudwatch_log_group", names)
 
 
 class BatchOperatorTests(unittest.TestCase):

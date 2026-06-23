@@ -17,13 +17,13 @@ if done_s3 exists:
   delete message only if the marker is valid
   exit/sleep for next message
 start heartbeat to extend visibility timeout
-run task command with a bounded timeout
+run task command with a bounded timeout while streaming redacted stdout/stderr to container logs
 if output_s3 exists and command did not write SPOTBATCH_OUTPUT_PATH:
   upload attempt-scoped failure summary_s3 if configured
   do not upload done_s3
 if command wrote SPOTBATCH_OUTPUT_PATH and output_s3 exists:
   upload output to an immutable attempt-scoped URI with sha256 metadata
-upload attempt-scoped summary/logs
+upload attempt-scoped summary plus capped/redacted stdout and stderr logs
 conditionally upload canonical done_s3 with If-None-Match: *
 if another attempt already wrote done_s3, validate the winning marker
 only then delete SQS message
@@ -33,13 +33,14 @@ Failure behavior:
 
 - Spot host terminated before delete: SQS visibility timeout expires; task is retried.
 - The worker caps task timeouts below SQS's 12-hour maximum visibility window; longer work must be checkpointed or split.
-- Heartbeat/lease-renewal failures are emitted as structured stderr JSON events.
+- Heartbeat/lease-renewal successes and major task decisions are emitted as structured `spotbatch.worker_event.v1` JSON events; heartbeat failures keep the `spotbatch.heartbeat_error.v1` stderr schema.
 - Command fails or times out: worker does not delete message; task is retried.
 - Expected output missing for a task with `output_s3`: worker writes no done marker, does not delete the message, and the task is retried.
 - Attempt output exists without done marker: task is considered incomplete and will be reprocessed; orphan attempt objects are safe to garbage-collect after retention.
 - Repeated poison task: SQS redrive policy moves message to DLQ.
 - Task-provided environment variables may not override reserved `SPOTBATCH_*`, `AWS_*`, or `ECS_*` names.
 - If allowed S3 prefixes are configured, every `s3://...` URI in the task payload must stay inside those prefixes; this complements the worker task role's bucket/prefix IAM scope.
+- Task stdout/stderr summaries are bounded tails, not whole-file reads. Uploaded attempt logs are capped by `SPOTBATCH_MAX_LOG_BYTES` / `--max-log-bytes` and redacted by configured regexes before streaming/upload. Redaction fails closed for overlong unterminated records by suppressing the record with a placeholder.
 
 Why done markers are the source of truth:
 

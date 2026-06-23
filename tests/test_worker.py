@@ -294,6 +294,105 @@ class RunTaskTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "outside allowed prefixes"):
                 run_task(task, s3=object(), work_root=Path(tmp), allowed_s3_prefixes=["s3://bucket/runs/r1"])
 
+    def test_streams_redacts_caps_and_summarizes_task_logs(self) -> None:
+        uploads: dict[str, str] = {}
+
+        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
+            uploads[uri] = text
+
+        task = {
+            "schema": "spotbatch.task.v1",
+            "run_id": "run-1",
+            "task_id": "logs",
+            "command": [sys.executable, "-c", "print('token=SECRET ' + 'x' * 80)"],
+            "summary_s3": "s3://bucket/run/summaries/logs.summary.json",
+            "done_s3": "s3://bucket/run/done/logs.done.json",
+        }
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
+             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
+             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True), \
+             contextlib.redirect_stdout(out):
+            result = run_task(task, s3=object(), work_root=Path(tmp), log_tail_bytes=16, max_log_bytes=20, redact_regexes=[r"token=\w+"])
+
+        self.assertEqual(result["event"], "processed")
+        self.assertIn("<redacted>", out.getvalue())
+        self.assertNotIn("SECRET", out.getvalue())
+        summary_uri = next(uri for uri in uploads if uri.endswith("/summary.json"))
+        summary = json.loads(uploads[summary_uri])
+        self.assertTrue(summary["stdout_log"]["truncated"])
+        self.assertLessEqual(len(summary["stdout_tail"].encode()), 16)
+        self.assertNotIn("SECRET", summary["stdout_tail"])
+        stdout_uri = next(uri for uri in uploads if uri.endswith("/stdout.txt"))
+        self.assertLessEqual(len(uploads[stdout_uri].encode()), 20)
+        self.assertIn("<redacted>", uploads[stdout_uri])
+
+    def test_redaction_handles_tokens_split_across_pipe_chunks(self) -> None:
+        uploads: dict[str, str] = {}
+
+        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
+            uploads[uri] = text
+
+        task = {
+            "schema": "spotbatch.task.v1",
+            "run_id": "run-1",
+            "task_id": "split-redact",
+            "command": [sys.executable, "-c", "import sys; sys.stdout.write('x' * 8190 + 'ABCDEF\\n')"],
+            "summary_s3": "s3://bucket/run/summaries/split-redact.summary.json",
+            "done_s3": "s3://bucket/run/done/split-redact.done.json",
+        }
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
+             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
+             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True), \
+             contextlib.redirect_stdout(out):
+            run_task(task, s3=object(), work_root=Path(tmp), log_tail_bytes=9000, max_log_bytes=9000, redact_regexes=[r"ABCDEF"])
+
+        self.assertNotIn("ABCDEF", out.getvalue())
+        self.assertIn("<redacted>", out.getvalue())
+        stdout_uri = next(uri for uri in uploads if uri.endswith("/stdout.txt"))
+        self.assertNotIn("ABCDEF", uploads[stdout_uri])
+        self.assertIn("<redacted>", uploads[stdout_uri])
+
+    def test_redaction_suppresses_overlong_unterminated_records(self) -> None:
+        uploads: dict[str, str] = {}
+
+        def capture_text(_s3, text: str, uri: str, _content_type: str = "application/json") -> None:
+            uploads[uri] = text
+
+        task = {
+            "schema": "spotbatch.task.v1",
+            "run_id": "run-1",
+            "task_id": "long-redact",
+            "command": [sys.executable, "-c", "import sys; sys.stdout.write('token=' + 'S' * 70000)"],
+            "summary_s3": "s3://bucket/run/summaries/long-redact.summary.json",
+            "done_s3": "s3://bucket/run/done/long-redact.done.json",
+        }
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("spotbatch.worker.s3_exists", return_value=False), \
+             mock.patch("spotbatch.worker.s3_upload_text", side_effect=capture_text), \
+             mock.patch("spotbatch.worker.s3_upload_text_if_absent", return_value=True), \
+             contextlib.redirect_stdout(out):
+            run_task(task, s3=object(), work_root=Path(tmp), log_tail_bytes=2000, max_log_bytes=2000, redact_regexes=[r"token=\S+"])
+
+        self.assertIn("stream-redaction-window-exceeded", out.getvalue())
+        self.assertNotIn("SSSSSS", out.getvalue())
+        stdout_uri = next(uri for uri in uploads if uri.endswith("/stdout.txt"))
+        self.assertIn("stream-redaction-window-exceeded", uploads[stdout_uri])
+        self.assertNotIn("SSSSSS", uploads[stdout_uri])
+
     def test_rejects_timeouts_above_sqs_safe_cap(self) -> None:
         task = {
             "schema": "spotbatch.task.v1",

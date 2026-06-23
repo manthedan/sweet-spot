@@ -15,7 +15,7 @@ import boto3
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
-from .worker import SAFE_TASK_TIMEOUT_SECONDS, run_worker, validate_done_marker, validate_worker_timing
+from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -262,8 +262,11 @@ def _worker_overrides(
     task_timeout_seconds: float,
     env: list[dict[str, str]],
     allowed_s3_prefixes: list[str] | tuple[str, ...] | None,
-    vcpus: int | None,
-    memory: int | None,
+    log_tail_bytes: int | None = None,
+    max_log_bytes: int | None = None,
+    redact_regexes: list[str] | tuple[str, ...] | None = None,
+    vcpus: int | None = None,
+    memory: int | None = None,
 ) -> dict[str, Any]:
     base_env = [
         {"name": "SPOTBATCH_SQS_QUEUE_URL", "value": sqs_queue_url},
@@ -275,6 +278,13 @@ def _worker_overrides(
     normalized_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
     if normalized_prefixes:
         base_env.append({"name": "SPOTBATCH_ALLOWED_S3_PREFIXES", "value": ",".join(normalized_prefixes)})
+    if log_tail_bytes is not None:
+        base_env.append({"name": "SPOTBATCH_LOG_TAIL_BYTES", "value": str(log_tail_bytes)})
+    if max_log_bytes is not None:
+        base_env.append({"name": "SPOTBATCH_MAX_LOG_BYTES", "value": str(max_log_bytes)})
+    if redact_regexes:
+        parse_redact_patterns(redact_regexes)
+        base_env.append({"name": "SPOTBATCH_REDACT_REGEXES", "value": "\n".join(redact_regexes)})
     base_env.extend(env or [])
     overrides: dict[str, Any] = {"environment": base_env}
     if vcpus is not None:
@@ -335,6 +345,9 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
         task_timeout_seconds=args.task_timeout_seconds,
         env=args.env or [],
         allowed_s3_prefixes=getattr(args, "allowed_s3_prefix", []) or [],
+        log_tail_bytes=args.log_tail_bytes,
+        max_log_bytes=args.max_log_bytes,
+        redact_regexes=args.redact_regex or [],
         vcpus=args.vcpus,
         memory=args.memory,
     )
@@ -420,6 +433,9 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
         "submit": bool(args.submit),
         "env": _redact_env(args.env or []),
         "allowed_s3_prefixes": list(parse_allowed_s3_prefixes(getattr(args, "allowed_s3_prefix", []) or [])),
+        "log_tail_bytes": args.log_tail_bytes,
+        "max_log_bytes": args.max_log_bytes,
+        "redact_regex_count": len(args.redact_regex or []),
     }
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
@@ -454,6 +470,9 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
             task_timeout_seconds=args.task_timeout_seconds,
             env=args.env or [],
             allowed_s3_prefixes=getattr(args, "allowed_s3_prefix", []) or [],
+            log_tail_bytes=args.log_tail_bytes,
+            max_log_bytes=args.max_log_bytes,
+            redact_regexes=args.redact_regex or [],
             vcpus=args.vcpus,
             memory=args.memory,
         )
@@ -919,6 +938,104 @@ def cmd_dlq(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_check(name: str, fn) -> dict[str, Any]:
+    started = time.time()
+    try:
+        details = fn()
+        return {"name": name, "ok": True, "elapsed_sec": time.time() - started, "details": details or {}}
+    except Exception as exc:
+        return {"name": name, "ok": False, "elapsed_sec": time.time() - started, "error_type": type(exc).__name__, "error": str(exc)}
+
+
+def _job_definition_log_group(job_def: dict[str, Any]) -> str | None:
+    container = job_def.get("containerProperties") or {}
+    return _container_log_group(container)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    try:
+        validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+        parse_redact_patterns(args.redact_regex or [])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    checks: list[dict[str, Any]] = []
+    discovered_log_group = args.log_group
+
+    if args.queue_url:
+        def check_queue() -> dict[str, Any]:
+            sqs = session.client("sqs", region_name=args.region)
+            attrs = sqs.get_queue_attributes(QueueUrl=args.queue_url, AttributeNames=["All"]).get("Attributes", {})
+            return {"queue_url": args.queue_url, "attributes": {k: attrs.get(k) for k in ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateAgeOfOldestMessage", "VisibilityTimeout", "RedrivePolicy"] if k in attrs}}
+        checks.append(_doctor_check("sqs_work_queue", check_queue))
+
+    if args.dlq_url:
+        def check_dlq() -> dict[str, Any]:
+            sqs = session.client("sqs", region_name=args.region)
+            attrs = sqs.get_queue_attributes(QueueUrl=args.dlq_url, AttributeNames=["All"]).get("Attributes", {})
+            return {"dlq_url": args.dlq_url, "attributes": {k: attrs.get(k) for k in ["ApproximateNumberOfMessages", "MessageRetentionPeriod"] if k in attrs}}
+        checks.append(_doctor_check("sqs_dlq", check_dlq))
+
+    if args.job_queue:
+        def check_job_queue() -> dict[str, Any]:
+            batch = session.client("batch", region_name=args.region)
+            queues = batch.describe_job_queues(jobQueues=[args.job_queue]).get("jobQueues", [])
+            if not queues:
+                raise RuntimeError(f"job queue not found: {args.job_queue}")
+            queue = queues[0]
+            if queue.get("state") != "ENABLED" or queue.get("status") not in {"VALID", None}:
+                raise RuntimeError(f"job queue not ready: state={queue.get('state')} status={queue.get('status')}")
+            return {"jobQueueName": queue.get("jobQueueName"), "state": queue.get("state"), "status": queue.get("status"), "computeEnvironmentOrder": queue.get("computeEnvironmentOrder")}
+        checks.append(_doctor_check("batch_job_queue", check_job_queue))
+
+    if args.job_definition:
+        def check_job_definition() -> dict[str, Any]:
+            nonlocal discovered_log_group
+            batch = session.client("batch", region_name=args.region)
+            defs = batch.describe_job_definitions(jobDefinitions=[args.job_definition], status="ACTIVE").get("jobDefinitions", [])
+            if not defs:
+                raise RuntimeError(f"active job definition not found: {args.job_definition}")
+            job_def = defs[0]
+            container = job_def.get("containerProperties") or {}
+            log_group = _job_definition_log_group(job_def)
+            discovered_log_group = discovered_log_group or log_group
+            return {"jobDefinitionName": job_def.get("jobDefinitionName"), "revision": job_def.get("revision"), "image": container.get("image"), "jobRoleArn": container.get("jobRoleArn"), "log_group": log_group, "command": container.get("command")}
+        checks.append(_doctor_check("batch_job_definition", check_job_definition))
+
+    if args.s3_prefix:
+        for prefix in args.s3_prefix:
+            def check_s3(prefix=prefix) -> dict[str, Any]:
+                s3 = session.client("s3", region_name=args.region)
+                bucket, key = parse_s3_uri(prefix)
+                list_prefix = key.rstrip("/")
+                s3.list_objects_v2(Bucket=bucket, Prefix=list_prefix, MaxKeys=1)
+                probe_uri = None
+                if args.write_probe:
+                    probe_key = f"{list_prefix.rstrip('/')}/.spotbatch-doctor-{utc_stamp()}.json" if list_prefix else f".spotbatch-doctor-{utc_stamp()}.json"
+                    body = json.dumps({"schema": "spotbatch.doctor_probe.v1", "created_at": iso_now()}) + "\n"
+                    s3.put_object(Bucket=bucket, Key=probe_key, Body=body.encode("utf-8"), ContentType="application/json")
+                    s3.delete_object(Bucket=bucket, Key=probe_key)
+                    probe_uri = f"s3://{bucket}/{probe_key}"
+                return {"prefix": prefix, "bucket": bucket, "key_prefix": list_prefix, "write_probe": probe_uri}
+            checks.append(_doctor_check(f"s3_prefix:{prefix}", check_s3))
+
+    if discovered_log_group:
+        def check_logs() -> dict[str, Any]:
+            logs = session.client("logs", region_name=args.region)
+            groups = logs.describe_log_groups(logGroupNamePrefix=discovered_log_group).get("logGroups", [])
+            match = next((g for g in groups if g.get("logGroupName") == discovered_log_group), None)
+            if not match:
+                raise RuntimeError(f"log group not found: {discovered_log_group}")
+            return {"log_group": discovered_log_group, "retentionInDays": match.get("retentionInDays"), "storedBytes": match.get("storedBytes")}
+        checks.append(_doctor_check("cloudwatch_log_group", check_logs))
+
+    checks.append({"name": "service_quotas", "ok": None, "details": {"status": "not_checked", "reason": "AWS Batch quota codes vary by account/Region; verify max vCPUs and queue limits in Service Quotas for production runs."}})
+    ok = all(c.get("ok") is not False for c in checks)
+    print(json.dumps({"schema": "spotbatch.doctor.v1", "checked_at": iso_now(), "ok": ok, "region": args.region, "checks": checks}, indent=2, sort_keys=True))
+    return 0 if ok else 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="spotbatch")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -932,7 +1049,10 @@ def main() -> int:
     p.add_argument("--wait-time", type=int, default=10)
     p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SPOTBATCH_WORK_DIR", "/tmp/spotbatch-work")))
     p.add_argument("--allowed-s3-prefix", action="append", default=_env_allowed_s3_prefixes(), help="S3 prefix allowed in task payloads; repeatable. Also read from SPOTBATCH_ALLOWED_S3_PREFIXES.")
-    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds, allowed_s3_prefixes=a.allowed_s3_prefix))
+    p.add_argument("--log-tail-bytes", type=int, default=int(os.environ.get("SPOTBATCH_LOG_TAIL_BYTES", str(DEFAULT_LOG_TAIL_BYTES))), help="Bytes of redacted stdout/stderr tail to keep in task summaries")
+    p.add_argument("--max-log-bytes", type=int, default=int(os.environ.get("SPOTBATCH_MAX_LOG_BYTES", str(DEFAULT_MAX_LOG_BYTES))), help="Maximum redacted bytes per stdout/stderr stream to upload to S3")
+    p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from streamed/uploaded task logs; repeatable. SPOTBATCH_REDACT_REGEXES may provide newline-separated defaults.")
+    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds, allowed_s3_prefixes=a.allowed_s3_prefix, log_tail_bytes=a.log_tail_bytes, max_log_bytes=a.max_log_bytes, redact_regexes=a.redact_regex))
 
     p = sub.add_parser("enqueue-jsonl")
     p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
@@ -971,6 +1091,9 @@ def main() -> int:
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
     p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SPOTBATCH_ALLOWED_S3_PREFIXES to workers; repeatable.")
+    p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
+    p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
+    p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_submit_workers)
 
@@ -1003,6 +1126,9 @@ def main() -> int:
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
     p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SPOTBATCH_ALLOWED_S3_PREFIXES to workers; repeatable.")
+    p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
+    p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
+    p.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_supervise_workers)
 
@@ -1069,6 +1195,22 @@ def main() -> int:
     p.add_argument("--artifact-dir", type=Path)
     p.add_argument("--completion-marker-s3")
     p.set_defaults(func=cmd_s3_delete_prefix)
+
+    p = sub.add_parser("doctor", help="Validate common AWS/SQS/S3/Batch/CloudWatch operator prerequisites")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
+    p.add_argument("--dlq-url")
+    p.add_argument("--job-queue")
+    p.add_argument("--job-definition")
+    p.add_argument("--log-group")
+    p.add_argument("--s3-prefix", action="append", default=[], help="S3 prefix to validate with ListBucket; repeatable")
+    p.add_argument("--write-probe", action="store_true", help="Also write/delete a tiny object under each --s3-prefix")
+    p.add_argument("--visibility-timeout", type=int, default=1800)
+    p.add_argument("--heartbeat-seconds", type=int, default=300)
+    p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS)
+    p.add_argument("--redact-regex", action="append", default=[], help="Validate worker log redaction regexes")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("dlq")
     p.add_argument("--dlq-url", required=True)

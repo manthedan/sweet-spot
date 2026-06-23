@@ -87,6 +87,8 @@ Task payloads are validated as `spotbatch.task.v1` before execution: `run_id`, `
 
 For production, set `SPOTBATCH_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix` to `spotbatch worker` / `submit-workers` / `supervise-workers`. When configured, every `s3://...` URI found in the task payload, including command arguments and derived done markers, must be inside one of those prefixes.
 
+Worker observability is on by default: child stdout/stderr are streamed to container logs for CloudWatch, a bounded redacted tail is stored in the task summary, and capped redacted attempt logs are uploaded to S3. Use `--log-tail-bytes`, `--max-log-bytes`, and repeatable `--redact-regex` on `worker`, `submit-workers`, or `supervise-workers` for sensitive workloads. Redaction is applied per newline-terminated log record; overlong unterminated records are suppressed with a placeholder rather than risk leaking a partial secret.
+
 Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much shorter shards, and checkpoint/split work that cannot fit safely under the default 11-hour cap.
 
 ## CLI quickstart
@@ -131,6 +133,14 @@ spotbatch supervise-workers \
   --max-submit-per-loop 16
 
 # add --submit after reviewing the dry-run
+
+# preflight AWS/SQS/S3/Batch/CloudWatch permissions and configuration
+spotbatch doctor \
+  --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
+  --job-queue my-batch-spot-queue \
+  --job-definition my-worker-jobdef:1 \
+  --s3-prefix s3://my-bucket/runs/hello-001
 
 # finalize by checking S3 done markers
 spotbatch finalize \
@@ -187,6 +197,7 @@ spotbatch-lane-manager --config lanes.json
 - optional On-Demand repair queue
 - least-privilege IAM roles scoped to the work queue and configured S3 bucket/prefixes
 - generic worker job definition with runtime S3-prefix validation
+- CloudWatch dashboard and baseline alarms for queue age, DLQ depth, Batch failures, and runnable-job stalls
 
 See `infra/opentofu/README.md`.
 

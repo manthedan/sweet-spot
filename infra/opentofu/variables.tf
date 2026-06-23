@@ -114,6 +114,54 @@ variable "sqs_max_receive_count" {
   default = 10
 }
 
+variable "create_observability" {
+  type        = bool
+  description = "Create a CloudWatch dashboard and baseline alarms for SQS/Batch health."
+  default     = true
+}
+
+variable "alarm_sns_topic_arns" {
+  type        = list(string)
+  description = "SNS topic ARNs for alarm/OK actions. Empty list creates alarms without actions."
+  default     = []
+}
+
+variable "alarm_evaluation_periods" {
+  type        = number
+  description = "Evaluation periods for baseline CloudWatch alarms."
+  default     = 5
+}
+
+variable "queue_age_alarm_seconds" {
+  type        = number
+  description = "Alarm threshold for ApproximateAgeOfOldestMessage on the work queue."
+  default     = 1800
+}
+
+variable "dlq_depth_alarm_threshold" {
+  type        = number
+  description = "Alarm threshold for visible messages in the DLQ."
+  default     = 1
+}
+
+variable "batch_failed_jobs_alarm_threshold" {
+  type        = number
+  description = "Alarm threshold for AWS Batch failed jobs on the Spot queue."
+  default     = 1
+}
+
+variable "runnable_jobs_alarm_threshold" {
+  type        = number
+  description = "Alarm threshold for runnable AWS Batch jobs on the Spot queue."
+  default     = 1
+}
+
+variable "runnable_jobs_alarm_evaluation_periods" {
+  type        = number
+  description = "Evaluation periods before alarming on stalled runnable AWS Batch jobs."
+  default     = 30
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

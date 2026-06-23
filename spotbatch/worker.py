@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Iterable, Pattern
 
 import boto3
 from botocore.exceptions import ClientError
@@ -26,8 +26,136 @@ SQS_MAX_VISIBILITY_SECONDS = 12 * 60 * 60
 SAFE_TASK_TIMEOUT_SECONDS = 11 * 60 * 60
 DONE_MARKER_SCHEMA_V1 = "spotbatch.done_marker.v1"
 DONE_MARKER_SCHEMA_V2 = "spotbatch.done_marker.v2"
-def _tail(s: str, n: int = 12000) -> str:
-    return s[-n:]
+DEFAULT_LOG_TAIL_BYTES = 12_000
+DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
+REDACTION_CARRY_CHARS = 65_536
+
+
+def _emit_event(event: str, **fields: Any) -> None:
+    payload = {"schema": "spotbatch.worker_event.v1", "event": event, "emitted_at": iso_now(), **fields}
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def parse_redact_patterns(patterns: Iterable[str] | str | None) -> list[Pattern[str]]:
+    if patterns is None:
+        return []
+    if isinstance(patterns, str):
+        raw_patterns = [p for p in patterns.splitlines() if p.strip()]
+    else:
+        raw_patterns = [str(p) for p in patterns if str(p).strip()]
+    compiled: list[Pattern[str]] = []
+    for pattern in raw_patterns:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            raise ValueError(f"invalid redact regex {pattern!r}: {exc}") from exc
+    return compiled
+
+
+def _redact_text(text: str, patterns: list[Pattern[str]]) -> str:
+    for pattern in patterns:
+        text = pattern.sub("<redacted>", text)
+    return text
+
+
+class _BoundedLogCapture:
+    def __init__(self, path: Path, *, stream, max_bytes: int, tail_bytes: int, redact_patterns: list[Pattern[str]]) -> None:
+        self.path = path
+        self.stream = stream
+        self.max_bytes = max(0, int(max_bytes))
+        self.tail_bytes = max(0, int(tail_bytes))
+        self.redact_patterns = redact_patterns
+        self.total_bytes = 0
+        self.stored_bytes = 0
+        self.truncated_bytes = 0
+        self._tail = bytearray()
+        self._fh = path.open("wb")
+        self._lock = threading.Lock()
+
+    def write_text(self, text: str) -> None:
+        text = _redact_text(text, self.redact_patterns)
+        data = text.encode("utf-8", errors="replace")
+        with self._lock:
+            self.total_bytes += len(data)
+            if self.tail_bytes:
+                self._tail.extend(data)
+                if len(self._tail) > self.tail_bytes:
+                    del self._tail[: len(self._tail) - self.tail_bytes]
+            if self.max_bytes == 0:
+                self.truncated_bytes += len(data)
+            else:
+                remaining = self.max_bytes - self.stored_bytes
+                if remaining > 0:
+                    to_store = data[:remaining]
+                    self._fh.write(to_store)
+                    self.stored_bytes += len(to_store)
+                    self.truncated_bytes += max(0, len(data) - len(to_store))
+                else:
+                    self.truncated_bytes += len(data)
+        self.stream.write(text)
+        self.stream.flush()
+
+    def write(self, chunk: bytes) -> None:
+        self.write_text(chunk.decode("utf-8", errors="replace"))
+
+    def close(self) -> None:
+        self._fh.flush()
+        self._fh.close()
+
+    def tail_text(self) -> str:
+        return bytes(self._tail).decode("utf-8", errors="replace")
+
+    def upload_text(self) -> str:
+        return self.path.read_bytes().decode("utf-8", errors="replace")
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "stored_bytes": self.stored_bytes,
+            "total_bytes": self.total_bytes,
+            "truncated_bytes": self.truncated_bytes,
+            "truncated": self.truncated_bytes > 0,
+            "max_bytes": self.max_bytes,
+        }
+
+
+def _pump_pipe(pipe: BinaryIO, capture: _BoundedLogCapture) -> None:
+    try:
+        if not capture.redact_patterns:
+            for chunk in iter(lambda: pipe.read(8192), b""):
+                if chunk:
+                    capture.write(chunk)
+        else:
+            pending = ""
+            suppress_until_newline = False
+            for chunk in iter(lambda: pipe.read(8192), b""):
+                if not chunk:
+                    continue
+                text = chunk.decode("utf-8", errors="replace")
+                if suppress_until_newline:
+                    newline_index = text.find("\n")
+                    if newline_index < 0:
+                        continue
+                    text = text[newline_index + 1:]
+                    suppress_until_newline = False
+                pending += text
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    capture.write_text(line + "\n")
+                if len(pending) > REDACTION_CARRY_CHARS:
+                    # Regex redaction cannot be proven safe for an unbounded
+                    # unterminated record. Fail closed: emit a placeholder and
+                    # suppress the rest of the overlong line/record rather than
+                    # leaking the suffix of a long secret whose prefix matched.
+                    capture.write_text("<redacted:stream-redaction-window-exceeded>\n")
+                    pending = ""
+                    suppress_until_newline = True
+            if pending and not suppress_until_newline:
+                capture.write_text(pending)
+    finally:
+        try:
+            pipe.close()
+        finally:
+            capture.close()
 
 
 def _task_dir_prefix(task_id: str) -> str:
@@ -88,6 +216,7 @@ def _heartbeat(sqs, queue_url: str, receipt_handle: str, timeout: int, every: in
                 ReceiptHandle=receipt_handle,
                 VisibilityTimeout=timeout,
             )
+            _emit_event("lease_renewed", queue_url=queue_url, visibility_timeout=timeout, heartbeat_seconds=every)
         except Exception as exc:
             print(json.dumps({
                 "schema": "spotbatch.heartbeat_error.v1",
@@ -192,12 +321,18 @@ def run_task(
     work_root: Path,
     default_timeout_seconds: float = SAFE_TASK_TIMEOUT_SECONDS,
     allowed_s3_prefixes: list[str] | tuple[str, ...] | None = None,
+    log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
+    redact_regexes: Iterable[str] | str | None = None,
 ) -> dict[str, Any]:
     run_id = str(task.get("run_id", ""))
     task_id = str(task.get("task_id", ""))
     if not run_id or not task_id:
         raise ValueError("task requires run_id and task_id")
     validate_task_s3_prefixes(task, allowed_s3_prefixes)
+    if log_tail_bytes < 0 or max_log_bytes < 0:
+        raise ValueError("log_tail_bytes and max_log_bytes must be non-negative")
+    redact_patterns = parse_redact_patterns(redact_regexes)
     done_s3 = default_done_s3(task)
     output_s3 = str(task.get("output_s3") or "")
     summary_s3 = str(task.get("summary_s3") or "")
@@ -206,6 +341,7 @@ def run_task(
     existing_marker = _load_done_marker(s3, done_s3)
     if existing_marker is not None:
         validate_done_marker(s3, task, existing_marker, this_task_hash)
+        _emit_event("skip_existing_done", run_id=run_id, task_id=task_id, task_hash=this_task_hash, done_s3=done_s3)
         return {
             "event": "skip_existing_done",
             "run_id": run_id,
@@ -224,6 +360,16 @@ def run_task(
     attempt_summary_s3 = _attempt_uri(summary_s3, attempt_id, "summary.json") if summary_s3 else ""
     attempt_stdout_s3 = _attempt_uri(done_s3, attempt_id, "stdout.txt")
     attempt_stderr_s3 = _attempt_uri(done_s3, attempt_id, "stderr.txt")
+    _emit_event(
+        "task_started",
+        run_id=run_id,
+        task_id=task_id,
+        task_hash=this_task_hash,
+        attempt_id=attempt_id,
+        timeout_seconds=timeout,
+        output_s3=output_s3 or None,
+        done_s3=done_s3,
+    )
 
     work_root.mkdir(parents=True, exist_ok=True)
     with _tempfile.TemporaryDirectory(prefix=_task_dir_prefix(task_id), dir=work_root) as tmp_dir:
@@ -250,40 +396,58 @@ def run_task(
         stdout_path = task_dir / "stdout.txt"
         stderr_path = task_dir / "stderr.txt"
         timed_out = False
-        with stdout_path.open("w+", encoding="utf-8") as stdout_fh, stderr_path.open("w+", encoding="utf-8") as stderr_fh:
-            proc = subprocess.Popen(
-                command,
-                cwd=str(task_dir),
-                env=env,
-                text=True,
-                stdout=stdout_fh,
-                stderr=stderr_fh,
-                start_new_session=True,
-            )
+        stdout_capture = _BoundedLogCapture(stdout_path, stream=sys.stdout, max_bytes=max_log_bytes, tail_bytes=log_tail_bytes, redact_patterns=redact_patterns)
+        stderr_capture = _BoundedLogCapture(stderr_path, stream=sys.stderr, max_bytes=max_log_bytes, tail_bytes=log_tail_bytes, redact_patterns=redact_patterns)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(task_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        stdout_thread = threading.Thread(target=_pump_pipe, args=(proc.stdout, stdout_capture), daemon=True)
+        stderr_thread = threading.Thread(target=_pump_pipe, args=(proc.stderr, stderr_capture), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _emit_event("task_timeout", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, timeout_seconds=timeout)
+            _signal_process_group(proc.pid, signal.SIGTERM)
             try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _signal_process_group(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass
-                _signal_process_group(proc.pid, signal.SIGKILL)
                 proc.wait(timeout=10)
-            if not timed_out:
-                # Clean up background descendants that stayed in the task process group
-                # after the top-level command exited.
-                _signal_process_group(proc.pid, signal.SIGTERM)
-                time.sleep(0.1)
-                _signal_process_group(proc.pid, signal.SIGKILL)
-            stdout_fh.flush()
-            stderr_fh.flush()
-            stdout_fh.seek(0)
-            stderr_fh.seek(0)
-            stdout = stdout_fh.read()
-            stderr = stderr_fh.read()
+            except subprocess.TimeoutExpired:
+                pass
+            _signal_process_group(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+        if not timed_out:
+            # Clean up background descendants that stayed in the task process group
+            # after the top-level command exited.
+            _signal_process_group(proc.pid, signal.SIGTERM)
+            time.sleep(0.1)
+            _signal_process_group(proc.pid, signal.SIGKILL)
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
         elapsed = time.time() - started
+        stdout = stdout_capture.tail_text()
+        stderr = stderr_capture.tail_text()
+        _emit_event(
+            "command_finished",
+            run_id=run_id,
+            task_id=task_id,
+            task_hash=this_task_hash,
+            attempt_id=attempt_id,
+            returncode=proc.returncode,
+            timed_out=timed_out,
+            elapsed_sec=elapsed,
+            stdout_bytes=stdout_capture.total_bytes,
+            stderr_bytes=stderr_capture.total_bytes,
+            stdout_truncated=stdout_capture.truncated_bytes > 0,
+            stderr_truncated=stderr_capture.truncated_bytes > 0,
+        )
 
         uploaded_output = False
         output_record: dict[str, Any] | None = None
@@ -302,6 +466,7 @@ def run_task(
                 )
                 uploaded_output = True
                 output_record = {"logical_uri": output_s3, "uri": attempt_output_s3, "size_bytes": size, "sha256": sha256}
+                _emit_event("output_uploaded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, uri=attempt_output_s3, size_bytes=size, sha256=sha256)
             else:
                 framework_error = f"expected output file was not produced: {output_path}"
 
@@ -327,8 +492,10 @@ def run_task(
             "uploaded_output": uploaded_output,
             "output": output_record,
             "framework_error": framework_error,
-            "stdout_tail": _tail(stdout),
-            "stderr_tail": _tail(stderr),
+            "stdout_tail": stdout,
+            "stderr_tail": stderr,
+            "stdout_log": stdout_capture.summary(),
+            "stderr_log": stderr_capture.summary(),
             "worker": {
                 "hostname": os.environ.get("HOSTNAME"),
                 "aws_batch_job_id": os.environ.get("AWS_BATCH_JOB_ID"),
@@ -338,12 +505,16 @@ def run_task(
         }
         if attempt_summary_s3:
             s3_upload_text(s3, json.dumps(summary, indent=2, sort_keys=True) + "\n", attempt_summary_s3)
+            _emit_event("summary_uploaded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, uri=attempt_summary_s3)
         # Attempt-scoped logs make postmortems possible even when a duplicate
-        # attempt loses the conditional done-marker race.
-        if stdout:
-            s3_upload_text(s3, stdout, attempt_stdout_s3, "text/plain")
-        if stderr:
-            s3_upload_text(s3, stderr, attempt_stderr_s3, "text/plain")
+        # attempt loses the conditional done-marker race. Logs are redacted and
+        # capped before upload and while streaming to CloudWatch.
+        if stdout_capture.stored_bytes:
+            s3_upload_text(s3, stdout_capture.upload_text(), attempt_stdout_s3, "text/plain")
+            _emit_event("log_uploaded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, stream="stdout", uri=attempt_stdout_s3, **stdout_capture.summary())
+        if stderr_capture.stored_bytes:
+            s3_upload_text(s3, stderr_capture.upload_text(), attempt_stderr_s3, "text/plain")
+            _emit_event("log_uploaded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, stream="stderr", uri=attempt_stderr_s3, **stderr_capture.summary())
 
         if timed_out:
             raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
@@ -371,8 +542,10 @@ def run_task(
         }
         committed = s3_upload_text_if_absent(s3, json.dumps(done, indent=2, sort_keys=True) + "\n", done_s3)
         if committed:
+            _emit_event("commit_succeeded", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, done_s3=done_s3)
             return {"event": "processed", **done}
 
+        _emit_event("commit_lost", run_id=run_id, task_id=task_id, task_hash=this_task_hash, attempt_id=attempt_id, done_s3=done_s3)
         winning_marker = _load_done_marker(s3, done_s3)
         if winning_marker is None:
             raise RuntimeError(f"conditional done marker write lost but no marker is readable: {done_s3}")
@@ -399,9 +572,17 @@ def run_worker(
     work_dir: Path,
     task_timeout_seconds: float,
     allowed_s3_prefixes: list[str] | tuple[str, ...] | None = None,
+    log_tail_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
+    redact_regexes: Iterable[str] | str | None = None,
 ) -> int:
     validate_worker_timing(visibility_timeout=visibility_timeout, heartbeat_seconds=heartbeat_seconds, task_timeout_seconds=task_timeout_seconds)
     allowed_s3_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
+    redact_regexes = list(redact_regexes or []) if not isinstance(redact_regexes, str) else [redact_regexes]
+    env_redact_regexes = os.environ.get("SPOTBATCH_REDACT_REGEXES", "")
+    if env_redact_regexes:
+        redact_regexes.extend([p for p in env_redact_regexes.splitlines() if p.strip()])
+    parse_redact_patterns(redact_regexes)
     sqs = boto3.client("sqs")
     s3 = boto3.client("s3")
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -428,10 +609,33 @@ def run_worker(
         hb.start()
         try:
             task = json.loads(msg.get("Body", "{}"))
-            result = run_task(task, s3=s3, work_root=work_dir, default_timeout_seconds=task_timeout_seconds, allowed_s3_prefixes=allowed_s3_prefixes)
+            attrs = msg.get("Attributes", {})
+            _emit_event(
+                "message_received",
+                queue_url=queue_url,
+                run_id=task.get("run_id") if isinstance(task, dict) else None,
+                task_id=task.get("task_id") if isinstance(task, dict) else None,
+                receive_count=attrs.get("ApproximateReceiveCount"),
+                sent_timestamp=attrs.get("SentTimestamp"),
+                retry=str(attrs.get("ApproximateReceiveCount") or "1") != "1",
+            )
+            result = run_task(
+                task,
+                s3=s3,
+                work_root=work_dir,
+                default_timeout_seconds=task_timeout_seconds,
+                allowed_s3_prefixes=allowed_s3_prefixes,
+                log_tail_bytes=log_tail_bytes,
+                max_log_bytes=max_log_bytes,
+                redact_regexes=redact_regexes,
+            )
             print(json.dumps(result, sort_keys=True), flush=True)
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+            _emit_event("message_deleted", queue_url=queue_url, run_id=task.get("run_id"), task_id=task.get("task_id"), receipt_deleted=True)
             processed += 1
+        except Exception as exc:
+            _emit_event("task_failed", queue_url=queue_url, error_type=type(exc).__name__, error=str(exc))
+            raise
         finally:
             stop.set()
     print(json.dumps({"schema": "spotbatch.worker_summary.v1", "processed": processed, "finished_at": iso_now()}), flush=True)

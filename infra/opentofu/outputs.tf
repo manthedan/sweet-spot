@@ -21,3 +21,11 @@ output "worker_job_definition" {
 output "worker_task_role_arn" {
   value = aws_iam_role.worker_task.arn
 }
+
+output "cloudwatch_dashboard_name" {
+  value = var.create_observability ? aws_cloudwatch_dashboard.spotbatch[0].dashboard_name : null
+}
+
+output "cloudwatch_log_group" {
+  value = aws_cloudwatch_log_group.batch.name
+}
