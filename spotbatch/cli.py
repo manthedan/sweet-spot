@@ -14,7 +14,8 @@ import boto3
 
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_text
-from .worker import SAFE_TASK_TIMEOUT_SECONDS, default_done_s3, run_worker, task_hash, validate_done_marker, validate_worker_timing
+from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
+from .worker import SAFE_TASK_TIMEOUT_SECONDS, run_worker, validate_done_marker, validate_worker_timing
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -44,6 +45,32 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: f.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _env_allowed_s3_prefixes() -> list[str]:
+    return list(parse_allowed_s3_prefixes(os.environ.get("SPOTBATCH_ALLOWED_S3_PREFIXES")))
+
+
+def _validate_unique_task_ids(tasks: list[dict[str, Any]], *, context: str) -> None:
+    seen: dict[str, int] = {}
+    duplicates: list[str] = []
+    for i, task in enumerate(tasks, start=1):
+        task_id = str(task.get("task_id") or "")
+        if task_id in seen:
+            duplicates.append(f"{task_id!r} at lines {seen[task_id]} and {i}")
+        elif task_id:
+            seen[task_id] = i
+    if duplicates:
+        raise SystemExit(f"duplicate task_id values in {context}: {', '.join(duplicates[:10])}")
+
+
+def _validate_tasks_for_enqueue(tasks: list[dict[str, Any]], *, allowed_s3_prefixes: list[str] | tuple[str, ...] | None) -> None:
+    _validate_unique_task_ids(tasks, context="enqueue JSONL")
+    for i, task in enumerate(tasks, start=1):
+        try:
+            validate_task_model(task, default_timeout_seconds=SAFE_TASK_TIMEOUT_SECONDS, max_timeout_seconds=SAFE_TASK_TIMEOUT_SECONDS, allowed_s3_prefixes=allowed_s3_prefixes)
+        except ValueError as exc:
+            raise SystemExit(f"invalid task at line {i}: {exc}") from exc
 
 
 def _parse_index_selection(raw: str, n: int) -> list[int]:
@@ -105,6 +132,8 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
     if args.run_id:
         for t in tasks:
             t.setdefault("run_id", args.run_id)
+    allowed_s3_prefixes = parse_allowed_s3_prefixes(getattr(args, "allowed_s3_prefix", None) or _env_allowed_s3_prefixes())
+    _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=allowed_s3_prefixes)
     artifact_dir = args.artifact_dir or Path("artifacts") / (args.run_id or f"run-{utc_stamp()}")
     artifact_dir.mkdir(parents=True, exist_ok=True)
     tasks_out = artifact_dir / "tasks.jsonl"
@@ -128,6 +157,7 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
         "task_count": len(tasks),
         "sent": sent,
         "submitted": bool(args.submit),
+        "allowed_s3_prefixes": list(allowed_s3_prefixes),
         "tasks_jsonl": str(tasks_out),
     }, indent=2, sort_keys=True))
     return 0
@@ -231,6 +261,7 @@ def _worker_overrides(
     heartbeat_seconds: int,
     task_timeout_seconds: float,
     env: list[dict[str, str]],
+    allowed_s3_prefixes: list[str] | tuple[str, ...] | None,
     vcpus: int | None,
     memory: int | None,
 ) -> dict[str, Any]:
@@ -241,6 +272,9 @@ def _worker_overrides(
         {"name": "SPOTBATCH_HEARTBEAT_SECONDS", "value": str(heartbeat_seconds)},
         {"name": "SPOTBATCH_TASK_TIMEOUT_SECONDS", "value": str(task_timeout_seconds)},
     ]
+    normalized_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
+    if normalized_prefixes:
+        base_env.append({"name": "SPOTBATCH_ALLOWED_S3_PREFIXES", "value": ",".join(normalized_prefixes)})
     base_env.extend(env or [])
     overrides: dict[str, Any] = {"environment": base_env}
     if vcpus is not None:
@@ -300,6 +334,7 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
         heartbeat_seconds=args.heartbeat_seconds,
         task_timeout_seconds=args.task_timeout_seconds,
         env=args.env or [],
+        allowed_s3_prefixes=getattr(args, "allowed_s3_prefix", []) or [],
         vcpus=args.vcpus,
         memory=args.memory,
     )
@@ -384,6 +419,7 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
         "keep_full_pool": bool(args.keep_full_pool),
         "submit": bool(args.submit),
         "env": _redact_env(args.env or []),
+        "allowed_s3_prefixes": list(parse_allowed_s3_prefixes(getattr(args, "allowed_s3_prefix", []) or [])),
     }
     config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
@@ -417,6 +453,7 @@ def cmd_supervise_workers(args: argparse.Namespace) -> int:
             heartbeat_seconds=args.heartbeat_seconds,
             task_timeout_seconds=args.task_timeout_seconds,
             env=args.env or [],
+            allowed_s3_prefixes=getattr(args, "allowed_s3_prefix", []) or [],
             vcpus=args.vcpus,
             memory=args.memory,
         )
@@ -548,6 +585,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         raise SystemExit("--ready-key must not be empty or collide with SpotBatch manifest paths")
     s3 = boto3.client("s3")
     tasks = _read_tasks_for_finalizer(args, s3)
+    _validate_unique_task_ids(tasks, context="finalizer tasks")
     artifact_dir = args.artifact_dir or Path("artifacts") / args.run_id / "finalizer"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     records_by_index: list[dict[str, Any] | None] = [None] * len(tasks)
@@ -893,13 +931,15 @@ def main() -> int:
     p.add_argument("--task-timeout-seconds", type=float, default=float(os.environ.get("SPOTBATCH_TASK_TIMEOUT_SECONDS", str(SAFE_TASK_TIMEOUT_SECONDS))), help="Default per-task command timeout when a task omits timeout_seconds")
     p.add_argument("--wait-time", type=int, default=10)
     p.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SPOTBATCH_WORK_DIR", "/tmp/spotbatch-work")))
-    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds))
+    p.add_argument("--allowed-s3-prefix", action="append", default=_env_allowed_s3_prefixes(), help="S3 prefix allowed in task payloads; repeatable. Also read from SPOTBATCH_ALLOWED_S3_PREFIXES.")
+    p.set_defaults(func=lambda a: run_worker(queue_url=a.queue_url, max_messages=a.max_messages, visibility_timeout=a.visibility_timeout, heartbeat_seconds=a.heartbeat_seconds, wait_time=a.wait_time, work_dir=a.work_dir, task_timeout_seconds=a.task_timeout_seconds, allowed_s3_prefixes=a.allowed_s3_prefix))
 
     p = sub.add_parser("enqueue-jsonl")
     p.add_argument("--queue-url", default=os.environ.get("SPOTBATCH_SQS_QUEUE_URL", ""))
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--run-id")
     p.add_argument("--artifact-dir", type=Path)
+    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Reject tasks containing S3 URIs outside this prefix; repeatable. Defaults to SPOTBATCH_ALLOWED_S3_PREFIXES when unset.")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_enqueue_jsonl)
 
@@ -930,6 +970,7 @@ def main() -> int:
     p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
+    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SPOTBATCH_ALLOWED_S3_PREFIXES to workers; repeatable.")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_submit_workers)
 
@@ -961,6 +1002,7 @@ def main() -> int:
     p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help="Default per-task command timeout to pass to workers")
     p.add_argument("--retry-attempts", type=int)
     p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
+    p.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SPOTBATCH_ALLOWED_S3_PREFIXES to workers; repeatable.")
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_supervise_workers)
 

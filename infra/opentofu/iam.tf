@@ -68,20 +68,31 @@ data "aws_iam_policy_document" "worker_policy" {
       "sqs:GetQueueAttributes",
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
-      "sqs:ChangeMessageVisibility",
-      "sqs:SendMessage"
+      "sqs:ChangeMessageVisibility"
     ]
-    resources = [aws_sqs_queue.work.arn, aws_sqs_queue.dlq.arn]
+    resources = [aws_sqs_queue.work.arn]
+  }
+
+  statement {
+    actions = [
+      "s3:ListBucket"
+    ]
+    resources = ["arn:aws:s3:::${var.worker_s3_bucket}"]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = local.worker_s3_list_prefixes
+    }
   }
 
   statement {
     actions = [
       "s3:GetObject",
       "s3:PutObject",
-      "s3:ListBucket",
-      "s3:HeadObject"
+      "s3:AbortMultipartUpload",
+      "s3:ListMultipartUploadParts"
     ]
-    resources = ["*"]
+    resources = local.worker_s3_object_resources
   }
 }
 

@@ -35,7 +35,7 @@ except ModuleNotFoundError:
 
 ClientError = _ClientError
 
-from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, cmd_derive_canary, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
+from spotbatch.cli import _auto_canary_indices, _job_log_group, _job_log_stream, _parse_index_selection, _redact_env, _supervisor_desired_workers, _validate_s3_delete_prefix, _worker_overrides, cmd_derive_canary, cmd_enqueue_jsonl, cmd_finalize, cmd_logs, cmd_s3_delete_prefix, cmd_supervise_workers
 from spotbatch.worker import task_hash
 
 
@@ -151,6 +151,50 @@ class CanaryTests(unittest.TestCase):
             self.assertEqual(manifest["selected_indices"], [1])
             self.assertEqual(manifest["expected_done_s3"], ["s3://b/r/done/t1"])
             self.assertTrue((out_dir / "dlq_probe_task.jsonl").exists())
+
+
+class EnqueueValidationTests(unittest.TestCase):
+    def test_enqueue_rejects_task_outside_allowed_s3_prefix(self) -> None:
+        task = {
+            "schema": "spotbatch.task.v1",
+            "run_id": "r1",
+            "task_id": "t0",
+            "command": [sys.executable, "-c", "pass"],
+            "done_s3": "s3://other/runs/r1/done/t0.done.json",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(queue_url="", tasks_jsonl=tasks_path, run_id=None, artifact_dir=Path(tmp) / "artifacts", allowed_s3_prefix=["s3://bucket/runs/r1"], submit=False)
+            with self.assertRaisesRegex(SystemExit, "outside allowed prefixes"):
+                cmd_enqueue_jsonl(args)
+
+    def test_enqueue_rejects_duplicate_task_ids(self) -> None:
+        tasks = [
+            {"schema": "spotbatch.task.v1", "run_id": "r1", "task_id": "dup", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/dup-a.done.json"},
+            {"schema": "spotbatch.task.v1", "run_id": "r1", "task_id": "dup", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/dup-b.done.json"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(queue_url="", tasks_jsonl=tasks_path, run_id=None, artifact_dir=Path(tmp) / "artifacts", allowed_s3_prefix=["s3://bucket/runs/r1"], submit=False)
+            with self.assertRaisesRegex(SystemExit, "duplicate task_id"):
+                cmd_enqueue_jsonl(args)
+
+    def test_worker_overrides_pass_allowed_s3_prefixes(self) -> None:
+        overrides = _worker_overrides(
+            sqs_queue_url="https://sqs.example/q",
+            messages_per_worker=1,
+            visibility_timeout=1800,
+            heartbeat_seconds=300,
+            task_timeout_seconds=3600,
+            env=[],
+            allowed_s3_prefixes=["s3://bucket/runs/r1/", "s3://bucket/runs/r2"],
+            vcpus=None,
+            memory=None,
+        )
+        env = {row["name"]: row["value"] for row in overrides["environment"]}
+        self.assertEqual(env["SPOTBATCH_ALLOWED_S3_PREFIXES"], "s3://bucket/runs/r1,s3://bucket/runs/r2")
 
 
 class FakeLogsClient:
@@ -369,6 +413,33 @@ class FinalizeTests(unittest.TestCase):
         args = types.SimpleNamespace(publish_ready=True, upload=True, ready_key="manifests/final_manifest.json")
         with self.assertRaisesRegex(SystemExit, "collide"):
             cmd_finalize(args)
+
+    def test_finalize_rejects_duplicate_task_ids(self) -> None:
+        tasks = [
+            {"run_id": "r1", "task_id": "dup", "done_s3": "s3://bucket/runs/r1/done/dup-a.done.json"},
+            {"run_id": "r1", "task_id": "dup", "done_s3": "s3://bucket/runs/r1/done/dup-b.done.json"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=1,
+                progress_interval=0,
+                write_repair_jsonl=None,
+                upload=False,
+                publish_ready=False,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                require_complete=False,
+            )
+            with patch("spotbatch.cli.boto3.client", return_value=FakeFinalizeS3()):
+                with self.assertRaisesRegex(SystemExit, "duplicate task_id"):
+                    cmd_finalize(args)
 
     def test_finalize_writes_repair_tasks_and_refuses_ready_when_incomplete(self) -> None:
         s3 = FakeFinalizeS3()

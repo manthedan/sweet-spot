@@ -38,13 +38,13 @@ Goal: tolerate duplicate delivery and concurrent execution without canonical out
 
 Goal: make the trust boundary explicit and least-privileged.
 
-- [ ] Add a versioned task model/schema for enqueue and worker validation.
-- [ ] Detect duplicate task IDs before enqueue/finalize.
-- [ ] Enforce allowed S3 input/output prefixes.
-- [ ] Narrow worker IAM to required queue and configured bucket/prefix resources.
-- [ ] Remove unused worker permissions, including unnecessary `sqs:SendMessage` and invalid `s3:HeadObject` action.
-- [ ] Consider named workload profiles (`job_type`) for common trusted commands instead of unrestricted command arrays.
-- [ ] Use separate queues/task roles for workloads with different data access.
+- [x] Add a versioned task model/schema for enqueue and worker validation.
+- [x] Detect duplicate task IDs before enqueue/finalize.
+- [x] Enforce allowed S3 input/output prefixes.
+- [x] Narrow worker IAM to required queue and configured bucket/prefix resources.
+- [x] Remove unused worker permissions, including unnecessary `sqs:SendMessage` and invalid `s3:HeadObject` action.
+- [x] Consider named workload profiles (`job_type`) for common trusted commands instead of unrestricted command arrays. Decision: keep `command` in v1 for generic trusted workloads; reserve optional `job_type` metadata for future profile enforcement.
+- [x] Use separate queues/task roles for workloads with different data access. The OpenTofu module is now least-privilege per instantiation; deploy one module instance per data-access boundary.
 
 ## Milestone 4 — live observability and diagnostics
 
