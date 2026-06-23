@@ -61,12 +61,12 @@ Goal: preserve diagnostics during Spot interruption and make operators faster.
 
 Goal: make finalization and cleanup scale and make cost claims defensible.
 
-- [ ] Stream finalizer JSONL instead of loading all tasks/records in memory.
-- [ ] Reject duplicate task IDs during finalization and repair generation.
-- [ ] Validate marker contents and output checksums during finalization.
-- [ ] Reduce HEAD-per-task cost with partitioned manifests, listings, or a durable state index.
-- [ ] Add explicit versioned-bucket cleanup mode (`--include-versions`) plus lifecycle-policy guidance.
-- [ ] Replace manual DLQ send-then-delete redrive with native SQS redrive APIs where possible.
+- [x] Stream finalizer JSONL instead of loading all tasks/records in memory.
+- [x] Reject duplicate task IDs during finalization and repair generation.
+- [x] Validate marker contents and output checksums during finalization.
+- [x] Reduce HEAD-per-task cost with partitioned manifests, listings, or a durable state index. Implemented with `--use-listing-index`, `--preload-s3-prefix`, bounded inline outputs, and complete `outputs.jsonl` / `task_status.jsonl` manifests.
+- [x] Add explicit versioned-bucket cleanup mode (`--include-versions`) plus lifecycle-policy guidance.
+- [x] Replace manual DLQ send-then-delete redrive with native SQS redrive APIs where possible. Whole-DLQ redrive uses `StartMessageMoveTask`; filtered small repairs keep manual redrive.
 
 ## Milestone 6 — reproducible production deployment
 
