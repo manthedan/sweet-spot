@@ -346,6 +346,24 @@ def instance_vcpus(ec2, instance_types: list[str]) -> dict[str, int]:
     return out
 
 
+def instance_memory_mib(ec2, instance_types: list[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for part in chunks(instance_types, 100):
+        try:
+            resp = ec2.describe_instance_types(InstanceTypes=part)
+            for it in resp.get("InstanceTypes", []):
+                out[it["InstanceType"]] = int(it["MemoryInfo"]["SizeInMiB"])
+        except ClientError:
+            for name in part:
+                try:
+                    resp = ec2.describe_instance_types(InstanceTypes=[name])
+                    for it in resp.get("InstanceTypes", []):
+                        out[it["InstanceType"]] = int(it["MemoryInfo"]["SizeInMiB"])
+                except ClientError:
+                    continue
+    return out
+
+
 def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     ap = argparse.ArgumentParser(prog=prog, description=__doc__)
     ap.add_argument("--profile", default=None)
@@ -357,6 +375,8 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     ap.add_argument("--hours", type=int, default=8)
     ap.add_argument("--bucket", default="", help="Optional canonical data bucket for locality annotation")
     ap.add_argument("--worker-vcpus", type=int, default=2)
+    ap.add_argument("--worker-memory", "--worker-memory-mib", dest="worker_memory_mib", type=int, default=0, help="Optional worker memory request in MiB for memory-aware instance packing")
+    ap.add_argument("--instance-memory-reserve-mib", type=int, default=512, help="Conservative per-instance memory reserve subtracted before Batch worker packing")
     ap.add_argument("--default-units-per-s", type=float, default=27.0, help="Fallback units/sec for one worker job")
     ap.add_argument("--observed-summaries", nargs="*", default=[], help="Local dirs/files or s3:// prefixes containing *.summary.json")
     ap.add_argument("--max-observed-files", type=int, default=5000)
@@ -375,6 +395,12 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     ap.add_argument("--s3-storage-cost-per-gb-month", type=float, default=0.023)
     ap.add_argument("--json-out", type=Path)
     args = ap.parse_args(argv)
+    if args.worker_vcpus <= 0:
+        ap.error("--worker-vcpus must be greater than 0")
+    if args.worker_memory_mib < 0:
+        ap.error("--worker-memory must be greater than or equal to 0")
+    if args.instance_memory_reserve_mib < 0:
+        ap.error("--instance-memory-reserve-mib must be greater than or equal to 0")
 
     session = boto3.Session(profile_name=args.profile)
     regions = args.regions or auto_regions(session, args.home_region)
@@ -402,7 +428,9 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         ec2 = session.client("ec2", region_name=region)
         try:
             price_map = latest_spot_prices(ec2, instance_types, start, now)
-            vcpu_map = instance_vcpus(ec2, sorted({it for it, _az in price_map}))
+            priced_instance_types = sorted({it for it, _az in price_map})
+            vcpu_map = instance_vcpus(ec2, priced_instance_types)
+            memory_map = instance_memory_mib(ec2, priced_instance_types) if args.worker_memory_mib > 0 else {}
         except Exception as exc:  # noqa: BLE001
             region_rows.append({"region": region, "ok": False, "error": repr(exc)})
             continue
@@ -434,7 +462,18 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
                 continue
             obs_it = (obs.get("by_instance_type") or {}).get(it) or {}
             lps = obs_it.get("median_units_per_s") or fallback_lps
-            packed_workers = max(1, vcpus // args.worker_vcpus)
+            vcpu_fit_workers = vcpus // args.worker_vcpus
+            if vcpu_fit_workers <= 0:
+                continue
+            memory_mib = memory_map.get(it)
+            if args.worker_memory_mib > 0 and memory_mib is None:
+                continue
+            memory_available_mib = max(0, memory_mib - args.instance_memory_reserve_mib) if memory_mib is not None else None
+            memory_fit_workers = memory_available_mib // args.worker_memory_mib if memory_available_mib is not None and args.worker_memory_mib > 0 else None
+            packed_workers = min(vcpu_fit_workers, memory_fit_workers) if memory_fit_workers is not None else vcpu_fit_workers
+            if packed_workers <= 0:
+                continue
+            packing_limiter = "memory" if memory_fit_workers is not None and memory_fit_workers < vcpu_fit_workers else "vcpu"
             units_per_hour = lps * packed_workers * 3600.0
             compute_cost_per_1m = (price / units_per_hour) * 1_000_000.0 if units_per_hour > 0 else math.nan
             noncompute_per_1m = noncompute_cost_per_1m_units(args, bucket_local=same_bucket)
@@ -452,12 +491,17 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
                     "az": az,
                     "instance_type": it,
                     "vcpus": vcpus,
+                    "memory_mib": memory_mib,
+                    "memory_available_mib": memory_available_mib,
                     "spot_hourly": price,
                     "spot_per_vcpu": price / vcpus,
                     "configuration_placement_score": score,
                     "placement_score_scope": "region_instance_type_configuration",
                     "bucket_local": same_bucket,
                     "packed_workers": packed_workers,
+                    "vcpu_fit_workers": vcpu_fit_workers,
+                    "memory_fit_workers": memory_fit_workers,
+                    "packing_limiter": packing_limiter,
                     "units_per_s_per_worker": lps,
                     "observed_n": obs_it.get("n", 0),
                     "estimated_compute_cost_per_1m_units": compute_cost_per_1m,
@@ -489,6 +533,8 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         "instance_types": instance_types,
         "target_vcpus": args.target_vcpus,
         "worker_vcpus": args.worker_vcpus,
+        "worker_memory_mib": args.worker_memory_mib,
+        "instance_memory_reserve_mib": args.instance_memory_reserve_mib,
         "observed_perf": obs,
         "cost_model": {
             "expected_replay_fraction": replay_fraction,
@@ -521,10 +567,10 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         score = placement_scores_obj.get(str(cap0)) if isinstance(placement_scores_obj, dict) else None
         print(f"{r['region']:15s} {str(r.get('bucket_local')):5s} {str(score):>5s} {r['pools']:6d}  ${r['min_per_vcpu']:.4f}   ${r['median_per_vcpu']:.4f}")
     print("\nTOP INSTANCE POOLS BY EXPECTED TOTAL $/1M UNITS")
-    print("region           az              type          cfg_score  $/hr    vcpu workers units/s compute$/1M total$/1M")
+    print("region           az              type          cfg_score  $/hr    vcpu memAvail workers limit  units/s compute$/1M total$/1M")
     for r in instance_rows[: args.top_instance_rows]:
         print(
-            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('configuration_placement_score')):>9s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_compute_cost_per_1m_units']:.3f} ${r['expected_total_cost_per_1m_units']:.3f}"
+            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('configuration_placement_score')):>9s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {str(r.get('memory_available_mib')):>8s} {r['packed_workers']:7d} {r['packing_limiter']:6s} {r['units_per_s_per_worker']:8.2f} ${r['estimated_compute_cost_per_1m_units']:.3f} ${r['expected_total_cost_per_1m_units']:.3f}"
         )
     return 0
 

@@ -29,6 +29,7 @@ All notable changes to this project are documented here. This project uses human
 - `sweetspot cancel-jobs --format table` plus `--sqs-queue-url` aliases/config defaults for enqueue workflows.
 - `sweetspot.job.v1` / `sweetspot.plan.v1` contract validation foundations with examples and stable planner reason codes.
 - Initial `sweetspot plan JOB_SPEC` command that validates the declarative job contract and emits JSON plan status/reason codes without mutating AWS resources.
+- `sweetspot scout --worker-memory` for memory-aware worker packing and cost estimates.
 
 ### Fixed
 

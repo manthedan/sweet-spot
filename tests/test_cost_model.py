@@ -70,6 +70,111 @@ class CostModelTests(unittest.TestCase):
         self.assertNotIn("placement_score", pool)
         self.assertIn("cfg_score", out.getvalue())
 
+    def test_scout_caps_packed_workers_by_memory_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = Path(tmp) / "scout.json"
+            out = io.StringIO()
+            with (
+                mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+                mock.patch("sweetspot.scout.latest_spot_prices", return_value={("c7i.2xlarge", "usw2-az1"): 0.08}),
+                mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.2xlarge": 8}),
+                mock.patch("sweetspot.scout.instance_memory_mib", return_value={"c7i.2xlarge": 8192}),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(
+                    scout.main(
+                        [
+                            "--regions",
+                            "us-west-2",
+                            "--instance-types",
+                            "c7i.2xlarge",
+                            "--worker-vcpus",
+                            "2",
+                            "--worker-memory",
+                            "4096",
+                            "--json-out",
+                            str(json_out),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(json_out.read_text())
+        pool = report["top_instance_pools"][0]
+        self.assertEqual(report["worker_memory_mib"], 4096)
+        self.assertEqual(report["instance_memory_reserve_mib"], 512)
+        self.assertEqual(pool["vcpu_fit_workers"], 4)
+        self.assertEqual(pool["memory_fit_workers"], 1)
+        self.assertEqual(pool["packed_workers"], 1)
+        self.assertEqual(pool["packing_limiter"], "memory")
+        self.assertEqual(pool["memory_mib"], 8192)
+        self.assertEqual(pool["memory_available_mib"], 7680)
+        self.assertIn("memAvail", out.getvalue())
+
+    def test_scout_skips_instances_without_memory_metadata_when_memory_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = Path(tmp) / "scout.json"
+            with (
+                mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+                mock.patch("sweetspot.scout.latest_spot_prices", return_value={("c7i.large", "usw2-az1"): 0.02}),
+                mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2}),
+                mock.patch("sweetspot.scout.instance_memory_mib", return_value={}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    scout.main(
+                        [
+                            "--regions",
+                            "us-west-2",
+                            "--instance-types",
+                            "c7i.large",
+                            "--worker-memory",
+                            "4096",
+                            "--json-out",
+                            str(json_out),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(json_out.read_text())
+        self.assertEqual(report["top_instance_pools"], [])
+
+    def test_scout_skips_instances_too_small_for_worker_vcpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = Path(tmp) / "scout.json"
+            with (
+                mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+                mock.patch(
+                    "sweetspot.scout.latest_spot_prices",
+                    return_value={
+                        ("c7i.large", "usw2-az1"): 0.01,
+                        ("c7i.2xlarge", "usw2-az1"): 0.08,
+                    },
+                ),
+                mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2, "c7i.2xlarge": 8}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    scout.main(
+                        [
+                            "--regions",
+                            "us-west-2",
+                            "--instance-types",
+                            "c7i.large",
+                            "c7i.2xlarge",
+                            "--worker-vcpus",
+                            "4",
+                            "--json-out",
+                            str(json_out),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(json_out.read_text())
+        self.assertEqual([pool["instance_type"] for pool in report["top_instance_pools"]], ["c7i.2xlarge"])
+
     def test_expected_cost_includes_replay_startup_and_noncompute(self) -> None:
         cost = expected_cost_per_1m_units(
             hourly_price=1.0,
