@@ -60,6 +60,7 @@ from sweetspot.cli import (
     cmd_s3_delete_prefix,
     cmd_supervise_workers,
     cmd_version,
+    main,
 )
 from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
@@ -74,6 +75,46 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(report["schema"], "sweetspot.version.v1")
         self.assertEqual(report["package"], "sweetspot")
         self.assertEqual(report["version"], "1.2.3")
+
+
+class QueueAliasTests(unittest.TestCase):
+    def test_submit_workers_accepts_queue_url_alias(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                self.queue_url = kwargs["QueueUrl"]
+                return {
+                    "Attributes": {
+                        "ApproximateNumberOfMessages": "3",
+                        "ApproximateNumberOfMessagesNotVisible": "0",
+                        "ApproximateNumberOfMessagesDelayed": "0",
+                    }
+                }
+
+        sqs = FakeSQS()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return object()
+            raise AssertionError(service)
+
+        argv = [
+            "sweetspot",
+            "submit-workers",
+            "--queue-url",
+            "alias-queue",
+            "--batch-job-queue",
+            "jq",
+            "--job-definition",
+            "jd",
+        ]
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+            self.assertEqual(main(), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(sqs.queue_url, "alias-queue")
+        self.assertEqual(report["backlog_used_for_sizing"], 3)
 
 
 class CanaryTests(unittest.TestCase):

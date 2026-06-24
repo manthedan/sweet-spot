@@ -15,6 +15,7 @@ All notable changes to this project are documented here. This project uses human
 - README guidance for small idempotent chunks, canary sizing, safe repair planning, and stale-message cleanup.
 - Consistent `--profile`/`--region` options for AWS-touching CLI commands.
 - `sweetspot version` command for checking the installed package version.
+- `--queue-url` alias for worker-submission commands that previously exposed only `--sqs-queue-url`.
 
 ### Fixed
 
