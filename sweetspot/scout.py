@@ -131,6 +131,8 @@ PRESETS = {
 
 SCOUT_REASON_CODES: dict[str, str] = {
     "cost_components_not_provided": "One or more optional non-compute cost components were left at zero and may be omitted from the estimate.",
+    "replay_fraction_lower_bound_only": "Receive-count telemetry proves at least one replay, but discarded compute was not observed; replay cost is a lower bound unless overridden.",
+    "replay_fraction_partially_observed": "Discarded compute telemetry was observed, but receive-count telemetry proves additional replay attempts may be missing; replay cost is a lower bound unless overridden.",
     "replay_fraction_unobserved": "Replay/interruption overhead was not observed and defaults to zero unless explicitly overridden.",
     "throughput_default_used": "No observed throughput summaries were provided, so default units/sec was used.",
 }
@@ -154,6 +156,18 @@ def pct(values: list[float], q: float) -> float:
     values = sorted(values)
     idx = min(len(values) - 1, max(0, round((len(values) - 1) * q)))
     return values[idx]
+
+
+def nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return int(parsed)
 
 
 def auto_regions(session: boto3.Session, home_region: str) -> list[str]:
@@ -270,8 +284,12 @@ def observed_perf(session: boto3.Session, refs: list[str], max_files: int) -> di
     all_vals: list[float] = []
     attempts = 0
     retry_attempts = 0
+    receive_count_observed_attempts = 0
+    max_receive_count_by_task: dict[str, int] = {}
+    discarded_compute_attempts_by_task: dict[str, int] = defaultdict(int)
     useful_compute = 0.0
     discarded_compute = 0.0
+    discarded_compute_observed_attempts = 0
     bytes_transferred = 0.0
     for js in iter_summary_jsons(session, refs, max_files):
         attempts += 1
@@ -289,23 +307,50 @@ def observed_perf(session: boto3.Session, refs: list[str], max_files: int) -> di
             inst = telemetry.get("instance_type") or ((js.get("worker_metadata") or {}).get("ec2") or {}).get("instanceType")
             if inst:
                 by_type[str(inst)].append(float(lps))
-        if telemetry.get("retry"):
+        task_identity = str(js.get("task_hash") or js.get("task_id") or js.get("done_s3") or js.get("summary_s3") or f"unknown-attempt-{attempts}")
+        receive_count = nonnegative_int(telemetry.get("receive_count"))
+        receive_count_replayed = False
+        if receive_count is not None and receive_count >= 1:
+            receive_count_observed_attempts += 1
+            receive_count_replayed = receive_count > 1
+            max_receive_count_by_task[task_identity] = max(receive_count, max_receive_count_by_task.get(task_identity, 0))
+        if telemetry.get("retry") or receive_count_replayed:
             retry_attempts += 1
         if successful_useful_attempt and isinstance(useful_sec, (int, float)):
             useful_compute += max(0.0, float(useful_sec))
         discarded = telemetry.get("discarded_compute_seconds")
         if isinstance(discarded, (int, float)):
-            discarded_compute += max(0.0, float(discarded))
+            discarded_nonnegative = max(0.0, float(discarded))
+            discarded_compute += discarded_nonnegative
+            if discarded_nonnegative > 0:
+                discarded_compute_observed_attempts += 1
+                discarded_compute_attempts_by_task[task_identity] += 1
         transferred = telemetry.get("bytes_transferred")
         if isinstance(transferred, (int, float)):
             bytes_transferred += max(0.0, float(transferred))
     observed_replay_fraction = discarded_compute / useful_compute if useful_compute > 0 else 0.0
+    receive_count_replay_lower_bound = sum(max(0, count - 1) for count in max_receive_count_by_task.values())
+    receive_count_missing_discarded_attempts = sum(max(0, max(0, receive_count - 1) - discarded_compute_attempts_by_task.get(task_identity, 0)) for task_identity, receive_count in max_receive_count_by_task.items())
+    replay_observation_status = "unobserved"
+    if attempts:
+        if receive_count_missing_discarded_attempts > 0:
+            replay_observation_status = "discarded_compute_partial_receive_count_lower_bound" if discarded_compute > 0 else "receive_count_lower_bound_only"
+        elif discarded_compute > 0:
+            replay_observation_status = "discarded_compute_observed"
+        else:
+            replay_observation_status = "no_replay_observed"
     return {
         "global_median_units_per_s": statistics.median(all_vals) if all_vals else None,
         "by_instance_type": {k: {"n": len(v), "median_units_per_s": statistics.median(v)} for k, v in sorted(by_type.items())},
         "count": len(all_vals),
         "attempt_count": attempts,
         "retry_fraction": retry_attempts / attempts if attempts else 0.0,
+        "receive_count_observed_attempts": receive_count_observed_attempts,
+        "receive_count_replay_lower_bound": receive_count_replay_lower_bound,
+        "receive_count_replay_lower_bound_fraction": receive_count_replay_lower_bound / attempts if attempts else 0.0,
+        "receive_count_missing_discarded_attempts": receive_count_missing_discarded_attempts,
+        "replay_observation_status": replay_observation_status,
+        "discarded_compute_observed_attempts": discarded_compute_observed_attempts,
         "discarded_compute_seconds": discarded_compute,
         "useful_compute_seconds": useful_compute,
         "observed_replay_fraction": observed_replay_fraction,
@@ -346,6 +391,27 @@ def scout_reasons(args: argparse.Namespace, obs: dict[str, Any]) -> list[dict[st
                 "message": SCOUT_REASON_CODES["replay_fraction_unobserved"],
             }
         )
+    if args.expected_replay_fraction is None:
+        if obs.get("replay_observation_status") == "receive_count_lower_bound_only":
+            reasons.append(
+                {
+                    "code": "replay_fraction_lower_bound_only",
+                    "severity": "warning",
+                    "message": SCOUT_REASON_CODES["replay_fraction_lower_bound_only"],
+                    "receive_count_replay_lower_bound": obs.get("receive_count_replay_lower_bound"),
+                }
+            )
+        elif obs.get("replay_observation_status") == "discarded_compute_partial_receive_count_lower_bound":
+            reasons.append(
+                {
+                    "code": "replay_fraction_partially_observed",
+                    "severity": "warning",
+                    "message": SCOUT_REASON_CODES["replay_fraction_partially_observed"],
+                    "discarded_compute_observed_attempts": obs.get("discarded_compute_observed_attempts"),
+                    "receive_count_missing_discarded_attempts": obs.get("receive_count_missing_discarded_attempts"),
+                    "receive_count_replay_lower_bound": obs.get("receive_count_replay_lower_bound"),
+                }
+            )
     omitted = omitted_cost_components(args)
     if omitted:
         reasons.append(
