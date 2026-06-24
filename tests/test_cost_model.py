@@ -41,6 +41,109 @@ class CostModelTests(unittest.TestCase):
         self.assertAlmostEqual(obs["observed_replay_fraction"], 0.2)
         self.assertEqual(obs["bytes_transferred"], 4096.0)
 
+    def test_observed_perf_uses_receive_count_as_replay_lower_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "retry.summary.json").write_text(
+                json.dumps(
+                    {
+                        "returncode": 0,
+                        "telemetry": {
+                            "completed_units": 1000,
+                            "useful_compute_seconds": 10,
+                            "receive_count": "3",
+                        },
+                    }
+                )
+            )
+            obs = observed_perf(mock.Mock(), [tmp], max_files=10)
+        self.assertEqual(obs["receive_count_observed_attempts"], 1)
+        self.assertEqual(obs["receive_count_replay_lower_bound"], 2)
+        self.assertEqual(obs["receive_count_replay_lower_bound_fraction"], 2.0)
+        self.assertEqual(obs["retry_fraction"], 1.0)
+        self.assertEqual(obs["replay_observation_status"], "receive_count_lower_bound_only")
+
+    def test_observed_perf_receive_count_lower_bound_uses_max_per_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for receive_count in (1, 2, 3):
+                Path(tmp, f"attempt-{receive_count}.summary.json").write_text(
+                    json.dumps(
+                        {
+                            "task_id": "same-task",
+                            "returncode": 0,
+                            "telemetry": {
+                                "completed_units": 1000,
+                                "useful_compute_seconds": 10,
+                                "receive_count": receive_count,
+                            },
+                        }
+                    )
+                )
+            obs = observed_perf(mock.Mock(), [tmp], max_files=10)
+        self.assertEqual(obs["receive_count_observed_attempts"], 3)
+        self.assertEqual(obs["receive_count_replay_lower_bound"], 2)
+        self.assertEqual(obs["retry_fraction"], 2 / 3)
+
+    def test_observed_perf_marks_mixed_replay_telemetry_as_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "lost.summary.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "same-task",
+                        "returncode": 0,
+                        "commit_status": "lost",
+                        "telemetry": {
+                            "completed_units": 1000,
+                            "useful_compute_seconds": 10,
+                            "discarded_compute_seconds": 10,
+                        },
+                    }
+                )
+            )
+            Path(tmp, "winner.summary.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "same-task",
+                        "returncode": 0,
+                        "telemetry": {
+                            "completed_units": 1000,
+                            "useful_compute_seconds": 10,
+                            "receive_count": 3,
+                        },
+                    }
+                )
+            )
+            obs = observed_perf(mock.Mock(), [tmp], max_files=10)
+        self.assertEqual(obs["discarded_compute_observed_attempts"], 1)
+        self.assertEqual(obs["receive_count_replay_lower_bound"], 2)
+        self.assertEqual(obs["replay_observation_status"], "discarded_compute_partial_receive_count_lower_bound")
+
+    def test_observed_perf_partial_replay_check_is_per_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "task-a-lost.summary.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "task-a",
+                        "returncode": 0,
+                        "commit_status": "lost",
+                        "telemetry": {"completed_units": 1000, "useful_compute_seconds": 10, "discarded_compute_seconds": 10},
+                    }
+                )
+            )
+            Path(tmp, "task-b-winner.summary.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "task-b",
+                        "returncode": 0,
+                        "telemetry": {"completed_units": 1000, "useful_compute_seconds": 10, "receive_count": 2},
+                    }
+                )
+            )
+            obs = observed_perf(mock.Mock(), [tmp], max_files=10)
+        self.assertEqual(obs["discarded_compute_observed_attempts"], 1)
+        self.assertEqual(obs["receive_count_replay_lower_bound"], 1)
+        self.assertEqual(obs["receive_count_missing_discarded_attempts"], 1)
+        self.assertEqual(obs["replay_observation_status"], "discarded_compute_partial_receive_count_lower_bound")
+
     def test_observed_perf_does_not_count_lost_attempts_as_useful(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "winner.summary.json").write_text(json.dumps({"returncode": 0, "telemetry": {"completed_units": 1000, "useful_compute_seconds": 10}}))
@@ -50,6 +153,69 @@ class CostModelTests(unittest.TestCase):
         self.assertEqual(obs["useful_compute_seconds"], 10.0)
         self.assertEqual(obs["discarded_compute_seconds"], 10.0)
         self.assertEqual(obs["observed_replay_fraction"], 1.0)
+
+    def test_scout_warns_when_replay_is_receive_count_lower_bound_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "retry.summary.json").write_text(
+                json.dumps(
+                    {
+                        "returncode": 0,
+                        "telemetry": {
+                            "completed_units": 1000,
+                            "useful_compute_seconds": 10,
+                            "receive_count": 2,
+                        },
+                    }
+                )
+            )
+            out = io.StringIO()
+            with (
+                mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+                mock.patch("sweetspot.scout.latest_spot_prices", return_value={("c7i.large", "usw2-az1"): 0.02}),
+                mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2}),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(scout.main(["--regions", "us-west-2", "--instance-types", "c7i.large", "--observed-summaries", tmp]), 0)
+            report = json.loads(out.getvalue())
+        reason_codes = {reason["code"] for reason in report["reasons"]}
+        self.assertIn("replay_fraction_lower_bound_only", reason_codes)
+        self.assertEqual(report["observed_perf"]["receive_count_replay_lower_bound"], 1)
+        self.assertEqual(report["observed_perf"]["replay_observation_status"], "receive_count_lower_bound_only")
+
+    def test_scout_warns_when_replay_is_partially_observed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "lost.summary.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "same-task",
+                        "returncode": 0,
+                        "commit_status": "lost",
+                        "telemetry": {"completed_units": 1000, "useful_compute_seconds": 10, "discarded_compute_seconds": 10},
+                    }
+                )
+            )
+            Path(tmp, "winner.summary.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "same-task",
+                        "returncode": 0,
+                        "telemetry": {"completed_units": 1000, "useful_compute_seconds": 10, "receive_count": 3},
+                    }
+                )
+            )
+            out = io.StringIO()
+            with (
+                mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+                mock.patch("sweetspot.scout.latest_spot_prices", return_value={("c7i.large", "usw2-az1"): 0.02}),
+                mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2}),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(scout.main(["--regions", "us-west-2", "--instance-types", "c7i.large", "--observed-summaries", tmp]), 0)
+            report = json.loads(out.getvalue())
+        self.assertIn("replay_fraction_partially_observed", {reason["code"] for reason in report["reasons"]})
+        self.assertEqual(report["observed_perf"]["replay_observation_status"], "discarded_compute_partial_receive_count_lower_bound")
 
     def test_scout_reports_placement_score_as_configuration_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
