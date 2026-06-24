@@ -217,7 +217,7 @@ class StatusTests(unittest.TestCase):
                     return FakeBatch()
                 raise AssertionError(service)
 
-        args = types.SimpleNamespace(profile="prof", region="us-west-2", queue_url="source", dlq_url="dlq", job_queue="jq", job_name_prefix="run")
+        args = types.SimpleNamespace(profile="prof", region="us-west-2", queue_url="source", dlq_url="dlq", job_queue="jq", job_name_prefix="run", format="json")
         out = io.StringIO()
         with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
             self.assertEqual(cmd_status(args), 0)
@@ -228,6 +228,15 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(report["queues"]["dlq"]["depth"]["visible"], 1)
         self.assertEqual(report["batch"]["active_count"], 1)
         self.assertEqual(report["batch"]["active_by_status"], {"RUNNING": 1})
+
+        args.format = "table"
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_status(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot status", table)
+        self.assertIn("source\t5\t2\t0\tsource", table)
+        self.assertIn("RUNNING\t1", table)
 
 
 class HelpExamplesTests(unittest.TestCase):
