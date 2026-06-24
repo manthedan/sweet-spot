@@ -281,8 +281,8 @@ sweetspot dlq \
   --native-redrive \
   --apply
 
-# read-only Spot scout
-sweetspot-scout \
+# read-only Spot scout (also available as standalone sweetspot-scout)
+sweetspot scout \
   --preset x86 \
   --regions us-west-2 us-east-2 eu-north-1 \
   --target-vcpus 256 512 \
@@ -295,7 +295,7 @@ sweetspot-scout \
 
 # multi-lane dry-run submitter; lanes with expected_total_cost_per_1m_units are allocated cheapest-first among eligible placement scores
 # If min_placement_score is set and AWS cannot return a score, the lane is ineligible unless allow_unknown_placement_score=true.
-sweetspot-lane-manager --config lanes.json
+sweetspot lane-manager --config lanes.json
 ```
 
 ## OpenTofu
