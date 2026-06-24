@@ -17,6 +17,7 @@ import boto3
 
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
+from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
@@ -269,67 +270,49 @@ def cmd_lane_manager(args: argparse.Namespace) -> int:
     return int(lane_manager.main(args.lane_manager_args, prog="sweetspot lane-manager"))
 
 
-def _format_table_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        value = json.dumps(value, sort_keys=True)
-    out: list[str] = []
-    for ch in str(value):
-        code = ord(ch)
-        if ch == "\t":
-            out.append("\\t")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif code < 32 or code == 127:
-            out.append(f"\\x{code:02x}")
-        elif 128 <= code <= 159:
-            out.append(f"\\u{code:04x}")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _print_table(title: str, headers: list[str], rows: Iterable[dict[str, Any]]) -> None:
-    print(title)
-    print("\t".join(headers))
-    for row in rows:
-        print("\t".join(_format_table_value(row.get(header)) for header in headers))
-
-
-def _print_key_values(title: str, values: dict[str, Any]) -> None:
-    print(title)
-    for key, value in values.items():
-        print(f"{key}\t{_format_table_value(value)}")
-
-
 def _print_status_table(report: dict[str, Any]) -> None:
     identity = report.get("identity") or {}
-    print("SweetSpot status")
-    print(f"checked_at\t{report.get('checked_at')}")
-    print(f"region\t{report.get('region')}")
-    print(f"account\t{identity.get('account')}")
-    print(f"arn\t{identity.get('arn')}")
+    _print_key_values(
+        "SweetSpot status",
+        {
+            "checked_at": report.get("checked_at"),
+            "region": report.get("region"),
+            "account": identity.get("account"),
+            "arn": identity.get("arn"),
+        },
+    )
     queues = report.get("queues") or {}
     if queues:
-        print("\nqueues")
-        print("name\tvisible\tnot_visible\tdelayed\tqueue_url")
+        print()
+        rows = []
         for name, queue in queues.items():
             depth = queue.get("depth") or {}
-            print(f"{name}\t{depth.get('visible', 0)}\t{depth.get('not_visible', 0)}\t{depth.get('delayed', 0)}\t{queue.get('queue_url')}")
+            rows.append(
+                {
+                    "name": name,
+                    "visible": depth.get("visible", 0),
+                    "not_visible": depth.get("not_visible", 0),
+                    "delayed": depth.get("delayed", 0),
+                    "queue_url": queue.get("queue_url"),
+                }
+            )
+        _print_table("queues", ["name", "visible", "not_visible", "delayed", "queue_url"], rows)
     batch = report.get("batch")
     if batch:
-        print("\nbatch")
-        print(f"job_queue\t{batch.get('job_queue')}")
-        print(f"job_name_prefix\t{batch.get('job_name_prefix')}")
-        print(f"active_count\t{batch.get('active_count')}")
+        print()
+        _print_key_values(
+            "batch",
+            {
+                "job_queue": batch.get("job_queue"),
+                "job_name_prefix": batch.get("job_name_prefix"),
+                "active_count": batch.get("active_count"),
+            },
+        )
         by_status = batch.get("active_by_status") or {}
         if by_status:
             print("status\tcount")
             for status, count in by_status.items():
-                print(f"{status}\t{count}")
+                print(f"{_format_table_value(status)}\t{_format_table_value(count)}")
 
 
 def cmd_status(args: argparse.Namespace) -> int:

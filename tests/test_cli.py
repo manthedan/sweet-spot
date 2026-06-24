@@ -239,7 +239,8 @@ class StatusTests(unittest.TestCase):
         table = out.getvalue()
         self.assertIn("SweetSpot status", table)
         self.assertIn("source\t5\t2\t0\tsource", table)
-        self.assertIn("RUNNING\t1", table)
+        self.assertIn("active_count\t1\nstatus\tcount\nRUNNING\t1", table)
+        self.assertNotIn("\nstatus\nstatus\tcount", table)
 
 
 class HelpExamplesTests(unittest.TestCase):
