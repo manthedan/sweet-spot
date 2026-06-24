@@ -1458,6 +1458,75 @@ def _list_matching_jobs(batch, *, job_queues: list[str], statuses: list[str], na
     return rows
 
 
+_CANCEL_JOB_STATUSES = {"SUBMITTED", "PENDING", "RUNNABLE"}
+_TERMINATE_JOB_STATUSES = {"STARTING", "RUNNING"}
+
+
+def cmd_cancel_jobs(args: argparse.Namespace) -> int:
+    if not args.job_name_regex:
+        raise SystemExit("cancel-jobs requires --job-name-regex to avoid broad cancellation")
+    if args.max_jobs <= 0:
+        raise SystemExit("--max-jobs must be positive")
+    statuses = args.status or (["SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"] if args.terminate_running else ["SUBMITTED", "PENDING", "RUNNABLE"])
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    batch = session.client("batch", region_name=args.region)
+    jobs = _list_matching_jobs(batch, job_queues=args.job_queue, statuses=statuses, name_regex=args.job_name_regex, max_jobs=args.max_jobs)
+    rows: list[dict[str, Any]] = []
+    cancelled = terminated = skipped = 0
+    for job in jobs:
+        status = str(job.get("status") or "UNKNOWN")
+        action = "skip"
+        reason = None
+        if status in _CANCEL_JOB_STATUSES:
+            action = "cancel"
+            if args.apply:
+                batch.cancel_job(jobId=str(job.get("jobId")), reason=args.reason)
+                cancelled += 1
+        elif status in _TERMINATE_JOB_STATUSES:
+            if args.terminate_running:
+                action = "terminate"
+                if args.apply:
+                    batch.terminate_job(jobId=str(job.get("jobId")), reason=args.reason)
+                    terminated += 1
+            else:
+                reason = "requires --terminate-running"
+                skipped += 1
+        else:
+            reason = "status is not cancellable"
+            skipped += 1
+        rows.append(
+            {
+                "jobId": job.get("jobId"),
+                "jobName": job.get("jobName"),
+                "jobQueue": job.get("jobQueue"),
+                "status": status,
+                "action": action,
+                "skip_reason": reason,
+            }
+        )
+    if not args.apply:
+        skipped = sum(1 for row in rows if row["action"] == "skip")
+    report = {
+        "schema": "sweetspot.cancel_jobs.v1",
+        "checked_at": iso_now(),
+        "apply": bool(args.apply),
+        "job_queues": args.job_queue,
+        "statuses": statuses,
+        "job_name_regex": args.job_name_regex,
+        "max_jobs": args.max_jobs,
+        "matched_count": len(rows),
+        "actionable_count": sum(1 for row in rows if row["action"] in {"cancel", "terminate"}),
+        "cancelled_count": cancelled,
+        "terminated_count": terminated,
+        "skipped_count": skipped,
+        "terminate_running": bool(args.terminate_running),
+        "reason": args.reason,
+        "jobs": rows,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def _record_task_ids_from_events(events: list[dict[str, Any]], task_ids: list[str]) -> None:
     for ev in events:
         task_id = _extract_task_id_from_log_message(str(ev.get("message", "")))
@@ -2179,6 +2248,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
+    "cancel-jobs": {"apply", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
     "dlq": {"apply", "dlq_url", "format", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
@@ -2298,11 +2368,13 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "publish_ready": ("--publish-ready", False),
     "queue_url": ("--queue-url", False),
     "region": ("--region", False),
+    "reason": ("--reason", False),
     "run_id": ("--run-id", False),
     "sqs_queue_url": ("--queue-url", False),
     "s3_prefix": ("--s3-prefix", True),
     "submit": ("--submit", False),
     "subtract_active": ("--subtract-active", False),
+    "terminate_running": ("--terminate-running", False),
     "target_active_workers": ("--target-active-workers", False),
     "task_count": ("--task-count", False),
     "task_status_jsonl": ("--task-status-jsonl", False),
@@ -2622,6 +2694,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-jobs", type=int, default=1000)
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_jobs)
+
+    p = _add_parser_with_examples(
+        sub,
+        "cancel-jobs",
+        help="Dry-run/apply cancellation of matching AWS Batch jobs",
+        examples="  sweetspot cancel-jobs --job-queue jq --job-name-regex '^sweetspot-worker-.*'\n  sweetspot cancel-jobs --job-queue jq --job-name-regex '^sweetspot-worker-.*' --apply",
+    )
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--job-queue", action="append", required=True, help="Batch queue to inspect; repeatable")
+    p.add_argument("--status", action="append", choices=list(ACTIVE_STATUSES), help="repeatable; default SUBMITTED/PENDING/RUNNABLE, plus STARTING/RUNNING when --terminate-running is set")
+    p.add_argument("--job-name-regex", required=True, help="required guardrail: only jobs whose names match are considered")
+    p.add_argument("--max-jobs", type=int, default=100)
+    p.add_argument("--reason", default="Cancelled by sweetspot cancel-jobs")
+    p.add_argument("--terminate-running", action="store_true", help="also terminate STARTING/RUNNING jobs instead of skipping them")
+    p.add_argument("--apply", action="store_true", help="perform cancellation/termination; default is dry-run")
+    p.set_defaults(func=cmd_cancel_jobs)
 
     p = _add_parser_with_examples(
         sub,
