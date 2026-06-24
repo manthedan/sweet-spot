@@ -130,7 +130,7 @@ For Spot, prefer many short tasks over a few long tasks. If a task cannot checkp
 
 The commands below expose SweetSpot's current operator phases. They remain useful for advanced debugging and controlled production runs, but they are not the intended long-term agent contract. SweetSpot is moving toward `sweetspot plan`, `sweetspot run`, `sweetspot status`, `sweetspot repair`, and `sweetspot cancel`, where agents provide workload intent, budget, deadline, and output locations while SweetSpot chooses shard size, resource shape, architecture, and parallelism.
 
-Until that controller is complete, treat direct sizing flags such as worker count, vCPU, memory, task timeout, shard size, and messages per worker as advanced controls that require canary evidence and dry-run review. Adaptive shard-sizing helpers now consume canary summaries internally so the future controller can grow from tiny replay-safe canaries instead of asking agents to invent chunk sizes; `sweetspot plan --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl` exposes that shard-sizing decision and production shard count in JSON without mutating AWS resources. Add `--out-production-tasks-jsonl artifacts/tasks.jsonl` to explicitly materialize calibrated `sweetspot.task.v1` production shards as a local artifact for review/enqueue. `sweetspot run JOB_SPEC` is available as a safe dry-run controller report that can persist `run_state.json` and local production task artifacts with `--artifact-dir`, but `sweetspot run --apply` is intentionally rejected until the cloud orchestration layer is implemented. `sweetspot repair RUN_ID` is the simplified repair entrypoint: it builds a run-scoped repair plan by default, and `--apply` can enqueue repair tasks after the JSON plan is reviewed. `sweetspot cancel RUN_ID` is the simplified cancellation entrypoint for run-scoped Batch job names; broader regex repair/cancellation remains available through the advanced `repair-plan` and `cancel-jobs` commands.
+Until that controller is complete, treat direct sizing flags such as worker count, vCPU, memory, task timeout, shard size, and messages per worker as advanced controls that require canary evidence and dry-run review. Adaptive shard-sizing helpers now consume canary summaries internally so the future controller can grow from tiny replay-safe canaries instead of asking agents to invent chunk sizes; `sweetspot plan --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl` exposes that shard-sizing decision and production shard count in JSON without mutating AWS resources. Add `--out-production-tasks-jsonl artifacts/tasks.jsonl` to explicitly materialize calibrated `sweetspot.task.v1` production shards as a local artifact for review/enqueue. `sweetspot run JOB_SPEC` is available as a safe dry-run controller report that can persist `run_state.json` and local production task artifacts with `--artifact-dir`, but `sweetspot run --apply` is intentionally rejected until the cloud orchestration layer is implemented. `sweetspot status RUN_ID` is the simplified status entrypoint: it summarizes local run/finalizer/repair artifacts and, when AWS flags are supplied, scopes Batch workers to `RUN_ID` by default. `sweetspot repair RUN_ID` is the simplified repair entrypoint: it builds a run-scoped repair plan by default, and `--apply` can enqueue repair tasks after the JSON plan is reviewed. `sweetspot cancel RUN_ID` is the simplified cancellation entrypoint for run-scoped Batch job names; broader regex repair/cancellation remains available through the advanced `repair-plan` and `cancel-jobs` commands.
 
 ## Recommended cost optimization workflow
 
@@ -234,7 +234,14 @@ cat > sweetspot.json <<'JSON'
 JSON
 sweetspot --config sweetspot.json submit-workers --job-name-prefix hello-001-worker
 
-# quick operator overview; JSON remains the default, table is opt-in
+# run-centric overview; JSON remains the default, table is opt-in
+sweetspot status hello-001 \
+  --artifact-dir artifacts/hello-001 \
+  --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --job-queue my-batch-spot-queue \
+  --format table
+
+# advanced operator overview without a RUN_ID is still available
 sweetspot status \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
   --job-queue my-batch-spot-queue \

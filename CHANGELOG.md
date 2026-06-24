@@ -43,6 +43,7 @@ All notable changes to this project are documented here. This project uses human
 - Adaptive canary decisions now block production shard generation with `canary_validation_failed` when canaries fail framework/output validation.
 - Initial `sweetspot run JOB_SPEC` dry-run controller report that nests the planner output, can write local run-state/task artifacts, and refuses `--apply` until AWS orchestration is implemented.
 - High-level `sweetspot cancel RUN_ID` wrapper for run-scoped Batch job cancellation with dry-run default and guarded `--apply`.
+- Run-centric `sweetspot status RUN_ID` summaries for local run/finalizer/repair artifacts, with Batch worker filtering scoped to the run by default.
 
 ### Changed
 
