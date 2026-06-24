@@ -454,7 +454,8 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
                     "vcpus": vcpus,
                     "spot_hourly": price,
                     "spot_per_vcpu": price / vcpus,
-                    "placement_score": score,
+                    "configuration_placement_score": score,
+                    "placement_score_scope": "region_instance_type_configuration",
                     "bucket_local": same_bucket,
                     "packed_workers": packed_workers,
                     "units_per_s_per_worker": lps,
@@ -476,7 +477,7 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         return float(scores.get(str(cap0)) or -1)
 
     ok_regions.sort(key=lambda r: (-region_placement_score(r), r["median_per_vcpu"], not bool(r.get("bucket_local"))))
-    instance_rows.sort(key=lambda r: (r["expected_total_cost_per_1m_units"], -(r.get("placement_score") or -1), not bool(r.get("bucket_local"))))
+    instance_rows.sort(key=lambda r: (r["expected_total_cost_per_1m_units"], -(r.get("configuration_placement_score") or -1), not bool(r.get("bucket_local"))))
 
     report = {
         "schema": "sweetspot.scout.v1",
@@ -520,10 +521,10 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         score = placement_scores_obj.get(str(cap0)) if isinstance(placement_scores_obj, dict) else None
         print(f"{r['region']:15s} {str(r.get('bucket_local')):5s} {str(score):>5s} {r['pools']:6d}  ${r['min_per_vcpu']:.4f}   ${r['median_per_vcpu']:.4f}")
     print("\nTOP INSTANCE POOLS BY EXPECTED TOTAL $/1M UNITS")
-    print("region           az              type          score  $/hr    vcpu workers units/s compute$/1M total$/1M")
+    print("region           az              type          cfg_score  $/hr    vcpu workers units/s compute$/1M total$/1M")
     for r in instance_rows[: args.top_instance_rows]:
         print(
-            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('placement_score')):>5s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_compute_cost_per_1m_units']:.3f} ${r['expected_total_cost_per_1m_units']:.3f}"
+            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('configuration_placement_score')):>9s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {r['packed_workers']:7d} {r['units_per_s_per_worker']:8.2f} ${r['estimated_compute_cost_per_1m_units']:.3f} ${r['expected_total_cost_per_1m_units']:.3f}"
         )
     return 0
 

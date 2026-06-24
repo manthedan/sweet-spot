@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sweetspot import lane_manager
+from sweetspot import lane_manager, scout
 from sweetspot.scout import expected_cost_per_1m_units, noncompute_cost_per_1m_units, observed_perf
 
 
@@ -50,6 +50,25 @@ class CostModelTests(unittest.TestCase):
         self.assertEqual(obs["useful_compute_seconds"], 10.0)
         self.assertEqual(obs["discarded_compute_seconds"], 10.0)
         self.assertEqual(obs["observed_replay_fraction"], 1.0)
+
+    def test_scout_reports_placement_score_as_configuration_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = Path(tmp) / "scout.json"
+            out = io.StringIO()
+            with (
+                mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+                mock.patch("sweetspot.scout.latest_spot_prices", return_value={("c7i.large", "usw2-az1"): 0.02}),
+                mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2}),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(scout.main(["--regions", "us-west-2", "--instance-types", "c7i.large", "--json-out", str(json_out)]), 0)
+            report = json.loads(json_out.read_text())
+        pool = report["top_instance_pools"][0]
+        self.assertEqual(pool["configuration_placement_score"], 8)
+        self.assertEqual(pool["placement_score_scope"], "region_instance_type_configuration")
+        self.assertNotIn("placement_score", pool)
+        self.assertIn("cfg_score", out.getvalue())
 
     def test_expected_cost_includes_replay_startup_and_noncompute(self) -> None:
         cost = expected_cost_per_1m_units(
