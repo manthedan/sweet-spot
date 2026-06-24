@@ -198,6 +198,55 @@ class CostModelTests(unittest.TestCase):
         self.assertEqual(report["lanes"][0]["desired_for_lane"], 2)
         self.assertEqual(report["lanes"][1]["desired_for_lane"], 1)
 
+    def test_lane_manager_uses_per_lane_instance_types_for_mixed_arch_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123/q",
+                "instance_types": ["c7i.large"],
+                "lanes": [
+                    {
+                        "name": "x86",
+                        "region": "us-west-2",
+                        "batch_job_queue": "qx86",
+                        "job_definition": "jdx86",
+                        "job_name_prefix": "x86",
+                        "max_workers": 1,
+                        "messages_per_worker": 1,
+                    },
+                    {
+                        "name": "arm",
+                        "region": "us-west-2",
+                        "instance_types": ["c7g.large", "m7g.large"],
+                        "batch_job_queue": "qarm",
+                        "job_definition": "jdarm",
+                        "job_name_prefix": "arm",
+                        "max_workers": 1,
+                        "messages_per_worker": 1,
+                    },
+                ],
+            }
+            cfg_path = Path(tmp) / "lanes.json"
+            cfg_path.write_text(json.dumps(cfg))
+            out = io.StringIO()
+            seen_instance_types = []
+
+            def fake_placement_score(_ec2_home: object, _lane: dict[str, object], instance_types: list[str], _target_vcpus: int) -> int:
+                seen_instance_types.append(instance_types)
+                return 7
+
+            with (
+                mock.patch.object(sys, "argv", ["sweetspot-lane-manager", "--config", str(cfg_path), "--target-workers", "2"]),
+                mock.patch("sweetspot.lane_manager.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+                mock.patch("sweetspot.lane_manager.queue_depth", return_value={"visible": 2, "not_visible": 0, "delayed": 0}),
+                mock.patch("sweetspot.lane_manager.placement_score", side_effect=fake_placement_score),
+                mock.patch("sweetspot.lane_manager.active_jobs", return_value=0),
+                contextlib.redirect_stdout(out),
+            ):
+                lane_manager.main()
+        report = json.loads(out.getvalue())
+        self.assertEqual(seen_instance_types, [["c7i.large"], ["c7g.large", "m7g.large"]])
+        self.assertEqual([lane["instance_types"] for lane in report["lanes"]], [["c7i.large"], ["c7g.large", "m7g.large"]])
+
 
 if __name__ == "__main__":
     unittest.main()

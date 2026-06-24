@@ -42,11 +42,11 @@ Where non-compute cost can include:
 - S3 storage
 - a caller-supplied extra cost term
 
-Observed summaries provide median units/sec by instance type plus retry/discarded-compute fractions. Operators can override the replay fraction and overhead assumptions for what-if planning.
+Observed summaries provide median units/sec by instance type plus retry/discarded-compute fractions. Operators can override the replay fraction and overhead assumptions for what-if planning. Use `sweetspot scout --preset mixed` during analysis to surface ARM/Graviton savings, but treat ARM as opt-in until a workload canary proves the image and native dependencies are compatible.
 
 ## Lane allocation
 
-`sweetspot-lane-manager` allocates eligible lanes by `expected_total_cost_per_1m_units` / `expected_cost_per_1m_units` first, then placement score, then config order. Lanes without cost annotations remain valid but are ranked after costed lanes.
+`sweetspot-lane-manager` allocates eligible lanes by `expected_total_cost_per_1m_units` / `expected_cost_per_1m_units` first, then placement score, then config order. Lanes without cost annotations remain valid but are ranked after costed lanes. Lane configs may set per-lane `instance_types`, which is useful when comparing separate x86 and ARM Batch queues without making ARM the default for unknown workloads.
 
 ## Run manifest and case study
 

@@ -22,9 +22,28 @@ Example config:
       "memory": 4096,
       "min_placement_score": 7,
       "expected_total_cost_per_1m_units": 0.42
+    },
+    {
+      "name": "us-west-2-arm",
+      "region": "us-west-2",
+      "instance_types": ["c7g.large", "m7g.large"],
+      "batch_job_queue": "arn:aws:batch:us-west-2:ACCOUNT:job-queue/sweetspot-arm-spot-queue",
+      "job_definition": "arn:aws:batch:us-west-2:ACCOUNT:job-definition/sweetspot-worker-arm64:1",
+      "job_name_prefix": "my-run-arm-worker",
+      "max_workers": 64,
+      "messages_per_worker": 4,
+      "vcpus": 2,
+      "memory": 4096,
+      "min_placement_score": 7,
+      "expected_total_cost_per_1m_units": 0.32
     }
   ]
 }
+
+Set top-level `instance_types` for homogeneous lane files. Set per-lane
+`instance_types` when one config mixes architectures or differently constrained
+Batch queues; those values are used for each lane's placement score query.
+
 """
 
 from __future__ import annotations
@@ -82,6 +101,13 @@ def placement_score(ec2_home, lane: dict[str, Any], instance_types: list[str], t
         return int(vals[0]["Score"]) if vals else None
     except ClientError:
         return None
+
+
+def lane_instance_types(cfg: dict[str, Any], lane: dict[str, Any]) -> list[str]:
+    raw = lane.get("instance_types", cfg.get("instance_types") or [])
+    if not isinstance(raw, list):
+        return []
+    return [str(x) for x in raw if str(x)]
 
 
 def lane_expected_cost(lane: dict[str, Any]) -> float | None:
@@ -147,13 +173,13 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     target_workers = min(target_workers, math.ceil(backlog / max(1, min(int(l.get("messages_per_worker", 1)) for l in lanes)))) if backlog else 0
 
     ec2_home = session.client("ec2", region_name=args.home_region)
-    instance_types = cfg.get("instance_types") or []
     scored_lanes = []
     for index, lane in enumerate(lanes):
         batch = session.client("batch", region_name=lane["region"])
         active = active_jobs(batch, lane["batch_job_queue"], lane["job_name_prefix"])
         max_workers = int(lane.get("max_workers", 0))
         lane_target_vcpus = max_workers * int(lane.get("vcpus", 2))
+        instance_types = lane_instance_types(cfg, lane)
         score = placement_score(ec2_home, lane, instance_types, lane_target_vcpus)
         min_score = int(lane.get("min_placement_score", 0))
         allow_unknown_score = bool(lane.get("allow_unknown_placement_score", False))
@@ -188,6 +214,7 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
                 "min_placement_score": min_score,
                 "allocation_order": allocation_index,
                 "expected_total_cost_per_1m_units": scored["expected_cost"],
+                "instance_types": lane_instance_types(cfg, lane),
                 "eligible": eligible,
                 "allow_unknown_placement_score": bool(scored.get("allow_unknown_score")),
                 "active": active,

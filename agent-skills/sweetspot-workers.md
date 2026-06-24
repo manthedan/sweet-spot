@@ -175,7 +175,8 @@ If `stop_reason` is `"dlq_not_empty"`, the supervisor stopped because the DLQ re
 2. **max_workers**: Start with SQS visible depth / messages_per_worker. Use `--subtract-active` to avoid oversubscription.
 3. **Spot vs On-Demand**: Use Spot queues for cheap retryable work. Use On-Demand queues for repair lanes.
 4. **timeout_seconds**: Must fit within SQS visibility timeout. Default 11h cap. Prefer much shorter tasks.
-5. **Always dry-run first**: Review `to_submit` and `raw_desired_workers` before adding `--submit`.
+5. **Architecture**: x86 is the safe default. ARM/Graviton can be cheaper, but only submit ARM workers to Batch queues/job definitions whose image and native dependencies passed an ARM canary. Do not mix x86 and ARM in one queue unless the image is verified multi-arch.
+6. **Always dry-run first**: Review `to_submit` and `raw_desired_workers` before adding `--submit`.
 
 ## Worker environment
 
@@ -211,4 +212,5 @@ Worker commands receive at runtime:
 2. **Not subtracting active workers**: If workers are already running, `submit-workers` will oversubscribe without `--subtract-active`.
 3. **No `--stop-on-dlq`**: Without this, the supervisor keeps submitting even when tasks are failing to the DLQ.
 4. **messages_per_worker too high for Spot**: If each worker processes many messages and a Spot host dies, all in-flight work is lost.
-5. **Queue URL mismatch**: The queue URL must match the one the workers poll. Double-check region and account.
+5. **Architecture mismatch**: ARM instance queues need ARM-compatible or multi-arch worker images. An x86-only image can fail immediately on Graviton even if the Spot price is attractive.
+6. **Queue URL mismatch**: The queue URL must match the one the workers poll. Double-check region and account.

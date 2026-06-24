@@ -1,0 +1,35 @@
+{
+  "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/ACCOUNT/sweetspot-work",
+  "lanes": [
+    {
+      "name": "us-west-2-x86-primary",
+      "region": "us-west-2",
+      "instance_types": ["c7i.large", "c7i.xlarge", "m7i.large", "m7i.xlarge"],
+      "batch_job_queue": "arn:aws:batch:us-west-2:ACCOUNT:job-queue/sweetspot-x86-spot-queue",
+      "job_definition": "arn:aws:batch:us-west-2:ACCOUNT:job-definition/sweetspot-worker-x86_64:1",
+      "job_name_prefix": "my-run-x86-worker",
+      "max_workers": 128,
+      "messages_per_worker": 4,
+      "vcpus": 2,
+      "memory": 4096,
+      "min_placement_score": 7,
+      "allow_unknown_placement_score": false,
+      "expected_total_cost_per_1m_units": 0.42
+    },
+    {
+      "name": "us-west-2-arm-canary-or-opt-in",
+      "region": "us-west-2",
+      "instance_types": ["c7g.large", "c7g.xlarge", "m7g.large", "m7g.xlarge"],
+      "batch_job_queue": "arn:aws:batch:us-west-2:ACCOUNT:job-queue/sweetspot-arm-spot-queue",
+      "job_definition": "arn:aws:batch:us-west-2:ACCOUNT:job-definition/sweetspot-worker-arm64:1",
+      "job_name_prefix": "my-run-arm-worker",
+      "max_workers": 64,
+      "messages_per_worker": 4,
+      "vcpus": 2,
+      "memory": 4096,
+      "min_placement_score": 7,
+      "allow_unknown_placement_score": false,
+      "expected_total_cost_per_1m_units": 0.32
+    }
+  ]
+}

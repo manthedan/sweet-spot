@@ -16,6 +16,16 @@ Invoke this skill when an agent needs to:
 - Derive a canary subset before a large run
 - Estimate runtime/cost from telemetry samples
 
+## Cost-first task design
+
+Before preparing a large Spot run, design tasks to be **small, idempotent, and cheap to replay**:
+
+1. Split large inputs into bounded shards with stable `task_id`s and deterministic output/done-marker paths.
+2. Keep per-task runtime comfortably below `timeout_seconds`; if the estimate is close to the timeout, split smaller or add checkpointing.
+3. Run a canary subset before the full enqueue.
+4. Have the worker command write `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, and `output_bytes` so `sweetspot estimate-runtime` and `sweetspot scout` can rank pools by useful work, not just hourly price.
+5. After the canary, run `sweetspot scout --preset mixed --observed-summaries ...` to surface potential ARM/Graviton savings. Use ARM only after an ARM canary proves the workload and image are compatible.
+
 ## Task schema
 
 Every task is a JSON object on its own line in a `.jsonl` file:
@@ -184,7 +194,7 @@ sweetspot enqueue-and-submit \
 }
 ```
 
-Check the `warnings` array. If it contains messages about timeout safety or Spot task length, the tasks need to be split smaller.
+Check the `warnings` array. If it contains messages about timeout safety or Spot task length, the tasks need to be split smaller before the full enqueue. The same canary summaries should be passed to `sweetspot scout --observed-summaries` so pool choice accounts for real throughput and retry/discard overhead.
 
 ## Common pitfalls
 

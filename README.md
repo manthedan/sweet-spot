@@ -126,6 +126,20 @@ A safe production loop is:
 
 For Spot, prefer many short tasks over a few long tasks. If a task cannot checkpoint or finish quickly, use an On-Demand repair lane or split it further.
 
+## Recommended cost optimization workflow
+
+Cost optimization works best when it starts before the main run, not after workers are already launched:
+
+1. Generate small, idempotent task shards that are cheap to replay after Spot interruption.
+2. Run a representative canary on the same worker image and command you plan to use in production.
+3. Have the task command write `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, and input/output byte counts.
+4. Estimate task size and timeout safety with `sweetspot estimate-runtime`.
+5. Run `sweetspot scout --preset mixed --observed-summaries ...` to compare x86 and ARM/Graviton pools by expected total cost, including replay, startup overhead, placement score, and non-compute costs.
+6. Treat ARM as opt-in: Graviton can be materially cheaper, but only use ARM lanes after a canary proves the workload, dependencies, and container image are ARM-compatible. Keep x86 as the safe default when compatibility is unknown.
+7. Feed the selected `expected_total_cost_per_1m_units` values into `sweetspot lane-manager`; it allocates cost-annotated eligible lanes cheapest-first and can keep an On-Demand repair lane for tail work.
+
+Do not mix x86 and ARM instance types in one Batch queue unless the job image is verified multi-arch and every native dependency works on both architectures. Otherwise, use separate x86 and ARM queues/job definitions and model them as separate lanes.
+
 ## CLI quickstart
 
 ```bash
@@ -308,8 +322,9 @@ sweetspot dlq \
   --apply
 
 # read-only Spot scout (also available as standalone sweetspot-scout)
+# Use --preset mixed to surface ARM/Graviton savings; deploy ARM only after a canary proves compatibility.
 sweetspot scout \
-  --preset x86 \
+  --preset mixed \
   --regions us-west-2 us-east-2 eu-north-1 \
   --target-vcpus 256 512 \
   --bucket my-data-bucket \
@@ -321,6 +336,7 @@ sweetspot scout \
 
 # multi-lane dry-run submitter; lanes with expected_total_cost_per_1m_units are allocated cheapest-first among eligible placement scores
 # If min_placement_score is set and AWS cannot return a score, the lane is ineligible unless allow_unknown_placement_score=true.
+# For mixed architecture configs, set per-lane instance_types and use architecture-specific Batch queues/job definitions.
 sweetspot lane-manager --config lanes.json
 ```
 
@@ -345,6 +361,7 @@ See `infra/opentofu/README.md`.
 
 - `docs/cost_model.md` explains worker telemetry, expected-total-cost pool ranking, and cost-aware lane allocation.
 - `examples/run_manifest.example.json` is the machine-readable shape for anonymized run/cost evidence.
+- `examples/lanes.mixed-arch.example.json` shows separate x86 and ARM/Graviton lanes with per-lane placement-score instance lists.
 - `docs/case_study_template.md` is the companion prose template for public Spot vs On-Demand comparisons when Cost Explorer data is unavailable or private.
 - `scripts/verify_release.sh` runs the local closeout checks that mirror CI-critical gates.
 - `docs/release_checklist.md` covers branch protection, action pin updates, and release/tag hygiene.

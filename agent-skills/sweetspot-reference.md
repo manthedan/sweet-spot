@@ -9,7 +9,7 @@ Master CLI reference for SweetSpot, a cost-aware AWS Batch Spot work runner for 
 
 ## When to use
 
-Invoke this skill when an agent needs to understand, reference, or execute any SweetSpot CLI command. This is the comprehensive reference covering all 21 `sweetspot` subcommands plus the standalone `sweetspot-scout` and `sweetspot-lane-manager` compatibility entry points.
+Invoke this skill when an agent needs to understand, reference, or execute any SweetSpot CLI command. This is the comprehensive reference covering all current `sweetspot` subcommands plus the standalone `sweetspot-scout` and `sweetspot-lane-manager` compatibility entry points.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ SQS task message
 ```
 
 Three console-script entry points:
-- `sweetspot` - main CLI with 21 subcommands, including nested `sweetspot scout` and `sweetspot lane-manager`
+- `sweetspot` - main CLI, including nested `sweetspot scout` and `sweetspot lane-manager`
 - `sweetspot-scout` - standalone compatibility entry point for the read-only Spot pool ranking tool
 - `sweetspot-lane-manager` - standalone compatibility entry point for the multi-region lane allocator
 
@@ -71,7 +71,7 @@ sweetspot enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url <url>
                              [--wait-for-visible-seconds 30] --submit
 ```
 
-### Canary and estimation
+### Canary, telemetry, and estimation
 ```bash
 # Derive a deterministic canary subset
 sweetspot derive-canary --tasks-jsonl tasks.jsonl --out-dir ./canary
@@ -82,6 +82,8 @@ sweetspot estimate-runtime --sample-jsonl summaries.jsonl
                            [--target-units N | --task-count N --units-per-task M]
                            [--active-workers W] [--price-per-vcpu-hour P]
 ```
+
+Use small, idempotent tasks that are cheap to replay after Spot interruption. Have canary task commands write `SWEETSPOT_METRICS_PATH` so runtime estimates and Spot scouting use observed useful throughput rather than guesswork.
 
 ### Worker submission
 ```bash
@@ -154,18 +156,22 @@ sweetspot doctor --queue-url <url> --dlq-url <dlq-url>
 
 ### Spot scouting
 ```bash
-sweetspot scout --preset x86 --regions us-west-2 us-east-2
+sweetspot scout --preset mixed --regions us-west-2 us-east-2
                --target-vcpus 256 512 --bucket my-data-bucket
                [--observed-summaries summaries/]
                [--json-out scout.json]
 # Standalone compatibility entry point also works: sweetspot-scout ...
 ```
 
+`--preset mixed` surfaces ARM/Graviton savings, but ARM is opt-in. Deploy ARM lanes only after an ARM canary proves the workload, native dependencies, and worker image are compatible; otherwise keep x86 as the safe default.
+
 ### Lane management
 ```bash
 sweetspot lane-manager --config lanes.json
 # Standalone compatibility entry point also works: sweetspot-lane-manager --config lanes.json
 ```
+
+Cost-annotated lanes are allocated cheapest-first among placement-score-eligible lanes. For mixed x86/ARM configs, use separate Batch queues/job definitions and set per-lane `instance_types` so placement-score checks match each architecture.
 
 ## Task schema (sweetspot.task.v1)
 
