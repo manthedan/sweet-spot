@@ -267,37 +267,119 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_from_optional_adaptive_inputs(
+    spec: dict[str, Any],
+    *,
+    canary_summary_jsonl: Path | None,
+    input_manifest_jsonl: Path | None,
+) -> tuple[dict[str, Any], int | None]:
+    if input_manifest_jsonl and not canary_summary_jsonl:
+        raise SystemExit("--input-manifest-jsonl requires --canary-summary-jsonl so shard counts are tied to measured canary sizing")
+    logical_unit_count = _count_jsonl_objects(input_manifest_jsonl) if input_manifest_jsonl else None
+    if canary_summary_jsonl:
+        return plan_with_adaptive_canaries(spec, _read_jsonl(canary_summary_jsonl), logical_unit_count=logical_unit_count), logical_unit_count
+    return initial_blocked_plan(spec), logical_unit_count
+
+
+def _write_production_tasks_from_plan(spec: dict[str, Any], plan: dict[str, Any], logical_unit_count: int | None, path: Path) -> int:
+    if logical_unit_count is None:
+        raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
+    decision = plan["canaries"][0]["decision"]
+    selected_units = decision.get("selected_units_per_task")
+    if not isinstance(selected_units, int):
+        raise SystemExit("adaptive shard decision is blocked; cannot write production tasks")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    task_count = 0
+    with path.open("w", encoding="utf-8") as f:
+        for task in iter_production_tasks_from_logical_unit_count(spec, logical_unit_count, selected_units):
+            f.write(json.dumps(task, sort_keys=True) + "\n")
+            task_count += 1
+    plan.setdefault("artifacts", {})["production_tasks_jsonl"] = str(path)
+    plan["artifacts"]["production_task_count"] = task_count
+    return task_count
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     try:
         spec = load_job_spec(args.job_spec)
-        if args.input_manifest_jsonl and not args.canary_summary_jsonl:
-            raise SystemExit("--input-manifest-jsonl requires --canary-summary-jsonl so shard counts are tied to measured canary sizing")
         if args.out_production_tasks_jsonl and not (args.canary_summary_jsonl and args.input_manifest_jsonl):
             raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
-        logical_unit_count = _count_jsonl_objects(args.input_manifest_jsonl) if args.input_manifest_jsonl else None
-        if args.canary_summary_jsonl:
-            plan = plan_with_adaptive_canaries(spec, _read_jsonl(args.canary_summary_jsonl), logical_unit_count=logical_unit_count)
-        else:
-            plan = initial_blocked_plan(spec)
+        plan, logical_unit_count = _plan_from_optional_adaptive_inputs(
+            spec,
+            canary_summary_jsonl=args.canary_summary_jsonl,
+            input_manifest_jsonl=args.input_manifest_jsonl,
+        )
         if args.out_production_tasks_jsonl:
-            assert logical_unit_count is not None
-            decision = plan["canaries"][0]["decision"]
-            selected_units = decision.get("selected_units_per_task")
-            if not isinstance(selected_units, int):
-                raise SystemExit("adaptive shard decision is blocked; cannot write production tasks")
-            args.out_production_tasks_jsonl.parent.mkdir(parents=True, exist_ok=True)
-            task_count = 0
-            with args.out_production_tasks_jsonl.open("w", encoding="utf-8") as f:
-                for task in iter_production_tasks_from_logical_unit_count(spec, logical_unit_count, selected_units):
-                    f.write(json.dumps(task, sort_keys=True) + "\n")
-                    task_count += 1
-            plan.setdefault("artifacts", {})["production_tasks_jsonl"] = str(args.out_production_tasks_jsonl)
-            plan["artifacts"]["production_task_count"] = task_count
+            _write_production_tasks_from_plan(spec, plan, logical_unit_count, args.out_production_tasks_jsonl)
     except PlannerSpecError as exc:
         raise SystemExit(str(exc)) from exc
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(plan, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    if args.apply:
+        raise SystemExit("sweetspot run --apply is not implemented yet; run without --apply to produce a reviewable dry-run plan")
+    try:
+        spec = load_job_spec(args.job_spec)
+        plan, logical_unit_count = _plan_from_optional_adaptive_inputs(
+            spec,
+            canary_summary_jsonl=args.canary_summary_jsonl,
+            input_manifest_jsonl=args.input_manifest_jsonl,
+        )
+        artifacts: dict[str, Any] = {}
+        tasks_path = args.out_production_tasks_jsonl
+        if tasks_path is None and args.artifact_dir and logical_unit_count is not None:
+            decision = plan.get("canaries", [{}])[0].get("decision", {})
+            if isinstance(decision, dict) and isinstance(decision.get("selected_units_per_task"), int):
+                tasks_path = args.artifact_dir / "production_tasks.jsonl"
+        if tasks_path:
+            if not (args.canary_summary_jsonl and args.input_manifest_jsonl):
+                raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
+            _write_production_tasks_from_plan(spec, plan, logical_unit_count, tasks_path)
+            artifacts["production_tasks_jsonl"] = str(tasks_path)
+            artifacts["production_task_count"] = plan.get("artifacts", {}).get("production_task_count")
+        report: dict[str, Any] = {
+            "schema": "sweetspot.run.v1",
+            "run_id": spec["run_id"],
+            "mode": "dry_run",
+            "applied": False,
+            "status": "dry_run_complete",
+            "controller": {
+                "apply_supported": False,
+                "mutations_allowed": False,
+            },
+            "plan": plan,
+            "phases": [
+                {"name": "plan", "status": "completed"},
+                {
+                    "name": "materialize_production_tasks",
+                    "status": "completed" if "production_tasks_jsonl" in artifacts else "skipped",
+                    "artifact": artifacts.get("production_tasks_jsonl"),
+                },
+                {"name": "enqueue_tasks", "status": "not_started", "requires_apply": True},
+                {"name": "submit_workers", "status": "not_started", "requires_apply": True},
+                {"name": "finalize", "status": "not_started", "requires_apply": True},
+            ],
+            "next_actions": [
+                "Review the JSON plan and any local production task artifact before mutation.",
+                "Use advanced enqueue/finalize commands for execution until sweetspot run --apply is implemented.",
+            ],
+        }
+        if artifacts:
+            report["artifacts"] = artifacts
+        if args.artifact_dir:
+            args.artifact_dir.mkdir(parents=True, exist_ok=True)
+            state_path = args.artifact_dir / "run_state.json"
+            report.setdefault("artifacts", {})["run_state_json"] = str(state_path)
+            state_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except PlannerSpecError as exc:
+        raise SystemExit(str(exc)) from exc
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -2329,6 +2411,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "jobs": {"format", "job_name_regex", "job_queue", "max_jobs", "profile", "region"},
     "logs": {"format", "job_id", "log_group", "log_stream", "profile", "region"},
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
+    "run": {"apply", "artifact_dir", "canary_summary_jsonl", "input_manifest_jsonl", "out_production_tasks_jsonl"},
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
     "status": {"dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
     "submit-workers": {
@@ -2398,6 +2481,8 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "job_name_prefix": ("--job-name-prefix", False),
     "job_name_regex": ("--job-name-regex", False),
     "job_queue": ("--job-queue", False),
+    "canary_summary_jsonl": ("--canary-summary-jsonl", False),
+    "input_manifest_jsonl": ("--input-manifest-jsonl", False),
     "log_group": ("--log-group", False),
     "log_stream": ("--log-stream", False),
     "max_jobs": ("--max-jobs", False),
@@ -2408,6 +2493,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "min_workers": ("--min-workers", False),
     "out_dir": ("--out-dir", False),
     "out_jsonl": ("--out-jsonl", False),
+    "out_production_tasks_jsonl": ("--out-production-tasks-jsonl", False),
     "output_prefix": ("--output-prefix", False),
     "prefix": ("--prefix", False),
     "profile": ("--profile", False),
@@ -2564,6 +2650,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units; with --canary-summary-jsonl, emits adaptive production shard counts")
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL; requires --canary-summary-jsonl and --input-manifest-jsonl")
     p.set_defaults(func=cmd_plan)
+
+    p = _add_parser_with_examples(
+        sub,
+        "run",
+        help="Build a dry-run controller report for a SweetSpot JobSpec without mutating AWS resources",
+        examples="  sweetspot run examples/job.x86.example.json\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1",
+    )
+    p.add_argument("job_spec", type=Path, help="Path to a sweetspot.job.v1 JSON JobSpec")
+    p.add_argument("--canary-summary-jsonl", type=Path, help="Optional local JSONL of canary worker summaries or normalized observations for adaptive shard sizing")
+    p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units for calibrated task materialization")
+    p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL")
+    p.add_argument("--artifact-dir", type=Path, help="Optional local directory for run_state.json and default production task artifacts")
+    p.add_argument("--apply", action="store_true", help="Reserved for future AWS orchestration; currently rejected so dry-run remains safe")
+    p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)
     p.add_argument("scout_args", nargs=argparse.REMAINDER)

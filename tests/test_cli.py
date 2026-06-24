@@ -59,6 +59,7 @@ from sweetspot.cli import (
     cmd_jobs,
     cmd_logs,
     cmd_repair_plan,
+    cmd_run,
     cmd_s3_delete_prefix,
     cmd_status,
     cmd_describe_job,
@@ -192,6 +193,61 @@ class PlanCommandTests(unittest.TestCase):
             summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
             with self.assertRaisesRegex(SystemExit, "requires --canary-summary-jsonl and --input-manifest-jsonl"):
                 main(["plan", "examples/job.x86.example.json", "--canary-summary-jsonl", str(summaries), "--out-production-tasks-jsonl", str(tasks_path)])
+
+
+class RunCommandTests(unittest.TestCase):
+    def test_run_emits_dry_run_controller_report_without_mutation(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["run", "examples/job.x86.example.json"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.run.v1")
+        self.assertEqual(report["run_id"], "example-x86-run")
+        self.assertEqual(report["mode"], "dry_run")
+        self.assertFalse(report["applied"])
+        self.assertFalse(report["controller"]["mutations_allowed"])
+        self.assertEqual(report["plan"]["schema"], "sweetspot.plan.v1")
+        self.assertEqual(report["phases"][0]["name"], "plan")
+        self.assertEqual(report["phases"][1]["status"], "skipped")
+
+    def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "run",
+                            "examples/job.x86.example.json",
+                            "--canary-summary-jsonl",
+                            str(summaries),
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--artifact-dir",
+                            str(artifact_dir),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            tasks_path = artifact_dir / "production_tasks.jsonl"
+            state_path = artifact_dir / "run_state.json"
+            self.assertEqual(report["artifacts"]["production_tasks_jsonl"], str(tasks_path))
+            self.assertEqual(report["artifacts"]["production_task_count"], 3)
+            self.assertEqual(report["artifacts"]["run_state_json"], str(state_path))
+            self.assertTrue(state_path.exists())
+            tasks = [json.loads(line) for line in tasks_path.read_text().splitlines()]
+        self.assertEqual([task["task_id"] for task in tasks], ["shard-000000", "shard-000001", "shard-000002"])
+
+    def test_run_apply_is_guarded_until_controller_mutation_is_implemented(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "run --apply is not implemented"):
+            cmd_run(types.SimpleNamespace(job_spec=Path("examples/job.x86.example.json"), apply=True))
 
 
 class ConfigTests(unittest.TestCase):

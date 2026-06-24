@@ -40,6 +40,7 @@ All notable changes to this project are documented here. This project uses human
 - `sweetspot plan --input-manifest-jsonl` can combine a local logical-unit manifest copy with canary sizing to report adaptive production shard counts without mutating AWS resources.
 - `sweetspot plan --out-production-tasks-jsonl` for explicitly writing calibrated production `sweetspot.task.v1` shards as a local review/enqueue artifact.
 - Adaptive canary decisions now block production shard generation with `canary_validation_failed` when canaries fail framework/output validation.
+- Initial `sweetspot run JOB_SPEC` dry-run controller report that nests the planner output, can write local run-state/task artifacts, and refuses `--apply` until AWS orchestration is implemented.
 
 ### Changed
 
