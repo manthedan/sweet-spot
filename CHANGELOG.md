@@ -46,6 +46,7 @@ All notable changes to this project are documented here. This project uses human
 - `sweetspot run JOB_SPEC --apply` kickoff/resume controller: with calibrated production tasks and an artifact directory, it persists `run_state.json`, enqueues tasks once, submits an initial run-scoped Batch worker wave once, and resumes without re-enqueueing completed phases.
 - High-level `sweetspot cancel RUN_ID` wrapper for run-scoped Batch job cancellation with dry-run default and guarded `--apply`.
 - Run-centric `sweetspot status RUN_ID` summaries for local run/finalizer/repair artifacts, with Batch worker filtering scoped to the run by default.
+- Thin `sweetspot-run` agent skill for the simplified `plan`/`run`/`status`/`repair`/`cancel` workflow, with lower-level phase commands documented as advanced/operator controls.
 
 ### Changed
 
