@@ -99,6 +99,18 @@ class PlanCommandTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "run_id"):
                 main(["plan", str(path)])
 
+    def test_plan_can_embed_adaptive_canary_summary_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["plan", "examples/job.x86.example.json", "--canary-summary-jsonl", str(summaries)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.plan.v1")
+        self.assertEqual(report["canaries"][0]["purpose"], "adaptive_shard_sizing")
+        self.assertEqual(report["canaries"][0]["decision"]["selected_units_per_task"], 3000)
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_prepopulates_required_worker_submit_flags(self) -> None:

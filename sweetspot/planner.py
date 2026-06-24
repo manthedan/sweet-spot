@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .adaptive import choose_next_shard_units
 from .s3util import parse_s3_uri
 from .task_model import SAFE_ID_RE
 
@@ -70,6 +71,58 @@ def initial_blocked_plan(job_spec: dict[str, Any]) -> dict[str, Any]:
     This deliberately does not invent worker count, shard size, vCPU, memory, or architecture choices. It gives agents stable reason codes and a validated Plan envelope while future planner phases add canary-backed execution settings.
     """
 
+    plan = _base_blocked_plan(job_spec)
+    plan["reasons"] = [
+        {
+            "code": "insufficient_telemetry",
+            "severity": "warning",
+            "message": "The planner contract is valid, but canary telemetry and adaptive sizing are not available yet.",
+        }
+    ]
+    return validate_plan(plan)
+
+
+def plan_with_adaptive_canaries(
+    job_spec: dict[str, Any],
+    canary_observations: list[dict[str, Any]],
+    *,
+    target_task_seconds: float = 300.0,
+) -> dict[str, Any]:
+    """Return a Plan envelope with an adaptive shard-sizing canary decision.
+
+    The planner still refuses to invent full execution settings, but it can expose
+    canary-backed shard-size evidence in a stable machine-readable location for
+    the future run controller.
+    """
+
+    plan = _base_blocked_plan(job_spec)
+    shard_decision = choose_next_shard_units(canary_observations, target_task_seconds=target_task_seconds)
+    if shard_decision["status"] == "blocked":
+        plan["reasons"] = [
+            {
+                "code": "memory_shape_rejected_oom",
+                "severity": "error",
+                "message": PLAN_REASON_CODES["memory_shape_rejected_oom"],
+            }
+        ]
+    else:
+        plan["reasons"] = [
+            {
+                "code": "insufficient_telemetry",
+                "severity": "warning",
+                "message": "Adaptive shard telemetry is available, but resource, architecture, and cost calibration are not complete enough to select full execution settings.",
+            }
+        ]
+    plan["canaries"] = [
+        {
+            "purpose": "adaptive_shard_sizing",
+            "decision": shard_decision,
+        }
+    ]
+    return validate_plan(plan)
+
+
+def _base_blocked_plan(job_spec: dict[str, Any]) -> dict[str, Any]:
     spec = validate_job_spec(job_spec)
     constraints = spec["constraints"]
     plan: dict[str, Any] = {
@@ -87,19 +140,13 @@ def initial_blocked_plan(job_spec: dict[str, Any]) -> dict[str, Any]:
             "completion_fraction": constraints.get("completion_fraction", 1.0),
             "architectures": constraints.get("architectures", ["x86_64"]),
         },
-        "reasons": [
-            {
-                "code": "insufficient_telemetry",
-                "severity": "warning",
-                "message": "The planner contract is valid, but canary telemetry and adaptive sizing are not available yet.",
-            }
-        ],
+        "reasons": [],
     }
     if "deadline_hours" in constraints:
         plan["constraints"]["deadline_seconds"] = constraints["deadline_hours"] * 3600
     if constraints.get("low_urgency") is True:
         plan["constraints"]["low_urgency"] = True
-    return validate_plan(plan)
+    return plan
 
 
 def validate_job_spec(spec: dict[str, Any]) -> dict[str, Any]:

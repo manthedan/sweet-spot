@@ -18,7 +18,7 @@ import boto3
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
-from .planner import PlannerSpecError, initial_blocked_plan, load_job_spec
+from .planner import PlannerSpecError, initial_blocked_plan, load_job_spec, plan_with_adaptive_canaries
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
@@ -266,8 +266,13 @@ def cmd_version(args: argparse.Namespace) -> int:
 def cmd_plan(args: argparse.Namespace) -> int:
     try:
         spec = load_job_spec(args.job_spec)
-        plan = initial_blocked_plan(spec)
+        if args.canary_summary_jsonl:
+            plan = plan_with_adaptive_canaries(spec, _read_jsonl(args.canary_summary_jsonl))
+        else:
+            plan = initial_blocked_plan(spec)
     except PlannerSpecError as exc:
+        raise SystemExit(str(exc)) from exc
+    except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     print(json.dumps(plan, indent=2, sort_keys=True))
     return 0
@@ -2532,6 +2537,7 @@ def main(argv: list[str] | None = None) -> int:
         examples="  sweetspot plan examples/job.x86.example.json\n  sweetspot plan examples/job.arm-eligible.example.json",
     )
     p.add_argument("job_spec", type=Path, help="Path to a sweetspot.job.v1 JSON JobSpec")
+    p.add_argument("--canary-summary-jsonl", type=Path, help="Optional local JSONL of canary worker summaries or normalized observations for adaptive shard sizing")
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)

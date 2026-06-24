@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from sweetspot.planner import PlannerSpecError, load_job_spec, load_plan, validate_job_spec, validate_plan
+from sweetspot.planner import PlannerSpecError, load_job_spec, load_plan, plan_with_adaptive_canaries, validate_job_spec, validate_plan
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +61,27 @@ class PlannerContractTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(PlannerSpecError, "unknown Plan reason code"):
             validate_plan(plan)
+
+    def test_plan_with_adaptive_canaries_embeds_shard_decision(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [{"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}],
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertEqual(plan["reasons"][0]["code"], "insufficient_telemetry")
+        decision = plan["canaries"][0]["decision"]
+        self.assertEqual(decision["schema"], "sweetspot.adaptive_shard_decision.v1")
+        self.assertEqual(decision["selected_units_per_task"], 3000)
+        self.assertEqual(decision["target_task_seconds"], 300.0)
+
+    def test_plan_with_adaptive_canaries_surfaces_oom_as_blocker(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [{"returncode": 137, "framework_error": "out of memory", "completed_units": 10, "elapsed_sec": 1}],
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertEqual(plan["reasons"][0]["code"], "memory_shape_rejected_oom")
+        self.assertEqual(plan["canaries"][0]["decision"]["status"], "blocked")
 
     def test_ready_plan_requires_selected_execution_settings(self) -> None:
         plan = {
