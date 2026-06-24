@@ -256,6 +256,109 @@ class HelpExamplesTests(unittest.TestCase):
 
 
 class QueueAliasTests(unittest.TestCase):
+    def test_enqueue_jsonl_accepts_sqs_queue_url_alias(self) -> None:
+        task = {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            argv = [
+                "sweetspot",
+                "enqueue-jsonl",
+                "--sqs-queue-url",
+                "alias-queue",
+                "--tasks-jsonl",
+                str(tasks_path),
+                "--allowed-s3-prefix",
+                "s3://bucket/runs/r1",
+            ]
+            out = io.StringIO()
+            with patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
+                self.assertEqual(main(), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["queue_url"], "alias-queue")
+
+    def test_enqueue_jsonl_config_accepts_sqs_queue_url_key(self) -> None:
+        task = {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            config_path = Path(tmp) / "sweetspot.json"
+            config_path.write_text(json.dumps({"enqueue-jsonl": {"sqs_queue_url": "configured-queue", "allowed_s3_prefix": ["s3://bucket/runs/r1"]}}))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--config", str(config_path), "enqueue-jsonl", "--tasks-jsonl", str(tasks_path)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["queue_url"], "configured-queue")
+
+    def test_enqueue_and_submit_accepts_sqs_queue_url_alias(self) -> None:
+        task = {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            sqs = FakePartialVisibleSQS(visible=0)
+            batch = FakeSubmitBatch()
+
+            def fake_client(service):
+                if service == "sqs":
+                    return sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            argv = [
+                "sweetspot",
+                "enqueue-and-submit",
+                "--sqs-queue-url",
+                "alias-queue",
+                "--tasks-jsonl",
+                str(tasks_path),
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--allowed-s3-prefix",
+                "s3://bucket/runs/r1",
+            ]
+            out = io.StringIO()
+            with patch.object(sys, "argv", argv), patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["queue_url"], "alias-queue")
+
+    def test_enqueue_and_submit_config_accepts_sqs_queue_url_key(self) -> None:
+        task = {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            config_path = Path(tmp) / "sweetspot.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "enqueue-and-submit": {
+                            "sqs_queue_url": "configured-queue",
+                            "allowed_s3_prefix": ["s3://bucket/runs/r1"],
+                            "batch_job_queue": "jq",
+                            "job_definition": "jd",
+                        }
+                    }
+                )
+            )
+            sqs = FakePartialVisibleSQS(visible=0)
+            batch = FakeSubmitBatch()
+
+            def fake_client(service):
+                if service == "sqs":
+                    return sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--config", str(config_path), "enqueue-and-submit", "--tasks-jsonl", str(tasks_path)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["queue_url"], "configured-queue")
+
     def test_submit_workers_accepts_queue_url_alias(self) -> None:
         class FakeSQS:
             def get_queue_attributes(self, **kwargs):
@@ -954,6 +1057,30 @@ class CancelJobsTests(unittest.TestCase):
         self.assertEqual(report["skipped_count"], 1)
         self.assertEqual(batch.cancelled, [])
         self.assertEqual(batch.terminated, [])
+
+    def test_cancel_jobs_table_output_lists_matches(self) -> None:
+        batch = FakeCancelBatch()
+        args = types.SimpleNamespace(
+            profile=None,
+            region=None,
+            job_queue=["jq"],
+            status=["PENDING", "RUNNING"],
+            job_name_regex="run-",
+            max_jobs=10,
+            apply=False,
+            terminate_running=False,
+            reason="test reason",
+            format="table",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeCancelSession(batch)), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_cancel_jobs(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot cancel-jobs", table)
+        self.assertIn("matched_count\t2", table)
+        self.assertIn("jobs", table)
+        self.assertIn("pending-1\trun-pending-worker\tjq\tPENDING\tcancel", table)
+        self.assertIn("running-1\trun-running-worker\tjq\tRUNNING\tskip\trequires --terminate-running", table)
 
     def test_cancel_jobs_apply_cancels_and_terminates_only_when_requested(self) -> None:
         batch = FakeCancelBatch()
