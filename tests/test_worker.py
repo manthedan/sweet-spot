@@ -42,6 +42,29 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(meta["worker_memory_mib"], 8192.0)
         self.assertEqual(meta["architecture"], "x86_64")
 
+    def test_worker_runtime_metadata_detects_instance_type_from_imds(self) -> None:
+        def fake_imds(path: str, _env: dict[str, str], _metadata_uri: str) -> str | None:
+            return {"instance-type": "c7i.large", "placement/availability-zone": "us-west-2b"}.get(path)
+
+        with mock.patch("sweetspot.worker._imds_text", side_effect=fake_imds):
+            meta = _worker_runtime_metadata({"AWS_BATCH_JOB_ID": "job-1"})
+        self.assertEqual(meta["instance_type"], "c7i.large")
+        self.assertEqual(meta["availability_zone"], "us-west-2b")
+        self.assertEqual(meta["region"], "us-west-2")
+
+    def test_worker_runtime_metadata_does_not_call_imds_when_env_has_metadata(self) -> None:
+        with mock.patch("sweetspot.worker._imds_text") as imds_text:
+            meta = _worker_runtime_metadata(
+                {
+                    "AWS_BATCH_JOB_ID": "job-1",
+                    "SWEETSPOT_INSTANCE_TYPE": "c7i.large",
+                    "SWEETSPOT_AVAILABILITY_ZONE": "us-west-2b",
+                }
+            )
+        imds_text.assert_not_called()
+        self.assertEqual(meta["instance_type"], "c7i.large")
+        self.assertEqual(meta["availability_zone"], "us-west-2b")
+
     def test_worker_resource_request_converts_ecs_cpu_units(self) -> None:
         request = _worker_resource_request({}, {"Limits": {"CPU": 4096, "Memory": 8192}})
         self.assertEqual(request["worker_vcpus"], 4.0)
