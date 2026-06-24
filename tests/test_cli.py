@@ -47,6 +47,7 @@ from sweetspot.cli import (
     _supervisor_desired_workers,
     _validate_s3_delete_prefix,
     _worker_overrides,
+    cmd_cancel_jobs,
     cmd_cleanup_stale_messages,
     cmd_derive_canary,
     cmd_dlq,
@@ -883,6 +884,103 @@ class FakeRepairSession:
         if service == "logs":
             return FakeRepairLogs()
         raise AssertionError(service)
+
+
+class FakeCancelPaginator:
+    def __init__(self, jobs_by_status):
+        self.jobs_by_status = jobs_by_status
+
+    def paginate(self, **kwargs):
+        yield {"jobSummaryList": self.jobs_by_status.get(kwargs["jobStatus"], [])}
+
+
+class FakeCancelBatch:
+    def __init__(self) -> None:
+        self.jobs_by_status = {
+            "PENDING": [{"jobId": "pending-1", "jobName": "run-pending-worker"}],
+            "RUNNING": [{"jobId": "running-1", "jobName": "run-running-worker"}],
+        }
+        self.cancelled: list[dict[str, str]] = []
+        self.terminated: list[dict[str, str]] = []
+
+    def get_paginator(self, name):
+        self.assert_name = name
+        return FakeCancelPaginator(self.jobs_by_status)
+
+    def describe_jobs(self, *, jobs):
+        status_by_id = {"pending-1": "PENDING", "running-1": "RUNNING"}
+        return {"jobs": [{"jobId": job_id, "jobName": f"run-{job_id.split('-')[0]}-worker", "jobQueue": "jq", "status": status_by_id[job_id]} for job_id in jobs]}
+
+    def cancel_job(self, *, jobId: str, reason: str) -> None:
+        self.cancelled.append({"jobId": jobId, "reason": reason})
+
+    def terminate_job(self, *, jobId: str, reason: str) -> None:
+        self.terminated.append({"jobId": jobId, "reason": reason})
+
+
+class FakeCancelSession:
+    def __init__(self, batch: FakeCancelBatch) -> None:
+        self.batch = batch
+
+    def client(self, service: str, region_name=None):
+        if service == "batch":
+            return self.batch
+        raise AssertionError(service)
+
+
+class CancelJobsTests(unittest.TestCase):
+    def test_cancel_jobs_dry_run_lists_without_mutating(self) -> None:
+        batch = FakeCancelBatch()
+        args = types.SimpleNamespace(
+            profile=None,
+            region=None,
+            job_queue=["jq"],
+            status=["PENDING", "RUNNING"],
+            job_name_regex="run-",
+            max_jobs=10,
+            apply=False,
+            terminate_running=False,
+            reason="test reason",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeCancelSession(batch)), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_cancel_jobs(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["matched_count"], 2)
+        self.assertEqual(report["actionable_count"], 1)
+        self.assertEqual(report["cancelled_count"], 0)
+        self.assertEqual(report["terminated_count"], 0)
+        self.assertEqual(report["skipped_count"], 1)
+        self.assertEqual(batch.cancelled, [])
+        self.assertEqual(batch.terminated, [])
+
+    def test_cancel_jobs_apply_cancels_and_terminates_only_when_requested(self) -> None:
+        batch = FakeCancelBatch()
+        args = types.SimpleNamespace(
+            profile=None,
+            region=None,
+            job_queue=["jq"],
+            status=None,
+            job_name_regex="run-",
+            max_jobs=10,
+            apply=True,
+            terminate_running=True,
+            reason="test reason",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeCancelSession(batch)), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_cancel_jobs(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["statuses"], ["SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"])
+        self.assertEqual(report["cancelled_count"], 1)
+        self.assertEqual(report["terminated_count"], 1)
+        self.assertEqual(batch.cancelled, [{"jobId": "pending-1", "reason": "test reason"}])
+        self.assertEqual(batch.terminated, [{"jobId": "running-1", "reason": "test reason"}])
+
+    def test_cancel_jobs_requires_name_regex_guardrail(self) -> None:
+        args = types.SimpleNamespace(job_name_regex="", max_jobs=10)
+        with self.assertRaisesRegex(SystemExit, "job-name-regex"):
+            cmd_cancel_jobs(args)
 
 
 class FakePaginatedRepairSession:

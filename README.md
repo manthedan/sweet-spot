@@ -121,7 +121,8 @@ A safe production loop is:
 3. enqueue and submit in one command with `sweetspot enqueue-and-submit --wait-for-visible-seconds ...` to avoid SQS approximate-depth races;
 4. finalize to produce `task_status.jsonl` and `repair_tasks.jsonl`;
 5. build repairs with `sweetspot repair-plan`, excluding tasks already owned by active workers;
-6. dry-run then apply `sweetspot cleanup-stale-messages` for visible duplicate messages whose done markers already exist.
+6. dry-run guarded `sweetspot cancel-jobs` before stopping any matching Batch jobs;
+7. dry-run then apply `sweetspot cleanup-stale-messages` for visible duplicate messages whose done markers already exist.
 
 For Spot, prefer many short tasks over a few long tasks. If a task cannot checkpoint or finish quickly, use an On-Demand repair lane or split it further.
 
@@ -265,6 +266,13 @@ sweetspot repair-plan \
   --out-jsonl artifacts/hello-001/repair_safe.jsonl \
   --job-queue my-batch-spot-queue \
   --job-name-regex hello-001-worker
+
+# dry-run matching Batch job cancellation; add --apply only after reviewing the JSON report
+sweetspot cancel-jobs \
+  --job-queue my-batch-spot-queue \
+  --job-name-regex '^hello-001-worker' \
+  --status RUNNABLE \
+  --status PENDING
 
 # dry-run stale duplicate cleanup; add --apply only after reviewing counts/examples
 sweetspot cleanup-stale-messages \
