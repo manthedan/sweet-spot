@@ -1,0 +1,17 @@
+{
+  "schema": "sweetspot.job.v1",
+  "run_id": "example-low-urgency-run",
+  "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "command": ["python", "/app/process_manifest_item.py"],
+  "input_manifest": "s3://my-bucket/inputs/items.jsonl",
+  "output_prefix": "s3://my-bucket/runs/example-low-urgency-run",
+  "constraints": {
+    "max_cost_usd": 20,
+    "low_urgency": true,
+    "completion_fraction": 1.0,
+    "architectures": ["x86_64"]
+  },
+  "validation": {
+    "output_check": "done_marker"
+  }
+}

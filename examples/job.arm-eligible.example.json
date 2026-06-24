@@ -1,0 +1,17 @@
+{
+  "schema": "sweetspot.job.v1",
+  "run_id": "example-arm-eligible-run",
+  "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "command": ["python", "/app/process_manifest_item.py"],
+  "input_manifest": "s3://my-bucket/inputs/items.jsonl",
+  "output_prefix": "s3://my-bucket/runs/example-arm-eligible-run",
+  "constraints": {
+    "max_cost_usd": 50,
+    "deadline_hours": 6,
+    "completion_fraction": 1.0,
+    "architectures": ["x86_64", "arm64"]
+  },
+  "validation": {
+    "output_check": "done_marker"
+  }
+}

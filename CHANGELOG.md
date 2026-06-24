@@ -27,6 +27,7 @@ All notable changes to this project are documented here. This project uses human
 - Guarded `sweetspot cancel-jobs` command with dry-run default, `--apply`, and explicit `--terminate-running` for active Batch jobs.
 - Mixed-architecture cost guidance, including opt-in ARM/Graviton scouting docs, per-lane lane-manager instance type overrides, and a mixed x86/ARM lane example.
 - `sweetspot cancel-jobs --format table` plus `--sqs-queue-url` aliases/config defaults for enqueue workflows.
+- `sweetspot.job.v1` / `sweetspot.plan.v1` contract validation foundations with examples and stable planner reason codes.
 
 ### Fixed
 

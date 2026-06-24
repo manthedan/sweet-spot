@@ -1,0 +1,31 @@
+{
+  "schema": "sweetspot.plan.v1",
+  "run_id": "example-x86-run",
+  "status": "ready",
+  "reasons": [
+    {
+      "code": "using_conservative_defaults",
+      "severity": "info",
+      "message": "No measured canary telemetry was supplied, so the planner used conservative defaults."
+    }
+  ],
+  "selected": {
+    "region": "us-west-2",
+    "architecture": "x86_64",
+    "vcpus": 2,
+    "memory_mib": 4096,
+    "target_task_seconds": 300,
+    "estimated_workers": 20
+  },
+  "constraints": {
+    "max_cost_usd": 50,
+    "deadline_seconds": 21600,
+    "completion_fraction": 1.0
+  },
+  "estimates": {
+    "expected_cost_usd": 31.25,
+    "p10_units_per_second_per_worker": 1.2,
+    "expected_wall_seconds": 18000
+  },
+  "canaries": []
+}
