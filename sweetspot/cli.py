@@ -1743,8 +1743,13 @@ def _job_task_ids_from_logs(session, *, jobs: list[dict[str, Any]], region: str 
     return out
 
 
-def cmd_repair_plan(args: argparse.Namespace) -> int:
+def _repair_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     tasks = _read_jsonl(args.tasks_jsonl)
+    expected_run_id = getattr(args, "run_id", None)
+    if expected_run_id:
+        wrong_run_tasks = [str(task.get("task_id") or "<missing-task-id>") for task in tasks if task.get("run_id") != expected_run_id]
+        if wrong_run_tasks:
+            raise SystemExit(f"repair RUN_ID requires every task to have run_id={expected_run_id!r}; mismatched task_ids: {wrong_run_tasks[:10]}")
     task_by_id = {str(task.get("task_id")): task for task in tasks if task.get("task_id")}
     if len(task_by_id) != len(tasks):
         raise SystemExit("repair-plan requires every task to have a unique non-empty task_id")
@@ -1752,6 +1757,8 @@ def cmd_repair_plan(args: argparse.Namespace) -> int:
     state_counts: Counter[str] = Counter()
     for rec in _iter_jsonl(args.task_status_jsonl):
         task_id = str(rec.get("task_id") or "")
+        if expected_run_id and rec.get("run_id") is not None and rec.get("run_id") != expected_run_id:
+            raise SystemExit(f"repair RUN_ID requires task_status records to match run_id={expected_run_id!r}; mismatched task_id: {task_id or '<missing-task-id>'}")
         state = str(rec.get("state") or "unknown")
         state_counts[state] += 1
         if task_id and state != "done":
@@ -1779,7 +1786,7 @@ def cmd_repair_plan(args: argparse.Namespace) -> int:
     ordered_repair_ids = [str(task.get("task_id")) for task in tasks if str(task.get("task_id")) in repair_ids]
     args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     args.out_jsonl.write_text("".join(json.dumps(task_by_id[task_id], sort_keys=True) + "\n" for task_id in ordered_repair_ids))
-    report = {
+    return {
         "schema": "sweetspot.repair_plan.v1",
         "checked_at": iso_now(),
         "tasks_jsonl": str(args.tasks_jsonl),
@@ -1799,6 +1806,108 @@ def cmd_repair_plan(args: argparse.Namespace) -> int:
         "blocked_active_task_ids": sorted(blocked_active)[:1000],
         "only_known_failed": bool(args.only_known_failed),
         "include_active": bool(args.include_active),
+    }
+
+
+def cmd_repair_plan(args: argparse.Namespace) -> int:
+    print(json.dumps(_repair_plan_report(args), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    artifact_dir = args.artifact_dir or Path("artifacts") / args.run_id / "repair"
+    repair_jsonl = args.out_jsonl or artifact_dir / "repair_tasks.jsonl"
+    if args.job_name_prefix and args.run_id not in args.job_name_prefix:
+        raise SystemExit("repair --job-name-prefix must include RUN_ID; use repair-plan for advanced broad matching")
+    repair_args = argparse.Namespace(
+        active_status=args.active_status,
+        failed_status=args.failed_status,
+        include_active=args.include_active,
+        job_name_regex=_run_scoped_job_name_regex(args.run_id, args.job_name_prefix),
+        job_queue=args.job_queue,
+        log_group=args.log_group,
+        log_tail=args.log_tail,
+        max_jobs=args.max_jobs,
+        only_known_failed=args.only_known_failed,
+        out_jsonl=repair_jsonl,
+        profile=args.profile,
+        region=args.region,
+        run_id=args.run_id,
+        task_status_jsonl=args.task_status_jsonl,
+        tasks_jsonl=args.tasks_jsonl,
+    )
+    repair_plan = _repair_plan_report(repair_args)
+    repair_tasks = _read_jsonl(repair_jsonl)
+    allowed_s3_prefixes = parse_allowed_s3_prefixes(getattr(args, "allowed_s3_prefix", None) or _env_allowed_s3_prefixes())
+    _validate_tasks_for_enqueue(repair_tasks, allowed_s3_prefixes=allowed_s3_prefixes)
+    sent = 0
+    submitted: list[dict[str, Any]] = []
+    queue_depth_after: dict[str, int] | None = None
+    active_matching_workers: list[dict[str, Any]] = []
+    to_submit = 0
+    raw_desired_workers = 0
+    if args.apply:
+        if not args.sqs_queue_url:
+            raise SystemExit("repair --apply requires --sqs-queue-url")
+        if args.submit_workers:
+            if not args.batch_job_queue or not args.job_definition:
+                raise SystemExit("repair --submit-workers requires --batch-job-queue and --job-definition")
+            try:
+                validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        session = boto3.Session(profile_name=args.profile, region_name=args.region)
+        sqs = session.client("sqs", region_name=args.region)
+        sent = _send_tasks_to_sqs(sqs, queue_url=args.sqs_queue_url, tasks=repair_tasks)
+        queue_depth_after = queue_depth(sqs, args.sqs_queue_url)
+        raw_desired_workers = desired_worker_count(sent, args.messages_per_worker, args.min_workers, args.max_workers)
+        if args.submit_workers:
+            batch = session.client("batch", region_name=args.region)
+            worker_prefix = args.worker_job_name_prefix or f"{args.run_id}-repair-worker"
+            active_matching_workers = active_jobs(batch, args.batch_job_queue, worker_prefix) if args.subtract_active else []
+            to_submit = max(0, raw_desired_workers - len(active_matching_workers)) if args.subtract_active else raw_desired_workers
+            to_submit = min(to_submit, args.max_workers)
+            overrides = _worker_overrides(
+                sqs_queue_url=args.sqs_queue_url,
+                messages_per_worker=args.messages_per_worker,
+                visibility_timeout=args.visibility_timeout,
+                heartbeat_seconds=args.heartbeat_seconds,
+                task_timeout_seconds=args.task_timeout_seconds,
+                env=args.env or [],
+                allowed_s3_prefixes=allowed_s3_prefixes,
+                log_tail_bytes=args.log_tail_bytes,
+                max_log_bytes=args.max_log_bytes,
+                redact_regexes=args.redact_regex or [],
+                allow_legacy_done_markers=bool(args.allow_legacy_done_markers),
+                vcpus=args.vcpus,
+                memory=args.memory,
+            )
+            if to_submit > 0:
+                submitted = _submit_worker_jobs(
+                    batch,
+                    count=to_submit,
+                    job_name_prefix=worker_prefix,
+                    batch_job_queue=args.batch_job_queue,
+                    job_definition=args.job_definition,
+                    overrides=overrides,
+                    retry_attempts=args.retry_attempts,
+                )
+    report = {
+        "schema": "sweetspot.repair.v1",
+        "checked_at": iso_now(),
+        "run_id": args.run_id,
+        "apply": bool(args.apply),
+        "sqs_queue_url": args.sqs_queue_url,
+        "repair_plan": repair_plan,
+        "repair_task_count": repair_plan["repair_task_count"],
+        "sent": sent,
+        "submit_workers": bool(args.submit_workers),
+        "raw_desired_workers": raw_desired_workers,
+        "to_submit": to_submit,
+        "submitted_count": len(submitted),
+        "submitted": submitted,
+        "active_matching_workers": len(active_matching_workers),
+        "queue_depth_after": queue_depth_after,
     }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -2458,6 +2567,38 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "describe-job": {"format", "job_id", "profile", "region"},
     "jobs": {"format", "job_name_regex", "job_queue", "max_jobs", "profile", "region"},
     "logs": {"format", "job_id", "log_group", "log_stream", "profile", "region"},
+    "repair": {
+        "active_status",
+        "allow_legacy_done_markers",
+        "allowed_s3_prefix",
+        "apply",
+        "artifact_dir",
+        "batch_job_queue",
+        "failed_status",
+        "heartbeat_seconds",
+        "include_active",
+        "job_definition",
+        "job_name_prefix",
+        "job_queue",
+        "log_group",
+        "max_jobs",
+        "max_workers",
+        "memory",
+        "messages_per_worker",
+        "min_workers",
+        "only_known_failed",
+        "out_jsonl",
+        "profile",
+        "region",
+        "sqs_queue_url",
+        "submit_workers",
+        "subtract_active",
+        "task_status_jsonl",
+        "tasks_jsonl",
+        "vcpus",
+        "visibility_timeout",
+        "worker_job_name_prefix",
+    },
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
     "run": {"apply", "artifact_dir", "canary_summary_jsonl", "input_manifest_jsonl", "out_production_tasks_jsonl"},
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
@@ -2513,6 +2654,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
 }
 
 CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
+    "active_status": ("--active-status", True),
     "active_workers": ("--active-workers", False),
     "allowed_s3_prefix": ("--allowed-s3-prefix", True),
     "apply": ("--apply", False),
@@ -2521,8 +2663,10 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "batch_job_queue": ("--batch-job-queue", False),
     "dlq_url": ("--dlq-url", False),
     "dry_run": ("--dry-run", False),
+    "failed_status": ("--failed-status", True),
     "format": ("--format", False),
     "heartbeat_seconds": ("--heartbeat-seconds", False),
+    "include_active": ("--include-active", False),
     "include_not_visible": ("--include-not-visible", False),
     "job_definition": ("--job-definition", False),
     "job_id": ("--job-id", False),
@@ -2539,6 +2683,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "memory": ("--memory", False),
     "messages_per_worker": ("--messages-per-worker", False),
     "min_workers": ("--min-workers", False),
+    "only_known_failed": ("--only-known-failed", False),
     "out_dir": ("--out-dir", False),
     "out_jsonl": ("--out-jsonl", False),
     "out_production_tasks_jsonl": ("--out-production-tasks-jsonl", False),
@@ -2554,6 +2699,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "s3_prefix": ("--s3-prefix", True),
     "submit": ("--submit", False),
     "subtract_active": ("--subtract-active", False),
+    "submit_workers": ("--submit-workers", False),
     "terminate_running": ("--terminate-running", False),
     "target_active_workers": ("--target-active-workers", False),
     "task_count": ("--task-count", False),
@@ -2566,6 +2712,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "min_prefix_chars": ("--min-prefix-chars", False),
     "vcpus": ("--vcpus", False),
     "visibility_timeout": ("--visibility-timeout", False),
+    "worker_job_name_prefix": ("--worker-job-name-prefix", False),
 }
 
 
@@ -2738,6 +2885,41 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reason")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_cancel)
+
+    p = _add_parser_with_examples(
+        sub,
+        "repair",
+        help="Dry-run/apply run-scoped repair planning and optional repair-task enqueueing",
+        examples="  sweetspot repair example-run --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --job-queue jq\n  sweetspot repair example-run --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --job-queue jq --sqs-queue-url https://sqs... --apply",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--tasks-jsonl", type=Path, required=True)
+    p.add_argument("--task-status-jsonl", type=Path, required=True)
+    p.add_argument("--out-jsonl", type=Path)
+    p.add_argument("--artifact-dir", type=Path)
+    p.add_argument("--job-queue", action="append", required=True, help="Batch queue to inspect for active/failed jobs; repeatable")
+    p.add_argument("--job-name-prefix", help="Run-scoped Batch job-name prefix to inspect; must include RUN_ID. Defaults to RUN_ID.")
+    p.add_argument("--active-status", action="append", choices=list(ACTIVE_STATUSES), help="active statuses to exclude; default all active statuses")
+    p.add_argument("--failed-status", action="append", choices=["FAILED"], help="failed statuses to classify; default FAILED")
+    p.add_argument("--include-active", action="store_true", help="unsafe: include missing tasks even if logs show an active job owns them")
+    p.add_argument("--only-known-failed", action="store_true", help="repair only missing tasks observed in failed job logs")
+    p.add_argument("--log-group")
+    p.add_argument("--log-tail", type=int, default=50000, help="maximum task-id CloudWatch log events to collect from each matching job stream")
+    p.add_argument("--max-jobs", type=int, default=1000)
+    p.add_argument("--sqs-queue-url", "--queue-url", dest="sqs_queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""), help="SQS queue for repair tasks when --apply is set")
+    p.add_argument("--apply", action="store_true", help="enqueue repair tasks; default is dry-run")
+    p.add_argument("--submit-workers", action="store_true", help="after enqueueing, submit Batch workers sized to repair-task count")
+    p.add_argument("--batch-job-queue")
+    p.add_argument("--job-definition")
+    p.add_argument("--worker-job-name-prefix", help="Batch job-name prefix for submitted repair workers; defaults to RUN_ID-repair-worker")
+    p.add_argument("--messages-per-worker", type=int, default=1)
+    p.add_argument("--max-workers", type=int, default=64)
+    p.add_argument("--min-workers", type=int, default=0)
+    p.add_argument("--subtract-active", action="store_true")
+    _add_worker_runtime_args(p, legacy_done_markers_help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to repair workers")
+    p.set_defaults(func=cmd_repair)
 
     p = _add_parser_with_examples(
         sub,

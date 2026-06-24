@@ -59,6 +59,7 @@ from sweetspot.cli import (
     cmd_finalize,
     cmd_jobs,
     cmd_logs,
+    cmd_repair,
     cmd_repair_plan,
     cmd_run,
     cmd_s3_delete_prefix,
@@ -1178,6 +1179,49 @@ class FakeRepairSession:
         raise AssertionError(service)
 
 
+class FakeRepairApplySQS:
+    def __init__(self) -> None:
+        self.sent_messages: list[str] = []
+
+    def send_message_batch(self, *, QueueUrl: str, Entries: list[dict[str, str]]):
+        self.sent_messages.extend(entry["MessageBody"] for entry in Entries)
+        return {"Successful": [{"Id": entry["Id"]} for entry in Entries]}
+
+    def get_queue_attributes(self, *, QueueUrl: str, AttributeNames: list[str]):
+        return {
+            "Attributes": {
+                "ApproximateNumberOfMessages": str(len(self.sent_messages)),
+                "ApproximateNumberOfMessagesNotVisible": "0",
+                "ApproximateNumberOfMessagesDelayed": "0",
+            }
+        }
+
+
+class FakeRepairApplyBatch(FakeRepairBatch):
+    def __init__(self) -> None:
+        self.submitted: list[dict[str, object]] = []
+
+    def submit_job(self, **kwargs):
+        self.submitted.append(kwargs)
+        return {"jobId": f"submitted-{len(self.submitted)}", "jobArn": f"arn:aws:batch:::job/submitted-{len(self.submitted)}"}
+
+
+class FakeRepairApplySession:
+    def __init__(self, sqs: FakeRepairApplySQS, batch: FakeRepairApplyBatch) -> None:
+        self.sqs = sqs
+        self.batch = batch
+        self.logs = FakeRepairLogs()
+
+    def client(self, service: str, region_name=None):
+        if service == "batch":
+            return self.batch
+        if service == "logs":
+            return self.logs
+        if service == "sqs":
+            return self.sqs
+        raise AssertionError(service)
+
+
 class FakeCancelPaginator:
     def __init__(self, jobs_by_status):
         self.jobs_by_status = jobs_by_status
@@ -1383,6 +1427,19 @@ class FakePaginatedRepairSession:
 
 
 class RepairPlanTests(unittest.TestCase):
+    def _write_repair_inputs(self, tmp: str) -> tuple[Path, Path, Path]:
+        tasks = [
+            {"schema": "sweetspot.task.v1", "run_id": "run", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t0"},
+            {"schema": "sweetspot.task.v1", "run_id": "run", "task_id": "t1", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t1"},
+        ]
+        statuses = [{"task_id": "t0", "state": "incomplete"}, {"task_id": "t1", "state": "incomplete"}]
+        tasks_path = Path(tmp) / "tasks.jsonl"
+        status_path = Path(tmp) / "status.jsonl"
+        out_path = Path(tmp) / "repair.jsonl"
+        tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+        status_path.write_text("".join(json.dumps(s) + "\n" for s in statuses))
+        return tasks_path, status_path, out_path
+
     def test_repair_plan_excludes_active_task_ids(self) -> None:
         tasks = [
             {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t0"},
@@ -1457,6 +1514,322 @@ class RepairPlanTests(unittest.TestCase):
             self.assertEqual(session.logs.calls[0]["logStreamNames"], ["active"])
             self.assertEqual(report["blocked_active_task_ids"], ["t0"])
             self.assertEqual(report["repair_task_ids"], ["t1"])
+
+    def test_repair_dry_run_builds_run_scoped_repair_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path, status_path, out_path = self._write_repair_inputs(tmp)
+            args = types.SimpleNamespace(
+                run_id="run",
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                artifact_dir=None,
+                job_queue=["jq"],
+                job_name_prefix=None,
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+                sqs_queue_url="",
+                apply=False,
+                submit_workers=False,
+                batch_job_queue=None,
+                job_definition=None,
+                worker_job_name_prefix=None,
+                messages_per_worker=1,
+                max_workers=64,
+                min_workers=0,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                allowed_s3_prefix=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairSession()), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_repair(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["schema"], "sweetspot.repair.v1")
+            self.assertEqual(report["run_id"], "run")
+            self.assertFalse(report["apply"])
+            self.assertEqual(report["repair_task_count"], 1)
+            self.assertEqual(report["sent"], 0)
+            self.assertEqual(json.loads(out_path.read_text())["task_id"], "t1")
+
+    def test_repair_apply_enqueues_repair_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path, status_path, out_path = self._write_repair_inputs(tmp)
+            sqs = FakeRepairApplySQS()
+            batch = FakeRepairApplyBatch()
+            args = types.SimpleNamespace(
+                run_id="run",
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                artifact_dir=None,
+                job_queue=["jq"],
+                job_name_prefix=None,
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+                sqs_queue_url="https://sqs.example/queue",
+                apply=True,
+                submit_workers=False,
+                batch_job_queue=None,
+                job_definition=None,
+                worker_job_name_prefix=None,
+                messages_per_worker=1,
+                max_workers=64,
+                min_workers=0,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                allowed_s3_prefix=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairApplySession(sqs, batch)), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_repair(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertTrue(report["apply"])
+            self.assertEqual(report["sent"], 1)
+            self.assertEqual(json.loads(sqs.sent_messages[0])["task_id"], "t1")
+            self.assertEqual(batch.submitted, [])
+
+    def test_repair_apply_can_submit_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path, status_path, out_path = self._write_repair_inputs(tmp)
+            sqs = FakeRepairApplySQS()
+            batch = FakeRepairApplyBatch()
+            args = types.SimpleNamespace(
+                run_id="run",
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                artifact_dir=None,
+                job_queue=["jq"],
+                job_name_prefix=None,
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+                sqs_queue_url="https://sqs.example/queue",
+                apply=True,
+                submit_workers=True,
+                batch_job_queue="worker-jq",
+                job_definition="worker-jd",
+                worker_job_name_prefix=None,
+                messages_per_worker=1,
+                max_workers=64,
+                min_workers=0,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                allowed_s3_prefix=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairApplySession(sqs, batch)), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_repair(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["submitted_count"], 1)
+            self.assertEqual(batch.submitted[0]["jobQueue"], "worker-jq")
+            self.assertEqual(batch.submitted[0]["jobDefinition"], "worker-jd")
+            self.assertTrue(str(batch.submitted[0]["jobName"]).startswith("run-repair-worker-"))
+
+    def test_repair_rejects_tasks_from_another_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path, status_path, out_path = self._write_repair_inputs(tmp)
+            records = [json.loads(line) for line in tasks_path.read_text().splitlines()]
+            records[1]["run_id"] = "other-run"
+            tasks_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            args = types.SimpleNamespace(
+                run_id="run",
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                artifact_dir=None,
+                job_queue=["jq"],
+                job_name_prefix=None,
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+                sqs_queue_url="https://sqs.example/queue",
+                apply=True,
+                submit_workers=False,
+                batch_job_queue=None,
+                job_definition=None,
+                worker_job_name_prefix=None,
+                messages_per_worker=1,
+                max_workers=64,
+                min_workers=0,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                allowed_s3_prefix=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+            )
+            sqs = FakeRepairApplySQS()
+            batch = FakeRepairApplyBatch()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairApplySession(sqs, batch)), self.assertRaisesRegex(SystemExit, "run_id='run'"):
+                cmd_repair(args)
+            self.assertEqual(sqs.sent_messages, [])
+
+    def test_repair_submit_worker_validation_happens_before_enqueue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path, status_path, out_path = self._write_repair_inputs(tmp)
+            sqs = FakeRepairApplySQS()
+            batch = FakeRepairApplyBatch()
+            args = types.SimpleNamespace(
+                run_id="run",
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                artifact_dir=None,
+                job_queue=["jq"],
+                job_name_prefix=None,
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+                sqs_queue_url="https://sqs.example/queue",
+                apply=True,
+                submit_workers=True,
+                batch_job_queue=None,
+                job_definition="worker-jd",
+                worker_job_name_prefix=None,
+                messages_per_worker=1,
+                max_workers=64,
+                min_workers=0,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                allowed_s3_prefix=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+            )
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairApplySession(sqs, batch)), self.assertRaisesRegex(SystemExit, "requires --batch-job-queue"):
+                cmd_repair(args)
+            self.assertEqual(sqs.sent_messages, [])
+            self.assertEqual(batch.submitted, [])
+
+    def test_repair_rejects_prefix_that_does_not_include_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path, status_path, out_path = self._write_repair_inputs(tmp)
+            args = types.SimpleNamespace(
+                run_id="run-1",
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                artifact_dir=None,
+                job_queue=["jq"],
+                job_name_prefix="workers",
+                active_status=None,
+                failed_status=None,
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+                sqs_queue_url="",
+                apply=False,
+                submit_workers=False,
+                batch_job_queue=None,
+                job_definition=None,
+                worker_job_name_prefix=None,
+                messages_per_worker=1,
+                max_workers=64,
+                min_workers=0,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                allowed_s3_prefix=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+            )
+            with self.assertRaisesRegex(SystemExit, "must include RUN_ID"):
+                cmd_repair(args)
 
 
 class FakeLogsClient:

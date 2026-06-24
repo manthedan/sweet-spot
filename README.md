@@ -130,7 +130,7 @@ For Spot, prefer many short tasks over a few long tasks. If a task cannot checkp
 
 The commands below expose SweetSpot's current operator phases. They remain useful for advanced debugging and controlled production runs, but they are not the intended long-term agent contract. SweetSpot is moving toward `sweetspot plan`, `sweetspot run`, `sweetspot status`, `sweetspot repair`, and `sweetspot cancel`, where agents provide workload intent, budget, deadline, and output locations while SweetSpot chooses shard size, resource shape, architecture, and parallelism.
 
-Until that controller is complete, treat direct sizing flags such as worker count, vCPU, memory, task timeout, shard size, and messages per worker as advanced controls that require canary evidence and dry-run review. Adaptive shard-sizing helpers now consume canary summaries internally so the future controller can grow from tiny replay-safe canaries instead of asking agents to invent chunk sizes; `sweetspot plan --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl` exposes that shard-sizing decision and production shard count in JSON without mutating AWS resources. Add `--out-production-tasks-jsonl artifacts/tasks.jsonl` to explicitly materialize calibrated `sweetspot.task.v1` production shards as a local artifact for review/enqueue. `sweetspot run JOB_SPEC` is available as a safe dry-run controller report that can persist `run_state.json` and local production task artifacts with `--artifact-dir`, but `sweetspot run --apply` is intentionally rejected until the cloud orchestration layer is implemented. `sweetspot cancel RUN_ID` is the simplified cancellation entrypoint for run-scoped Batch job names; broader regex cancellation remains available through the advanced `cancel-jobs` command.
+Until that controller is complete, treat direct sizing flags such as worker count, vCPU, memory, task timeout, shard size, and messages per worker as advanced controls that require canary evidence and dry-run review. Adaptive shard-sizing helpers now consume canary summaries internally so the future controller can grow from tiny replay-safe canaries instead of asking agents to invent chunk sizes; `sweetspot plan --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl` exposes that shard-sizing decision and production shard count in JSON without mutating AWS resources. Add `--out-production-tasks-jsonl artifacts/tasks.jsonl` to explicitly materialize calibrated `sweetspot.task.v1` production shards as a local artifact for review/enqueue. `sweetspot run JOB_SPEC` is available as a safe dry-run controller report that can persist `run_state.json` and local production task artifacts with `--artifact-dir`, but `sweetspot run --apply` is intentionally rejected until the cloud orchestration layer is implemented. `sweetspot repair RUN_ID` is the simplified repair entrypoint: it builds a run-scoped repair plan by default, and `--apply` can enqueue repair tasks after the JSON plan is reviewed. `sweetspot cancel RUN_ID` is the simplified cancellation entrypoint for run-scoped Batch job names; broader regex repair/cancellation remains available through the advanced `repair-plan` and `cancel-jobs` commands.
 
 ## Recommended cost optimization workflow
 
@@ -279,7 +279,23 @@ sweetspot finalize \
   --publish-ready \
   --require-complete
 
-# build a repair JSONL while excluding missing tasks currently owned by active jobs
+# build a run-scoped repair JSONL while excluding missing tasks currently owned by active jobs
+sweetspot repair hello-001 \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --task-status-jsonl artifacts/hello-001/finalizer/task_status.jsonl \
+  --out-jsonl artifacts/hello-001/repair_safe.jsonl \
+  --job-queue my-batch-spot-queue
+
+# after reviewing the JSON plan, enqueue repair tasks; add --submit-workers only when worker target flags are configured
+sweetspot repair hello-001 \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --task-status-jsonl artifacts/hello-001/finalizer/task_status.jsonl \
+  --out-jsonl artifacts/hello-001/repair_safe.jsonl \
+  --job-queue my-batch-spot-queue \
+  --sqs-queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --apply
+
+# advanced broad-regex repair planning remains available when you intentionally need it
 sweetspot repair-plan \
   --tasks-jsonl artifacts/hello-001/tasks.jsonl \
   --task-status-jsonl artifacts/hello-001/finalizer/task_status.jsonl \
