@@ -26,7 +26,18 @@ if "botocore.exceptions" not in sys.modules:
     exceptions.ClientError = ClientError
     sys.modules["botocore.exceptions"] = exceptions
 
-from sweetspot.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, _task_telemetry, _worker_resource_request, _worker_runtime_metadata, run_task, task_hash, validate_done_marker, validate_worker_timing
+from sweetspot.worker import (
+    SAFE_TASK_TIMEOUT_SECONDS,
+    _heartbeat,
+    _spot_interruption_metadata,
+    _task_telemetry,
+    _worker_resource_request,
+    _worker_runtime_metadata,
+    run_task,
+    task_hash,
+    validate_done_marker,
+    validate_worker_timing,
+)
 
 
 class RunTaskTests(unittest.TestCase):
@@ -52,11 +63,12 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(meta["availability_zone"], "us-west-2b")
         self.assertEqual(meta["region"], "us-west-2")
 
-    def test_worker_runtime_metadata_does_not_call_imds_when_env_has_metadata(self) -> None:
+    def test_worker_runtime_metadata_does_not_call_imds_when_disabled(self) -> None:
         with mock.patch("sweetspot.worker._imds_text") as imds_text:
             meta = _worker_runtime_metadata(
                 {
                     "AWS_BATCH_JOB_ID": "job-1",
+                    "AWS_EC2_METADATA_DISABLED": "true",
                     "SWEETSPOT_INSTANCE_TYPE": "c7i.large",
                     "SWEETSPOT_AVAILABILITY_ZONE": "us-west-2b",
                 }
@@ -64,6 +76,21 @@ class RunTaskTests(unittest.TestCase):
         imds_text.assert_not_called()
         self.assertEqual(meta["instance_type"], "c7i.large")
         self.assertEqual(meta["availability_zone"], "us-west-2b")
+
+    def test_worker_runtime_metadata_records_spot_interruption_signals(self) -> None:
+        def fake_imds(path: str, _env: dict[str, str], _metadata_uri: str) -> str | None:
+            return {
+                "spot/instance-action": '{"action":"terminate","time":"2026-06-24T18:00:00Z"}',
+                "events/recommendations/rebalance": '{"noticeTime":"2026-06-24T17:55:00Z"}',
+            }.get(path)
+
+        with mock.patch("sweetspot.worker._imds_text", side_effect=fake_imds):
+            meta = _spot_interruption_metadata({"AWS_BATCH_JOB_ID": "job-1"}, "")
+        self.assertTrue(meta["spot_interruption_notice"])
+        self.assertEqual(meta["spot_interruption_action"], "terminate")
+        self.assertEqual(meta["spot_interruption_time"], "2026-06-24T18:00:00Z")
+        self.assertTrue(meta["spot_rebalance_recommendation"])
+        self.assertEqual(meta["spot_rebalance_recommendation_time"], "2026-06-24T17:55:00Z")
 
     def test_worker_resource_request_converts_ecs_cpu_units(self) -> None:
         request = _worker_resource_request({}, {"Limits": {"CPU": 4096, "Memory": 8192}})

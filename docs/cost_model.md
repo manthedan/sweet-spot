@@ -12,6 +12,7 @@ Each task summary includes `telemetry`:
 - `completed_units`, `useful_compute_seconds`, and `units_per_second` when the task writes them to `SWEETSPOT_METRICS_PATH`.
 - `input_bytes`, `output_bytes`, `log_bytes`, and `bytes_transferred` from task metrics plus framework-observed output/log bytes.
 - `interruption_status` (`none`, `failed`, or `timeout`) and `discarded_compute_seconds` for failed/timed-out attempts. Duplicate attempts that lose the done-marker race emit `commit_lost` with discarded compute.
+- `spot_interruption_notice`, `spot_interruption_action`, `spot_interruption_time`, and `spot_rebalance_recommendation_time` when EC2 IMDS exposes Spot interruption or rebalance notices before the worker exits.
 
 Commands can write:
 

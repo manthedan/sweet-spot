@@ -94,6 +94,32 @@ def _imds_text(path: str, env: dict[str, str], metadata_uri: str) -> str | None:
     return _http_text(f"{IMDS_BASE_URL}/meta-data/{path.lstrip('/')}", headers=headers)
 
 
+def _parse_imds_json(text: str | None) -> dict[str, Any]:
+    if not text:
+        return {}
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _spot_interruption_metadata(env: dict[str, str], metadata_uri: str) -> dict[str, Any]:
+    if not _imds_allowed(env, metadata_uri):
+        return {}
+    instance_action = _parse_imds_json(_imds_text("spot/instance-action", env, metadata_uri))
+    rebalance = _parse_imds_json(_imds_text("events/recommendations/rebalance", env, metadata_uri))
+    out: dict[str, Any] = {}
+    if instance_action:
+        out["spot_interruption_notice"] = True
+        out["spot_interruption_action"] = instance_action.get("action")
+        out["spot_interruption_time"] = instance_action.get("time")
+    if rebalance:
+        out["spot_rebalance_recommendation"] = True
+        out["spot_rebalance_recommendation_time"] = rebalance.get("noticeTime") or rebalance.get("time")
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _region_from_az(az: str | None) -> str | None:
     if not az:
         return None
@@ -167,6 +193,7 @@ def _worker_runtime_metadata(env: dict[str, str]) -> dict[str, Any]:
         "aws_batch_job_attempt": _parse_int(env.get("AWS_BATCH_JOB_ATTEMPT")),
         "ecs_task_arn": str(task_meta.get("TaskARN") or "") or None,
         **_worker_resource_request(env, container_meta),
+        **_spot_interruption_metadata(env, metadata_uri),
     }
 
 

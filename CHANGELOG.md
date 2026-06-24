@@ -34,6 +34,7 @@ All notable changes to this project are documented here. This project uses human
 - Worker telemetry now records requested worker vCPU/memory, task-reported peak memory when available, and best-effort IMDS instance type/AZ fallback.
 - Scout observed-performance telemetry now exposes `ApproximateReceiveCount` replay lower bounds and warns when replay cost is lower-bound-only or only partially captured by discarded-compute summaries.
 - Optional OpenTofu ARM/Graviton Spot queue and worker job definition for canary-gated x86/ARM lane separation.
+- Worker telemetry now records best-effort EC2 Spot interruption and rebalance notices from IMDS when available.
 
 ### Changed
 
