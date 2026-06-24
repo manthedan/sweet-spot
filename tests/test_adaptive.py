@@ -60,6 +60,40 @@ class AdaptiveShardTests(unittest.TestCase):
         self.assertIsNone(decision["selected_units_per_task"])
         self.assertIn("memory_shape_rejected_oom", {reason["code"] for reason in decision["reasons"]})
 
+    def test_choose_next_shard_units_blocks_on_validation_failure(self) -> None:
+        decision = choose_next_shard_units(
+            [
+                {
+                    "returncode": 0,
+                    "framework_error": "expected output file was not produced: /tmp/task/output",
+                    "completed_units": 10,
+                    "elapsed_sec": 1,
+                }
+            ],
+            target_task_seconds=300,
+        )
+        self.assertEqual(decision["status"], "blocked")
+        self.assertIsNone(decision["selected_units_per_task"])
+        self.assertIn("canary_validation_failed", {reason["code"] for reason in decision["reasons"]})
+
+    def test_choose_next_shard_units_blocks_on_commit_validation_failure(self) -> None:
+        decision = choose_next_shard_units(
+            [{"returncode": 0, "commit_status": "validation_failed", "completed_units": 10, "elapsed_sec": 1}],
+            target_task_seconds=300,
+        )
+        self.assertEqual(decision["status"], "blocked")
+        self.assertIn("canary_validation_failed", {reason["code"] for reason in decision["reasons"]})
+
+    def test_choose_next_shard_units_skips_duplicate_loser_commit_status(self) -> None:
+        decision = choose_next_shard_units(
+            [{"returncode": 0, "commit_status": "lost", "completed_units": 10, "elapsed_sec": 1}],
+            target_task_seconds=300,
+            min_units=5,
+        )
+        self.assertEqual(decision["status"], "ready")
+        self.assertEqual(decision["selected_units_per_task"], 5)
+        self.assertIn("canary_required", {reason["code"] for reason in decision["reasons"]})
+
     def test_logical_shard_plan_emits_deterministic_ranges(self) -> None:
         plan = logical_shard_plan(25, 10)
         self.assertEqual(plan["schema"], "sweetspot.logical_shard_plan.v1")
@@ -108,6 +142,42 @@ class AdaptiveShardTests(unittest.TestCase):
         )
         self.assertFalse(observation["success"])
         self.assertTrue(observation["oom"])
+
+    def test_canary_observation_marks_validation_failure(self) -> None:
+        observation = canary_observation_from_summary(
+            {
+                "task_id": "canary-output-missing",
+                "returncode": 0,
+                "framework_error": "expected output file was not produced: /tmp/task/output",
+                "telemetry": {"completed_units": 10, "useful_compute_seconds": 2},
+            }
+        )
+        self.assertFalse(observation["success"])
+        self.assertTrue(observation["validation_failed"])
+
+    def test_canary_observation_marks_commit_validation_failure(self) -> None:
+        observation = canary_observation_from_summary(
+            {
+                "task_id": "canary-commit-failed",
+                "returncode": 0,
+                "commit_status": "validation_failed",
+                "telemetry": {"completed_units": 10, "useful_compute_seconds": 2},
+            }
+        )
+        self.assertFalse(observation["success"])
+        self.assertTrue(observation["validation_failed"])
+
+    def test_canary_observation_skips_duplicate_loser_without_validation_failure(self) -> None:
+        observation = canary_observation_from_summary(
+            {
+                "task_id": "canary-lost",
+                "returncode": 0,
+                "commit_status": "lost",
+                "telemetry": {"completed_units": 10, "useful_compute_seconds": 2},
+            }
+        )
+        self.assertFalse(observation["success"])
+        self.assertFalse(observation["validation_failed"])
 
     def test_canary_observation_does_not_match_oom_inside_words(self) -> None:
         observation = canary_observation_from_summary(

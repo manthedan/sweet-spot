@@ -7,11 +7,15 @@ from typing import Any
 
 ADAPTIVE_SHARD_SCHEMA_V1 = "sweetspot.adaptive_shard_decision.v1"
 LOGICAL_SHARD_PLAN_SCHEMA_V1 = "sweetspot.logical_shard_plan.v1"
+SUCCESS_COMMIT_STATUSES = {"", "succeeded", "success", "committed"}
+NON_BLOCKING_UNSUCCESSFUL_COMMIT_STATUSES = {"lost"}
+
 ADAPTIVE_SHARD_REASON_CODES: dict[str, str] = {
     "canary_required": "No measurable canary summary was available, so the next canary should use the minimum shard size.",
     "geometric_growth_cap": "The measured rate supports a larger shard, but growth was capped to keep canaries replay-safe.",
     "max_units_cap": "The selected shard size was capped by the configured maximum unit count.",
     "memory_shape_rejected_oom": "A canary reported an out-of-memory signal; increase memory or reject this resource shape before growing shards.",
+    "canary_validation_failed": "A canary failed framework or output validation; fix the workload contract before producing production shards.",
     "target_duration_selected": "The selected shard size targets the configured replay-safe task duration from measured canary throughput.",
 }
 
@@ -33,11 +37,40 @@ def _positive_int(value: Any) -> int | None:
     return max(1, int(parsed))
 
 
+def _commit_status(summary: dict[str, Any]) -> str:
+    return str(summary.get("commit_status") or "").strip().lower()
+
+
+def _summary_text(summary: dict[str, Any], telemetry: dict[str, Any]) -> str:
+    text = " ".join(str(summary.get(key) or "") for key in ("framework_error", "stderr_tail", "error", "commit_status", "commit_error"))
+    return " ".join([text, str(telemetry.get("interruption_status") or ""), str(telemetry.get("metrics_error") or "")]).lower()
+
+
 def _looks_like_oom(summary: dict[str, Any], telemetry: dict[str, Any]) -> bool:
-    text = " ".join(str(summary.get(key) or "") for key in ("framework_error", "stderr_tail", "error"))
-    text = " ".join([text, str(telemetry.get("interruption_status") or ""), str(telemetry.get("metrics_error") or "")]).lower()
+    text = _summary_text(summary, telemetry)
     specific_markers = ("out of memory", "oomkilled", "memoryerror", "cannot allocate memory")
     return any(marker in text for marker in specific_markers) or re.search(r"\boom\b", text) is not None
+
+
+def _looks_like_validation_failure(summary: dict[str, Any], telemetry: dict[str, Any]) -> bool:
+    if summary.get("timed_out"):
+        return False
+    commit_status = _commit_status(summary)
+    if commit_status and commit_status not in SUCCESS_COMMIT_STATUSES | NON_BLOCKING_UNSUCCESSFUL_COMMIT_STATUSES:
+        return True
+    text = _summary_text(summary, telemetry)
+    if not text or _looks_like_oom(summary, telemetry):
+        return False
+    validation_markers = (
+        "expected output file was not produced",
+        "framework validation",
+        "done marker",
+        "output logical_uri mismatch",
+        "output uri does not match",
+        "output validation",
+        "validation failed",
+    )
+    return any(marker in text for marker in validation_markers)
 
 
 def canary_observation_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -51,13 +84,15 @@ def canary_observation_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
     telemetry = telemetry_raw if isinstance(telemetry_raw, dict) else {}
     units = _positive_float(telemetry.get("completed_units") or summary.get("completed_units"))
     seconds = _positive_float(telemetry.get("useful_compute_seconds") or summary.get("elapsed_sec"))
-    success = summary.get("returncode") in (None, 0) and not summary.get("timed_out") and not summary.get("framework_error") and summary.get("commit_status") != "lost"
+    commit_status = _commit_status(summary)
+    success = summary.get("returncode") in (None, 0) and not summary.get("timed_out") and not summary.get("framework_error") and commit_status in SUCCESS_COMMIT_STATUSES
     observation: dict[str, Any] = {
         "task_id": summary.get("task_id"),
         "success": bool(success),
         "completed_units": units,
         "useful_compute_seconds": seconds,
         "oom": _looks_like_oom(summary, telemetry),
+        "validation_failed": _looks_like_validation_failure(summary, telemetry),
     }
     if units and seconds:
         observation["units_per_second"] = units / seconds
@@ -131,20 +166,9 @@ def choose_next_shard_units(
     raw_summary_keys = {"telemetry", "elapsed_sec", "returncode", "timed_out", "framework_error", "stderr_tail", "commit_status"}
     normalized = [canary_observation_from_summary(obs) if raw_summary_keys.intersection(obs) else dict(obs) for obs in observations]
     if any(obs.get("oom") for obs in normalized):
-        return {
-            "schema": ADAPTIVE_SHARD_SCHEMA_V1,
-            "status": "blocked",
-            "selected_units_per_task": None,
-            "target_task_seconds": target,
-            "observations_used": 0,
-            "reasons": [
-                {
-                    "code": "memory_shape_rejected_oom",
-                    "severity": "error",
-                    "message": ADAPTIVE_SHARD_REASON_CODES["memory_shape_rejected_oom"],
-                }
-            ],
-        }
+        return _blocked_adaptive_decision("memory_shape_rejected_oom", target)
+    if any(obs.get("validation_failed") for obs in normalized):
+        return _blocked_adaptive_decision("canary_validation_failed", target)
 
     rates: list[float] = []
     max_observed_units = 0
@@ -188,4 +212,21 @@ def choose_next_shard_units(
         "observations_used": len(rates),
         "median_units_per_second": median_rate,
         "reasons": reasons,
+    }
+
+
+def _blocked_adaptive_decision(code: str, target_task_seconds: float) -> dict[str, Any]:
+    return {
+        "schema": ADAPTIVE_SHARD_SCHEMA_V1,
+        "status": "blocked",
+        "selected_units_per_task": None,
+        "target_task_seconds": target_task_seconds,
+        "observations_used": 0,
+        "reasons": [
+            {
+                "code": code,
+                "severity": "error",
+                "message": ADAPTIVE_SHARD_REASON_CODES[code],
+            }
+        ],
     }

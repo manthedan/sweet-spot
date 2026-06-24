@@ -94,6 +94,22 @@ class PlannerContractTests(unittest.TestCase):
         self.assertEqual(plan["reasons"][0]["code"], "memory_shape_rejected_oom")
         self.assertEqual(plan["canaries"][0]["decision"]["status"], "blocked")
 
+    def test_plan_with_adaptive_canaries_surfaces_validation_failure_as_blocker(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [
+                {
+                    "returncode": 0,
+                    "framework_error": "expected output file was not produced: /tmp/task/output",
+                    "completed_units": 10,
+                    "elapsed_sec": 1,
+                }
+            ],
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertEqual(plan["reasons"][0]["code"], "canary_validation_failed")
+        self.assertEqual(plan["canaries"][0]["decision"]["status"], "blocked")
+
     def test_plan_with_adaptive_canaries_counts_production_shards(self) -> None:
         plan = plan_with_adaptive_canaries(
             self._valid_job_spec(),

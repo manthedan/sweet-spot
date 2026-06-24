@@ -33,6 +33,7 @@ PLAN_REASON_CODES: dict[str, str] = {
     "arm_canary_failed": "ARM was requested but rejected after a failed compatibility or validation canary.",
     "arm_not_requested": "ARM was not included in the requested architecture set.",
     "budget_caps_parallelism": "The requested budget limits the safe worker count below the deadline-driven target.",
+    "canary_validation_failed": "A canary failed framework or output validation, so production shards cannot be generated safely.",
     "deadline_unachievable": "The available throughput and limits cannot satisfy the requested deadline.",
     "insufficient_telemetry": "Planner telemetry is missing or too sparse for a measured decision.",
     "memory_shape_rejected_oom": "A candidate resource shape was rejected after an out-of-memory signal or validation failure.",
@@ -99,11 +100,15 @@ def plan_with_adaptive_canaries(
     plan = _base_blocked_plan(job_spec)
     shard_decision = choose_next_shard_units(canary_observations, target_task_seconds=target_task_seconds)
     if shard_decision["status"] == "blocked":
+        decision_reasons = shard_decision.get("reasons") if isinstance(shard_decision.get("reasons"), list) else []
+        raw_decision_code = decision_reasons[0].get("code") if decision_reasons and isinstance(decision_reasons[0], dict) else "memory_shape_rejected_oom"
+        decision_code = str(raw_decision_code)
+        plan_code = decision_code if decision_code in PLAN_REASON_CODES else "memory_shape_rejected_oom"
         plan["reasons"] = [
             {
-                "code": "memory_shape_rejected_oom",
+                "code": plan_code,
                 "severity": "error",
-                "message": PLAN_REASON_CODES["memory_shape_rejected_oom"],
+                "message": PLAN_REASON_CODES[plan_code],
             }
         ]
     else:

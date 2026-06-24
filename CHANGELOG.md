@@ -39,6 +39,7 @@ All notable changes to this project are documented here. This project uses human
 - `sweetspot plan --canary-summary-jsonl` to embed adaptive shard-sizing decisions from local canary summaries in the Plan JSON envelope.
 - `sweetspot plan --input-manifest-jsonl` can combine a local logical-unit manifest copy with canary sizing to report adaptive production shard counts without mutating AWS resources.
 - `sweetspot plan --out-production-tasks-jsonl` for explicitly writing calibrated production `sweetspot.task.v1` shards as a local review/enqueue artifact.
+- Adaptive canary decisions now block production shard generation with `canary_validation_failed` when canaries fail framework/output validation.
 
 ### Changed
 
