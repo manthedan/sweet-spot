@@ -14,7 +14,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Pattern
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import boto3
 from botocore.exceptions import ClientError
@@ -32,6 +32,7 @@ DEFAULT_LOG_TAIL_BYTES = 12_000
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024
 REDACTION_CARRY_CHARS = 65_536
 METADATA_TIMEOUT_SECONDS = 0.25
+IMDS_BASE_URL = "http://169.254.169.254/latest"
 
 
 def _emit_event(event: str, **fields: Any) -> None:
@@ -62,6 +63,35 @@ def _http_json(url: str) -> dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except Exception:  # noqa: BLE001 - metadata is best-effort telemetry, not task-critical
         return {}
+
+
+def _http_text(url: str, *, headers: dict[str, str] | None = None, method: str = "GET") -> str | None:
+    try:
+        req = Request(url, headers=headers or {}, method=method)
+        with urlopen(req, timeout=METADATA_TIMEOUT_SECONDS) as resp:  # noqa: S310 - metadata URLs are fixed AWS link-local endpoints
+            return resp.read(64 * 1024).decode("utf-8").strip()
+    except Exception:  # noqa: BLE001 - metadata is best-effort telemetry, not task-critical
+        return None
+
+
+def _metadata_disabled(env: dict[str, str]) -> bool:
+    return env.get("AWS_EC2_METADATA_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _imds_allowed(env: dict[str, str], metadata_uri: str) -> bool:
+    if _metadata_disabled(env):
+        return False
+    if env.get("SWEETSPOT_ENABLE_IMDS_METADATA", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return bool(metadata_uri or env.get("AWS_BATCH_JOB_ID"))
+
+
+def _imds_text(path: str, env: dict[str, str], metadata_uri: str) -> str | None:
+    if not _imds_allowed(env, metadata_uri):
+        return None
+    token = _http_text(f"{IMDS_BASE_URL}/api/token", headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}, method="PUT")
+    headers = {"X-aws-ec2-metadata-token": token} if token else None
+    return _http_text(f"{IMDS_BASE_URL}/meta-data/{path.lstrip('/')}", headers=headers)
 
 
 def _region_from_az(az: str | None) -> str | None:
@@ -120,11 +150,14 @@ def _worker_runtime_metadata(env: dict[str, str]) -> dict[str, Any]:
     container_meta = _http_json(metadata_uri) if metadata_uri else {}
     task_meta = _http_json(f"{metadata_uri.rstrip('/')}/task") if metadata_uri else {}
     az = env.get("SWEETSPOT_AVAILABILITY_ZONE") or str(task_meta.get("AvailabilityZone") or "") or None
+    if not az:
+        az = _imds_text("placement/availability-zone", env, metadata_uri)
     region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or env.get("SWEETSPOT_REGION") or _region_from_az(az)
     image_id = env.get("SWEETSPOT_IMAGE_DIGEST") or str(container_meta.get("ImageID") or "") or None
+    instance_type = env.get("SWEETSPOT_INSTANCE_TYPE") or env.get("EC2_INSTANCE_TYPE") or _imds_text("instance-type", env, metadata_uri)
     return {
         "hostname": env.get("HOSTNAME"),
-        "instance_type": env.get("SWEETSPOT_INSTANCE_TYPE") or env.get("EC2_INSTANCE_TYPE"),
+        "instance_type": instance_type,
         "architecture": env.get("SWEETSPOT_ARCHITECTURE") or platform.machine(),
         "region": region,
         "availability_zone": az,

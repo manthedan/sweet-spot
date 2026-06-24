@@ -31,7 +31,7 @@ All notable changes to this project are documented here. This project uses human
 - Initial `sweetspot plan JOB_SPEC` command that validates the declarative job contract and emits JSON plan status/reason codes without mutating AWS resources.
 - `sweetspot scout --worker-memory` for memory-aware worker packing and cost estimates.
 - Machine-readable `sweetspot scout` reason codes for default throughput, unobserved replay, and omitted optional cost components.
-- Worker telemetry now records requested worker vCPU/memory and task-reported peak memory when available.
+- Worker telemetry now records requested worker vCPU/memory, task-reported peak memory when available, and best-effort IMDS instance type/AZ fallback.
 
 ### Changed
 
