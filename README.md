@@ -110,6 +110,21 @@ For measured cost optimization, tasks may write a JSON object to `SWEETSPOT_METR
 
 Task timeouts are capped below SQS's 12-hour visibility ceiling. Prefer much shorter shards, and checkpoint/split work that cannot fit safely under the default 11-hour cap.
 
+## Sizing and repair safety
+
+SweetSpot works best when each task is small, trusted, and idempotent. Do **not** launch huge uncheckpointed tasks on Spot just because your input files are large. First run a representative canary, estimate throughput, then choose a chunk size whose predicted per-task runtime is comfortably below your timeout and cheap to replay after interruption.
+
+A safe production loop is:
+
+1. derive and run a canary;
+2. estimate runtime/cost from canary telemetry with `sweetspot estimate-runtime`;
+3. enqueue and submit in one command with `sweetspot enqueue-and-submit --wait-for-visible-seconds ...` to avoid SQS approximate-depth races;
+4. finalize to produce `task_status.jsonl` and `repair_tasks.jsonl`;
+5. build repairs with `sweetspot repair-plan`, excluding tasks already owned by active workers;
+6. dry-run then apply `sweetspot cleanup-stale-messages` for visible duplicate messages whose done markers already exist.
+
+For Spot, prefer many short tasks over a few long tasks. If a task cannot checkpoint or finish quickly, use an On-Demand repair lane or split it further.
+
 ## CLI quickstart
 
 ```bash
@@ -141,6 +156,33 @@ sweetspot submit-workers \
   --subtract-active
 
 # add --submit after reviewing the dry-run
+
+# enqueue and submit in one step, waiting for SQS's approximate visible count
+# to catch up before sizing the worker wave
+sweetspot enqueue-and-submit \
+  --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --artifact-dir artifacts/hello-001/enqueue-submit \
+  --batch-job-queue my-batch-spot-queue \
+  --job-definition my-worker-jobdef:1 \
+  --job-name-prefix hello-001-worker \
+  --messages-per-worker 4 \
+  --max-workers 64 \
+  --wait-for-visible-seconds 60 \
+  --allowed-s3-prefix s3://my-bucket/runs/hello-001
+
+# add --submit after reviewing the dry-run
+
+# estimate full-run wall time/cost from canary or task summary telemetry
+sweetspot estimate-runtime \
+  --sample-jsonl artifacts/hello-001/canary_summaries.jsonl \
+  --task-count 1000 \
+  --units-per-task 25000 \
+  --active-workers 64 \
+  --vcpus-per-worker 2 \
+  --price-per-vcpu-hour 0.02 \
+  --task-timeout-seconds 3600 \
+  --spot
 
 # keep a bounded worker pool topped up across one or more loops
 sweetspot supervise-workers \
@@ -181,6 +223,20 @@ sweetspot finalize \
   --upload \
   --publish-ready \
   --require-complete
+
+# build a repair JSONL while excluding missing tasks currently owned by active jobs
+sweetspot repair-plan \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --task-status-jsonl artifacts/hello-001/finalizer/task_status.jsonl \
+  --out-jsonl artifacts/hello-001/repair_safe.jsonl \
+  --job-queue my-batch-spot-queue \
+  --job-name-regex hello-001-worker
+
+# dry-run stale duplicate cleanup; add --apply only after reviewing counts/examples
+sweetspot cleanup-stale-messages \
+  --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --run-id hello-001 \
+  --max-messages 100
 
 # inspect AWS Batch jobs and logs
 sweetspot jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001

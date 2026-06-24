@@ -40,17 +40,23 @@ from sweetspot.cli import (
     _auto_canary_indices,
     _job_log_group,
     _job_log_stream,
+    _extract_task_id_from_log_message,
     _parse_index_selection,
     _redact_env,
+    _sample_from_runtime_obj,
     _supervisor_desired_workers,
     _validate_s3_delete_prefix,
     _worker_overrides,
+    cmd_cleanup_stale_messages,
     cmd_derive_canary,
     cmd_dlq,
     cmd_doctor,
+    cmd_enqueue_and_submit,
     cmd_enqueue_jsonl,
+    cmd_estimate_runtime,
     cmd_finalize,
     cmd_logs,
+    cmd_repair_plan,
     cmd_s3_delete_prefix,
     cmd_supervise_workers,
 )
@@ -252,6 +258,433 @@ class EnqueueValidationTests(unittest.TestCase):
         self.assertEqual(env["SWEETSPOT_LOG_TAIL_BYTES"], "123")
         self.assertEqual(env["SWEETSPOT_MAX_LOG_BYTES"], "456")
         self.assertEqual(env["SWEETSPOT_REDACT_REGEXES"], "token=[^ ]+")
+
+
+class FakeQueueDepthSQS:
+    def __init__(self) -> None:
+        self.sent = 0
+        self.depth_calls = 0
+
+    def send_message_batch(self, *, QueueUrl, Entries):
+        self.sent += len(Entries)
+        return {"Successful": [{"Id": e["Id"]} for e in Entries]}
+
+    def get_queue_attributes(self, **kwargs):
+        self.depth_calls += 1
+        visible = 0 if self.depth_calls <= 2 else self.sent
+        return {"Attributes": {"ApproximateNumberOfMessages": str(visible), "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+
+class FakePartialVisibleSQS:
+    def __init__(self, visible: int) -> None:
+        self.visible = visible
+        self.sent = 0
+        self.depth_calls = 0
+
+    def send_message_batch(self, *, QueueUrl, Entries):
+        self.sent += len(Entries)
+        return {"Successful": [{"Id": e["Id"]} for e in Entries]}
+
+    def get_queue_attributes(self, **kwargs):
+        self.depth_calls += 1
+        visible = 0 if self.depth_calls == 1 else self.visible
+        return {"Attributes": {"ApproximateNumberOfMessages": str(visible), "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+
+class FakeSubmitBatch:
+    def __init__(self) -> None:
+        self.submitted: list[dict[str, object]] = []
+
+    def submit_job(self, **kwargs):
+        job_id = f"job-{len(self.submitted)}"
+        self.submitted.append(kwargs)
+        return {"jobId": job_id, "jobArn": f"arn:{job_id}"}
+
+
+class FakeCleanupSQS:
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    def receive_message(self, **kwargs):
+        if self.deleted:
+            return {"Messages": []}
+        task = {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t0"}
+        return {"Messages": [{"Body": json.dumps(task), "ReceiptHandle": "rh"}]}
+
+    def delete_message(self, **kwargs):
+        self.deleted.append(kwargs["ReceiptHandle"])
+
+
+class RuntimeAndRepairTests(unittest.TestCase):
+    def test_extract_task_id_from_json_log_message(self) -> None:
+        self.assertEqual(_extract_task_id_from_log_message(json.dumps({"event": "message_received", "task_id": "t1"})), "t1")
+        self.assertIsNone(_extract_task_id_from_log_message("not json"))
+
+    def test_sample_from_runtime_obj_reads_telemetry(self) -> None:
+        self.assertEqual(_sample_from_runtime_obj({"telemetry": {"completed_units": 100, "useful_compute_seconds": 25}}), (100.0, 25.0))
+
+    def test_estimate_runtime_warns_when_task_exceeds_timeout_budget(self) -> None:
+        args = types.SimpleNamespace(
+            sample_jsonl=[],
+            completed_units=1000,
+            elapsed_seconds=100,
+            target_units=None,
+            task_count=10,
+            units_per_task=1000,
+            active_workers=2,
+            vcpus_per_worker=2,
+            price_per_vcpu_hour=0.05,
+            task_timeout_seconds=60,
+            timeout_safety_fraction=0.8,
+            spot=True,
+            max_spot_task_seconds=30,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_estimate_runtime(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["sample_count"], 1)
+        self.assertGreaterEqual(len(report["warnings"]), 2)
+
+    def test_cleanup_stale_messages_deletes_done_messages_when_applied(self) -> None:
+        sqs = FakeCleanupSQS()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "s3":
+                return object()
+            raise AssertionError(service)
+
+        args = types.SimpleNamespace(queue_url="q", run_id="r", max_messages=1, wait_time=0, visibility_timeout=5, allow_legacy_done_markers=False, apply=True)
+        out = io.StringIO()
+        with (
+            patch("sweetspot.cli.boto3.client", side_effect=fake_client),
+            patch("sweetspot.cli._check_task", return_value={"state": "done"}),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(cmd_cleanup_stale_messages(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["deleted"], 1)
+        self.assertEqual(sqs.deleted, ["rh"])
+
+    def test_enqueue_and_submit_dry_run_sizes_from_tasks_that_would_be_sent(self) -> None:
+        tasks = [{"schema": "sweetspot.task.v1", "run_id": "r", "task_id": f"t{i}", "command": [sys.executable, "-c", "pass"], "done_s3": f"s3://bucket/r/done/t{i}.done.json"} for i in range(100)]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text("".join(json.dumps(task) + "\n" for task in tasks))
+            sqs = FakePartialVisibleSQS(visible=0)
+            batch = FakeSubmitBatch()
+
+            def fake_client(service):
+                if service == "sqs":
+                    return sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            args = types.SimpleNamespace(
+                queue_url="q",
+                tasks_jsonl=tasks_path,
+                run_id=None,
+                artifact_dir=Path(tmp) / "artifacts",
+                allowed_s3_prefix=["s3://bucket/r"],
+                batch_job_queue="jq",
+                job_definition="jd",
+                job_name_prefix="worker",
+                messages_per_worker=10,
+                min_workers=0,
+                max_workers=20,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+                wait_for_visible_seconds=0,
+                wait_for_visible_min=None,
+                wait_interval_seconds=0.01,
+                submit=False,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_enqueue_and_submit(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["sent"], 0)
+            self.assertEqual(report["simulated_sent_for_sizing"], 100)
+            self.assertEqual(report["backlog_used_for_sizing"], 100)
+            self.assertEqual(report["to_submit"], 10)
+            self.assertEqual(report["submitted_count"], 0)
+
+    def test_enqueue_and_submit_sizes_from_sent_count_when_sqs_depth_lags(self) -> None:
+        tasks = [{"schema": "sweetspot.task.v1", "run_id": "r", "task_id": f"t{i}", "command": [sys.executable, "-c", "pass"], "done_s3": f"s3://bucket/r/done/t{i}.done.json"} for i in range(100)]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text("".join(json.dumps(task) + "\n" for task in tasks))
+            sqs = FakePartialVisibleSQS(visible=10)
+            batch = FakeSubmitBatch()
+
+            def fake_client(service):
+                if service == "sqs":
+                    return sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            args = types.SimpleNamespace(
+                queue_url="q",
+                tasks_jsonl=tasks_path,
+                run_id=None,
+                artifact_dir=Path(tmp) / "artifacts",
+                allowed_s3_prefix=["s3://bucket/r"],
+                batch_job_queue="jq",
+                job_definition="jd",
+                job_name_prefix="worker",
+                messages_per_worker=10,
+                min_workers=0,
+                max_workers=20,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+                wait_for_visible_seconds=0,
+                wait_for_visible_min=None,
+                wait_interval_seconds=0.01,
+                submit=True,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_enqueue_and_submit(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["sent"], 100)
+            self.assertEqual(report["queue_depth"]["visible"], 10)
+            self.assertEqual(report["backlog_floor_used_for_sizing"], 100)
+            self.assertEqual(report["submitted_count"], 10)
+
+    def test_enqueue_and_submit_waits_for_visible_depth(self) -> None:
+        task = {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/r/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            sqs = FakeQueueDepthSQS()
+            batch = FakeSubmitBatch()
+
+            def fake_client(service):
+                if service == "sqs":
+                    return sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            args = types.SimpleNamespace(
+                queue_url="q",
+                tasks_jsonl=tasks_path,
+                run_id=None,
+                artifact_dir=Path(tmp) / "artifacts",
+                allowed_s3_prefix=["s3://bucket/r"],
+                batch_job_queue="jq",
+                job_definition="jd",
+                job_name_prefix="worker",
+                messages_per_worker=1,
+                min_workers=0,
+                max_workers=10,
+                subtract_active=False,
+                include_not_visible=False,
+                vcpus=None,
+                memory=None,
+                visibility_timeout=1800,
+                heartbeat_seconds=300,
+                task_timeout_seconds=3600,
+                retry_attempts=None,
+                env=[],
+                log_tail_bytes=100,
+                max_log_bytes=1000,
+                redact_regex=[],
+                allow_legacy_done_markers=False,
+                wait_for_visible_seconds=1,
+                wait_for_visible_min=None,
+                wait_interval_seconds=0.01,
+                submit=True,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_enqueue_and_submit(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["sent"], 1)
+            self.assertEqual(report["submitted_count"], 1)
+            self.assertGreaterEqual(len(report["wait_history"]), 2)
+
+
+class FakeRepairPaginator:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def paginate(self, **kwargs):
+        return self.pages.get(kwargs["jobStatus"], [])
+
+
+class FakeRepairBatch:
+    def get_paginator(self, name):
+        self.assert_name = name
+        return FakeRepairPaginator(
+            {
+                "RUNNING": [{"jobSummaryList": [{"jobId": "active", "jobName": "run-active-worker", "createdAt": 1}]}],
+                "FAILED": [{"jobSummaryList": [{"jobId": "failed", "jobName": "run-failed-worker", "createdAt": 2}]}],
+            }
+        )
+
+    def describe_jobs(self, *, jobs):
+        out = []
+        for job_id in jobs:
+            out.append(
+                {
+                    "jobId": job_id,
+                    "jobName": f"run-{job_id}-worker",
+                    "status": "RUNNING" if job_id == "active" else "FAILED",
+                    "container": {"logStreamName": job_id, "logConfiguration": {"options": {"awslogs-group": "lg"}}},
+                }
+            )
+        return {"jobs": out}
+
+
+class FakeRepairLogs:
+    def filter_log_events(self, **kwargs):
+        stream = kwargs["logStreamNames"][0]
+        task_id = "t0" if stream == "active" else "t1"
+        return {"events": [{"message": json.dumps({"event": "message_received", "task_id": task_id})}]}
+
+    def get_log_events(self, **kwargs):
+        stream = kwargs["logStreamName"]
+        task_id = "t0" if stream == "active" else "t1"
+        return {"events": [{"message": json.dumps({"event": "message_received", "task_id": task_id})}]}
+
+
+class FakePaginatedRepairLogs:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def filter_log_events(self, **kwargs):
+        self.calls.append(kwargs)
+        if "nextToken" not in kwargs:
+            return {"events": [], "nextToken": "page-2"}
+        return {"events": [{"message": json.dumps({"event": "message_received", "task_id": "t0"})}]}
+
+    def get_log_events(self, **kwargs):
+        raise AssertionError("repair-plan should use FilterLogEvents before fallback")
+
+
+class FakeRepairSession:
+    def client(self, service: str, region_name=None):
+        if service == "batch":
+            return FakeRepairBatch()
+        if service == "logs":
+            return FakeRepairLogs()
+        raise AssertionError(service)
+
+
+class FakePaginatedRepairSession:
+    def __init__(self) -> None:
+        self.logs = FakePaginatedRepairLogs()
+
+    def client(self, service: str, region_name=None):
+        if service == "batch":
+            return FakeRepairBatch()
+        if service == "logs":
+            return self.logs
+        raise AssertionError(service)
+
+
+class RepairPlanTests(unittest.TestCase):
+    def test_repair_plan_excludes_active_task_ids(self) -> None:
+        tasks = [
+            {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t0"},
+            {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t1", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t1"},
+        ]
+        statuses = [{"task_id": "t0", "state": "incomplete"}, {"task_id": "t1", "state": "incomplete"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            status_path = Path(tmp) / "status.jsonl"
+            out_path = Path(tmp) / "repair.jsonl"
+            tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            status_path.write_text("".join(json.dumps(s) + "\n" for s in statuses))
+            args = types.SimpleNamespace(
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                job_queue=["jq"],
+                job_name_regex="run",
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=10,
+                max_jobs=10,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairSession()), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_repair_plan(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["blocked_active_task_ids"], ["t0"])
+            self.assertEqual(report["repair_task_ids"], ["t1"])
+            self.assertEqual(json.loads(out_path.read_text())["task_id"], "t1")
+
+    def test_repair_plan_scans_past_first_log_page_for_active_task_ids(self) -> None:
+        tasks = [
+            {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t0"},
+            {"schema": "sweetspot.task.v1", "run_id": "r", "task_id": "t1", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t1"},
+        ]
+        statuses = [{"task_id": "t0", "state": "incomplete"}, {"task_id": "t1", "state": "incomplete"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            status_path = Path(tmp) / "status.jsonl"
+            out_path = Path(tmp) / "repair.jsonl"
+            tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+            status_path.write_text("".join(json.dumps(s) + "\n" for s in statuses))
+            args = types.SimpleNamespace(
+                profile=None,
+                region=None,
+                tasks_jsonl=tasks_path,
+                task_status_jsonl=status_path,
+                out_jsonl=out_path,
+                job_queue=["jq"],
+                job_name_regex="active",
+                active_status=["RUNNING"],
+                failed_status=["FAILED"],
+                include_active=False,
+                only_known_failed=False,
+                log_group="lg",
+                log_tail=1000,
+                max_jobs=10,
+            )
+            session = FakePaginatedRepairSession()
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(out):
+                self.assertEqual(cmd_repair_plan(args), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(len(session.logs.calls), 2)
+            self.assertEqual(session.logs.calls[0]["filterPattern"], '"task_id"')
+            self.assertEqual(session.logs.calls[0]["logStreamNames"], ["active"])
+            self.assertEqual(report["blocked_active_task_ids"], ["t0"])
+            self.assertEqual(report["repair_task_ids"], ["t1"])
 
 
 class FakeLogsClient:

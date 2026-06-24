@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import statistics
 import time
 from collections import Counter
 from pathlib import Path
@@ -87,6 +88,72 @@ def _validate_tasks_for_enqueue(tasks: list[dict[str, Any]], *, allowed_s3_prefi
             raise SystemExit(f"invalid task at line {i}: {exc}") from exc
 
 
+def _write_enqueue_artifacts(tasks: list[dict[str, Any]], artifact_dir: Path) -> Path:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    tasks_out = artifact_dir / "tasks.jsonl"
+    tasks_out.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in tasks))
+    return tasks_out
+
+
+def _send_tasks_to_sqs(sqs, *, queue_url: str, tasks: list[dict[str, Any]]) -> int:
+    sent = 0
+    for batch in _chunks(tasks, 10):
+        entries = [{"Id": str(i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(batch)]
+        resp = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
+        if resp.get("Failed"):
+            raise RuntimeError(f"send_message_batch failed: {resp['Failed']}")
+        sent += len(resp.get("Successful", []))
+    return sent
+
+
+def _wait_for_visible_backlog(sqs, *, queue_url: str, min_visible: int, max_seconds: float, interval_seconds: float) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    deadline = time.time() + max(0.0, max_seconds)
+    history: list[dict[str, Any]] = []
+    while True:
+        depth = queue_depth(sqs, queue_url)
+        history.append({"checked_at": iso_now(), **depth})
+        if depth["visible"] >= min_visible or max_seconds <= 0 or time.time() >= deadline:
+            return depth, history
+        time.sleep(max(0.1, interval_seconds))
+
+
+def _extract_task_id_from_log_message(message: str) -> str | None:
+    try:
+        obj = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    task_id = obj.get("task_id")
+    return str(task_id) if task_id else None
+
+
+def _sample_from_runtime_obj(obj: dict[str, Any]) -> tuple[float, float] | None:
+    raw_telemetry = obj.get("telemetry")
+    telemetry: dict[str, Any] = raw_telemetry if isinstance(raw_telemetry, dict) else {}
+    candidates: list[dict[str, Any]] = [obj, telemetry]
+    for source in candidates:
+        units: Any = source.get("completed_units") or source.get("labels") or source.get("rows")
+        seconds: Any = source.get("useful_compute_seconds") or source.get("useful_compute_sec") or source.get("elapsed_sec") or source.get("seconds")
+        try:
+            units_f = float(units)
+            seconds_f = float(seconds)
+        except (TypeError, ValueError):
+            continue
+        if units_f > 0 and seconds_f > 0:
+            return units_f, seconds_f
+    labels: Any = obj.get("labels")
+    labels_per_second: Any = obj.get("labels_per_second") or obj.get("units_per_second")
+    try:
+        units_f = float(labels)
+        rate_f = float(labels_per_second)
+    except (TypeError, ValueError):
+        return None
+    if units_f > 0 and rate_f > 0:
+        return units_f, units_f / rate_f
+    return None
+
+
 def _parse_index_selection(raw: str, n: int) -> list[int]:
     if raw in {"", "auto"}:
         return []
@@ -149,21 +216,14 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
     allowed_s3_prefixes = parse_allowed_s3_prefixes(getattr(args, "allowed_s3_prefix", None) or _env_allowed_s3_prefixes())
     _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=allowed_s3_prefixes)
     artifact_dir = args.artifact_dir or Path("artifacts") / (args.run_id or f"run-{utc_stamp()}")
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    tasks_out = artifact_dir / "tasks.jsonl"
-    tasks_out.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in tasks))
+    tasks_out = _write_enqueue_artifacts(tasks, artifact_dir)
 
     sent = 0
     if args.submit:
         if not args.queue_url:
             raise SystemExit("--submit requires --queue-url")
         sqs = boto3.client("sqs")
-        for batch in _chunks(tasks, 10):
-            entries = [{"Id": str(i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(batch)]
-            resp = sqs.send_message_batch(QueueUrl=args.queue_url, Entries=entries)
-            if resp.get("Failed"):
-                raise RuntimeError(f"send_message_batch failed: {resp['Failed']}")
-            sent += len(resp.get("Successful", []))
+        sent = _send_tasks_to_sqs(sqs, queue_url=args.queue_url, tasks=tasks)
     print(
         json.dumps(
             {
@@ -427,6 +487,115 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
                 "checked_at": iso_now(),
                 "submit": bool(args.submit),
                 "queue_depth": depth,
+                "backlog_used_for_sizing": backlog,
+                "messages_per_worker": args.messages_per_worker,
+                "raw_desired_workers": raw_desired,
+                "active_matching_workers": len(active),
+                "to_submit": to_submit,
+                "submitted_count": len(submitted),
+                "submitted": submitted,
+                "active_examples": active[:20],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_enqueue_and_submit(args: argparse.Namespace) -> int:
+    if not args.queue_url:
+        raise SystemExit("missing --queue-url or SWEETSPOT_SQS_QUEUE_URL")
+    try:
+        validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    tasks = _read_jsonl(args.tasks_jsonl)
+    if args.run_id:
+        for task in tasks:
+            task.setdefault("run_id", args.run_id)
+    allowed_s3_prefixes = parse_allowed_s3_prefixes(getattr(args, "allowed_s3_prefix", None) or _env_allowed_s3_prefixes())
+    _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=allowed_s3_prefixes)
+    artifact_dir = args.artifact_dir or Path("artifacts") / (args.run_id or f"run-{utc_stamp()}")
+    tasks_out = _write_enqueue_artifacts(tasks, artifact_dir)
+
+    sqs = boto3.client("sqs")
+    batch = boto3.client("batch")
+    sent = 0
+    wait_history: list[dict[str, Any]] = []
+    depth = queue_depth(sqs, args.queue_url)
+    submitted: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    initial_visible = depth["visible"]
+    initial_backlog = depth["visible"] + (depth["not_visible"] if args.include_not_visible else 0)
+    sizing_sent = 0 if args.submit else len(tasks)
+    backlog_floor = initial_backlog + sizing_sent
+    backlog = max(initial_backlog, backlog_floor)
+    raw_desired = desired_worker_count(backlog, args.messages_per_worker, args.min_workers, args.max_workers)
+    active = active_jobs(batch, args.batch_job_queue, args.job_name_prefix) if args.subtract_active else []
+    to_submit = max(0, raw_desired - len(active)) if args.subtract_active else raw_desired
+    to_submit = min(to_submit, args.max_workers)
+
+    if args.submit:
+        sent = _send_tasks_to_sqs(sqs, queue_url=args.queue_url, tasks=tasks)
+        expected_visible = initial_visible + sent
+        min_visible = args.wait_for_visible_min if args.wait_for_visible_min is not None else expected_visible
+        depth, wait_history = _wait_for_visible_backlog(
+            sqs,
+            queue_url=args.queue_url,
+            min_visible=min_visible,
+            max_seconds=args.wait_for_visible_seconds,
+            interval_seconds=args.wait_interval_seconds,
+        )
+        observed_backlog = depth["visible"] + (depth["not_visible"] if args.include_not_visible else 0)
+        backlog_floor = initial_backlog + sent
+        backlog = max(observed_backlog, backlog_floor)
+        raw_desired = desired_worker_count(backlog, args.messages_per_worker, args.min_workers, args.max_workers)
+        active = active_jobs(batch, args.batch_job_queue, args.job_name_prefix) if args.subtract_active else []
+        to_submit = max(0, raw_desired - len(active)) if args.subtract_active else raw_desired
+        to_submit = min(to_submit, args.max_workers)
+        overrides = _worker_overrides(
+            sqs_queue_url=args.queue_url,
+            messages_per_worker=args.messages_per_worker,
+            visibility_timeout=args.visibility_timeout,
+            heartbeat_seconds=args.heartbeat_seconds,
+            task_timeout_seconds=args.task_timeout_seconds,
+            env=args.env or [],
+            allowed_s3_prefixes=allowed_s3_prefixes,
+            log_tail_bytes=args.log_tail_bytes,
+            max_log_bytes=args.max_log_bytes,
+            redact_regexes=args.redact_regex or [],
+            allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+            vcpus=args.vcpus,
+            memory=args.memory,
+        )
+        if to_submit > 0:
+            submitted = _submit_worker_jobs(
+                batch,
+                count=to_submit,
+                job_name_prefix=args.job_name_prefix,
+                batch_job_queue=args.batch_job_queue,
+                job_definition=args.job_definition,
+                overrides=overrides,
+                retry_attempts=args.retry_attempts,
+            )
+
+    print(
+        json.dumps(
+            {
+                "schema": "sweetspot.enqueue_and_submit_summary.v1",
+                "checked_at": iso_now(),
+                "submit": bool(args.submit),
+                "queue_url": args.queue_url,
+                "task_count": len(tasks),
+                "sent": sent,
+                "simulated_sent_for_sizing": sizing_sent,
+                "tasks_jsonl": str(tasks_out),
+                "allowed_s3_prefixes": list(allowed_s3_prefixes),
+                "wait_for_visible_seconds": args.wait_for_visible_seconds,
+                "wait_history": wait_history,
+                "queue_depth": depth,
+                "backlog_floor_used_for_sizing": backlog_floor,
                 "backlog_used_for_sizing": backlog,
                 "messages_per_worker": args.messages_per_worker,
                 "raw_desired_workers": raw_desired,
@@ -1082,6 +1251,259 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _list_matching_jobs(batch, *, job_queues: list[str], statuses: list[str], name_regex: str | None, max_jobs: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(name_regex) if name_regex else None
+    for job_queue in job_queues:
+        for status in statuses:
+            paginator = batch.get_paginator("list_jobs")
+            for page in paginator.paginate(jobQueue=job_queue, jobStatus=status):
+                ids: list[str] = []
+                for job in page.get("jobSummaryList", []):
+                    if pattern and not pattern.search(str(job.get("jobName", ""))):
+                        continue
+                    ids.append(str(job.get("jobId")))
+                    if len(rows) + len(ids) >= max_jobs:
+                        break
+                for i in range(0, len(ids), 100):
+                    rows.extend(batch.describe_jobs(jobs=ids[i : i + 100]).get("jobs", []))
+                if len(rows) >= max_jobs:
+                    return rows[:max_jobs]
+    return rows
+
+
+def _record_task_ids_from_events(events: list[dict[str, Any]], task_ids: list[str]) -> None:
+    for ev in events:
+        task_id = _extract_task_id_from_log_message(str(ev.get("message", "")))
+        if task_id and task_id not in task_ids:
+            task_ids.append(task_id)
+
+
+def _job_task_ids_from_logs(session, *, jobs: list[dict[str, Any]], region: str | None, log_group: str | None, max_events: int) -> dict[str, list[str]]:
+    logs = session.client("logs", region_name=region)
+    out: dict[str, list[str]] = {}
+    scan_limit = max(1, max_events)
+    for job in jobs:
+        stream = _job_log_stream(job)
+        group = log_group or _job_log_group(job) or "/aws/batch/job"
+        task_ids: list[str] = []
+        events_seen = 0
+        next_token: str | None = None
+        if stream:
+            try:
+                while events_seen < scan_limit:
+                    remaining = scan_limit - events_seen
+                    kwargs: dict[str, Any] = {"logGroupName": group, "logStreamNames": [stream], "filterPattern": '"task_id"', "limit": min(10000, remaining)}
+                    if next_token:
+                        kwargs["nextToken"] = next_token
+                    resp = logs.filter_log_events(**kwargs)
+                    events = resp.get("events", [])
+                    events_seen += len(events)
+                    _record_task_ids_from_events(events, task_ids)
+                    new_token = resp.get("nextToken")
+                    if not new_token or new_token == next_token:
+                        break
+                    next_token = str(new_token)
+            except Exception:  # noqa: BLE001 - fall back when FilterLogEvents is unavailable or denied
+                try:
+                    resp = logs.get_log_events(logGroupName=group, logStreamName=stream, limit=min(10000, scan_limit), startFromHead=False)
+                except Exception:  # noqa: BLE001 - repair planning should degrade when a job has no readable logs yet
+                    resp = {"events": []}
+                _record_task_ids_from_events(resp.get("events", []), task_ids)
+        out[str(job.get("jobId"))] = task_ids
+    return out
+
+
+def cmd_repair_plan(args: argparse.Namespace) -> int:
+    tasks = _read_jsonl(args.tasks_jsonl)
+    task_by_id = {str(task.get("task_id")): task for task in tasks if task.get("task_id")}
+    if len(task_by_id) != len(tasks):
+        raise SystemExit("repair-plan requires every task to have a unique non-empty task_id")
+    missing_ids: set[str] = set()
+    state_counts: Counter[str] = Counter()
+    for rec in _iter_jsonl(args.task_status_jsonl):
+        task_id = str(rec.get("task_id") or "")
+        state = str(rec.get("state") or "unknown")
+        state_counts[state] += 1
+        if task_id and state != "done":
+            missing_ids.add(task_id)
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    batch = session.client("batch", region_name=args.region)
+    active_statuses = args.active_status or ACTIVE_STATUSES
+    failed_statuses = args.failed_status or ["FAILED"]
+    job_queues = args.job_queue or []
+    active_jobs_found = _list_matching_jobs(batch, job_queues=job_queues, statuses=active_statuses, name_regex=args.job_name_regex, max_jobs=args.max_jobs) if job_queues else []
+    failed_jobs_found = _list_matching_jobs(batch, job_queues=job_queues, statuses=failed_statuses, name_regex=args.job_name_regex, max_jobs=args.max_jobs) if job_queues else []
+    active_task_ids_by_job = _job_task_ids_from_logs(session, jobs=active_jobs_found, region=args.region, log_group=args.log_group, max_events=args.log_tail) if active_jobs_found else {}
+    failed_task_ids_by_job = _job_task_ids_from_logs(session, jobs=failed_jobs_found, region=args.region, log_group=args.log_group, max_events=args.log_tail) if failed_jobs_found else {}
+    active_task_ids = {task_id for ids in active_task_ids_by_job.values() for task_id in ids}
+    failed_task_ids = {task_id for ids in failed_task_ids_by_job.values() for task_id in ids}
+    blocked_active = missing_ids & active_task_ids
+    repair_ids = set(missing_ids)
+    if not args.include_active:
+        repair_ids -= blocked_active
+    if args.only_known_failed:
+        repair_ids &= failed_task_ids
+    unknown_ids = sorted(repair_ids - set(task_by_id))
+    if unknown_ids:
+        raise SystemExit(f"task_status contains task_id values absent from tasks JSONL: {unknown_ids[:10]}")
+    ordered_repair_ids = [str(task.get("task_id")) for task in tasks if str(task.get("task_id")) in repair_ids]
+    args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    args.out_jsonl.write_text("".join(json.dumps(task_by_id[task_id], sort_keys=True) + "\n" for task_id in ordered_repair_ids))
+    report = {
+        "schema": "sweetspot.repair_plan.v1",
+        "checked_at": iso_now(),
+        "tasks_jsonl": str(args.tasks_jsonl),
+        "task_status_jsonl": str(args.task_status_jsonl),
+        "out_jsonl": str(args.out_jsonl),
+        "task_count": len(tasks),
+        "state_counts": dict(state_counts),
+        "missing_count": len(missing_ids),
+        "active_job_count": len(active_jobs_found),
+        "failed_job_count": len(failed_jobs_found),
+        "active_task_count": len(active_task_ids),
+        "failed_task_count": len(failed_task_ids),
+        "blocked_active_count": len(blocked_active),
+        "repair_task_count": len(ordered_repair_ids),
+        "repair_task_ids": ordered_repair_ids[:1000],
+        "repair_task_ids_truncated": len(ordered_repair_ids) > 1000,
+        "blocked_active_task_ids": sorted(blocked_active)[:1000],
+        "only_known_failed": bool(args.only_known_failed),
+        "include_active": bool(args.include_active),
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_cleanup_stale_messages(args: argparse.Namespace) -> int:
+    if not args.queue_url:
+        raise SystemExit("missing --queue-url or SWEETSPOT_SQS_QUEUE_URL")
+    sqs = boto3.client("sqs")
+    s3 = boto3.client("s3")
+    scanned = deleted = done = invalid = kept = 0
+    examples: list[dict[str, Any]] = []
+    while scanned < args.max_messages:
+        resp = sqs.receive_message(
+            QueueUrl=args.queue_url,
+            MaxNumberOfMessages=min(10, args.max_messages - scanned),
+            WaitTimeSeconds=args.wait_time,
+            VisibilityTimeout=args.visibility_timeout,
+            AttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
+        )
+        messages = resp.get("Messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            scanned += 1
+            receipt = msg.get("ReceiptHandle")
+            task: dict[str, Any] | None = None
+            try:
+                parsed = json.loads(msg.get("Body", "{}"))
+                if not isinstance(parsed, dict):
+                    raise ValueError("message body is not a JSON object")
+                task = parsed
+                if args.run_id and task.get("run_id") != args.run_id:
+                    kept += 1
+                    if len(examples) < 20:
+                        examples.append({"task_id": task.get("task_id"), "state": "skipped_run_id", "deleted": False})
+                    continue
+                record = _check_task(s3, task, None, allow_legacy_done_markers=bool(args.allow_legacy_done_markers))
+                is_done = record.get("state") == "done"
+            except Exception as exc:  # noqa: BLE001 - report malformed messages; do not delete by default
+                invalid += 1
+                is_done = False
+                record = {"state": "invalid_message", "error": str(exc)}
+            if is_done:
+                done += 1
+                if args.apply and receipt:
+                    sqs.delete_message(QueueUrl=args.queue_url, ReceiptHandle=receipt)
+                    deleted += 1
+            else:
+                kept += 1
+            if len(examples) < 20:
+                examples.append({"task_id": task.get("task_id") if task else None, "state": record.get("state"), "deleted": bool(args.apply and is_done)})
+    print(
+        json.dumps(
+            {
+                "schema": "sweetspot.stale_message_cleanup.v1",
+                "checked_at": iso_now(),
+                "queue_url": args.queue_url,
+                "apply": bool(args.apply),
+                "scanned": scanned,
+                "done_messages": done,
+                "deleted": deleted,
+                "kept": kept,
+                "invalid": invalid,
+                "examples": examples,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_estimate_runtime(args: argparse.Namespace) -> int:
+    samples: list[tuple[float, float]] = []
+    if args.sample_jsonl:
+        for path in args.sample_jsonl:
+            for obj in _iter_jsonl(path):
+                sample = _sample_from_runtime_obj(obj)
+                if sample:
+                    samples.append(sample)
+    if args.completed_units is not None or args.elapsed_seconds is not None:
+        if args.completed_units is None or args.elapsed_seconds is None:
+            raise SystemExit("--completed-units and --elapsed-seconds must be provided together")
+        samples.append((float(args.completed_units), float(args.elapsed_seconds)))
+    if not samples:
+        raise SystemExit("provide --sample-jsonl or --completed-units/--elapsed-seconds")
+    rates = [units / seconds for units, seconds in samples if units > 0 and seconds > 0]
+    if not rates:
+        raise SystemExit("no positive throughput samples")
+    target_units = args.target_units
+    if target_units is None:
+        if args.task_count is None or args.units_per_task is None:
+            raise SystemExit("provide --target-units or both --task-count and --units-per-task")
+        target_units = args.task_count * args.units_per_task
+    median_rate = statistics.median(rates)
+    p10_rate = sorted(rates)[max(0, int(0.1 * (len(rates) - 1)))]
+    total_worker_seconds = target_units / median_rate
+    conservative_worker_seconds = target_units / max(p10_rate, 1e-9)
+    parallelism = max(1, args.active_workers)
+    predicted_wall_seconds = total_worker_seconds / parallelism
+    conservative_wall_seconds = conservative_worker_seconds / parallelism
+    vcpu_hours = total_worker_seconds * args.vcpus_per_worker / 3600.0
+    estimated_cost = vcpu_hours * args.price_per_vcpu_hour if args.price_per_vcpu_hour is not None else None
+    per_task_seconds = (args.units_per_task / median_rate) if args.units_per_task else None
+    warnings: list[str] = []
+    if per_task_seconds and args.task_timeout_seconds and per_task_seconds > args.task_timeout_seconds * args.timeout_safety_fraction:
+        warnings.append("predicted per-task runtime is too close to or above timeout; split tasks smaller or raise timeout/visibility")
+    if args.spot and per_task_seconds and per_task_seconds > args.max_spot_task_seconds:
+        warnings.append("long uncheckpointed Spot tasks waste too much work on interruption; use smaller chunks")
+    print(
+        json.dumps(
+            {
+                "schema": "sweetspot.runtime_estimate.v1",
+                "checked_at": iso_now(),
+                "sample_count": len(samples),
+                "median_units_per_second_per_worker": median_rate,
+                "p10_units_per_second_per_worker": p10_rate,
+                "target_units": target_units,
+                "active_workers": parallelism,
+                "predicted_wall_seconds": predicted_wall_seconds,
+                "conservative_wall_seconds": conservative_wall_seconds,
+                "worker_vcpu_hours": vcpu_hours,
+                "estimated_compute_cost": estimated_cost,
+                "predicted_seconds_per_task": per_task_seconds,
+                "warnings": warnings,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_describe_job(args: argparse.Namespace) -> int:
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     batch = session.client("batch", region_name=args.region)
@@ -1581,6 +2003,37 @@ def main() -> int:
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_enqueue_jsonl)
 
+    p = sub.add_parser("enqueue-and-submit", help="Atomically enqueue tasks, wait for SQS visibility, then submit Batch workers")
+    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--tasks-jsonl", type=Path, required=True)
+    p.add_argument("--run-id")
+    p.add_argument("--artifact-dir", type=Path)
+    p.add_argument("--batch-job-queue", required=True)
+    p.add_argument("--job-definition", required=True)
+    p.add_argument("--job-name-prefix", default="sweetspot-worker")
+    p.add_argument("--messages-per-worker", type=int, default=1)
+    p.add_argument("--max-workers", type=int, default=64)
+    p.add_argument("--min-workers", type=int, default=0)
+    p.add_argument("--subtract-active", action="store_true")
+    p.add_argument("--include-not-visible", action="store_true")
+    p.add_argument("--vcpus", type=int)
+    p.add_argument("--memory", type=int)
+    p.add_argument("--visibility-timeout", type=int, default=1800)
+    p.add_argument("--heartbeat-seconds", type=int, default=300)
+    p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS)
+    p.add_argument("--retry-attempts", type=int)
+    p.add_argument("--env", action="append", type=_parse_env_pair, default=[])
+    p.add_argument("--allowed-s3-prefix", action="append", default=[])
+    p.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
+    p.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
+    p.add_argument("--redact-regex", action="append", default=[])
+    p.add_argument("--allow-legacy-done-markers", action="store_true")
+    p.add_argument("--wait-for-visible-seconds", type=float, default=30.0)
+    p.add_argument("--wait-for-visible-min", type=int, help="minimum visible messages before submitting workers; default initial visible backlog plus sent messages")
+    p.add_argument("--wait-interval-seconds", type=float, default=2.0)
+    p.add_argument("--submit", action="store_true")
+    p.set_defaults(func=cmd_enqueue_and_submit)
+
     p = sub.add_parser("derive-canary")
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
@@ -1681,6 +2134,49 @@ def main() -> int:
     p.add_argument("--name-regex")
     p.add_argument("--max-jobs", type=int, default=1000)
     p.set_defaults(func=cmd_jobs)
+
+    p = sub.add_parser("repair-plan", help="Build a repair JSONL from finalizer status while excluding tasks already owned by active jobs")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--tasks-jsonl", type=Path, required=True)
+    p.add_argument("--task-status-jsonl", type=Path, required=True)
+    p.add_argument("--out-jsonl", type=Path, required=True)
+    p.add_argument("--job-queue", action="append", default=[], help="Batch queue to inspect for active/failed jobs; repeatable")
+    p.add_argument("--job-name-regex")
+    p.add_argument("--active-status", action="append", choices=list(ACTIVE_STATUSES), help="active statuses to exclude; default all active statuses")
+    p.add_argument("--failed-status", action="append", choices=["FAILED"], help="failed statuses to classify; default FAILED")
+    p.add_argument("--include-active", action="store_true", help="unsafe: include missing tasks even if logs show an active job owns them")
+    p.add_argument("--only-known-failed", action="store_true", help="repair only missing tasks observed in failed job logs")
+    p.add_argument("--log-group")
+    p.add_argument("--log-tail", type=int, default=50000, help="maximum task-id CloudWatch log events to collect from each matching job stream")
+    p.add_argument("--max-jobs", type=int, default=1000)
+    p.set_defaults(func=cmd_repair_plan)
+
+    p = sub.add_parser("cleanup-stale-messages", help="Dry-run/apply deletion of visible SQS messages whose S3 done marker already exists")
+    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--run-id", help="Only consider messages for this run_id")
+    p.add_argument("--max-messages", type=int, default=100)
+    p.add_argument("--wait-time", type=int, default=1)
+    p.add_argument("--visibility-timeout", type=int, default=5, help="Short dry-run lease so skipped messages quickly reappear")
+    p.add_argument("--allow-legacy-done-markers", action="store_true")
+    p.add_argument("--apply", action="store_true", help="Delete stale done messages; default is dry-run")
+    p.set_defaults(func=cmd_cleanup_stale_messages)
+
+    p = sub.add_parser("estimate-runtime", help="Estimate wall time/cost from canary or task summary telemetry")
+    p.add_argument("--sample-jsonl", action="append", type=Path, default=[], help="JSONL with task summaries/metrics containing completed_units+seconds; repeatable")
+    p.add_argument("--completed-units", type=float)
+    p.add_argument("--elapsed-seconds", type=float)
+    p.add_argument("--target-units", type=float)
+    p.add_argument("--task-count", type=float)
+    p.add_argument("--units-per-task", type=float)
+    p.add_argument("--active-workers", type=int, default=1)
+    p.add_argument("--vcpus-per-worker", type=float, default=1.0)
+    p.add_argument("--price-per-vcpu-hour", type=float)
+    p.add_argument("--task-timeout-seconds", type=float)
+    p.add_argument("--timeout-safety-fraction", type=float, default=0.8)
+    p.add_argument("--spot", action="store_true")
+    p.add_argument("--max-spot-task-seconds", type=float, default=1800.0)
+    p.set_defaults(func=cmd_estimate_runtime)
 
     p = sub.add_parser("describe-job")
     p.add_argument("--profile")

@@ -8,6 +8,11 @@ All notable changes to this project are documented here. This project uses human
 
 - Contributor guide covering local development, release checks, dependency pins, and SweetSpot's trusted-workload boundary.
 - PyPI-oriented project metadata for repository URLs, keywords, classifiers, and SPDX license expression.
+- `enqueue-and-submit` command that waits for SQS visible-message depth before sizing/submitting a worker wave.
+- `repair-plan` command that combines finalizer task status with Batch job/log state to avoid repairing tasks still owned by active workers.
+- `estimate-runtime` command for canary-derived wall-time, timeout-risk, and compute-cost estimates.
+- `cleanup-stale-messages` command for dry-run/apply deletion of visible duplicate SQS messages whose done markers already exist.
+- README guidance for small idempotent chunks, canary sizing, safe repair planning, and stale-message cleanup.
 
 ### Fixed
 
