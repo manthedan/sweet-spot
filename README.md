@@ -328,6 +328,7 @@ sweetspot dlq \
   --apply
 
 # read-only Spot scout (also available as standalone sweetspot-scout)
+# Emits JSON to stdout by default; add --format table for human-readable output.
 # Use --preset mixed to surface ARM/Graviton savings; deploy ARM only after a canary proves compatibility.
 sweetspot scout \
   --preset mixed \

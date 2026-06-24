@@ -31,6 +31,10 @@ All notable changes to this project are documented here. This project uses human
 - Initial `sweetspot plan JOB_SPEC` command that validates the declarative job contract and emits JSON plan status/reason codes without mutating AWS resources.
 - `sweetspot scout --worker-memory` for memory-aware worker packing and cost estimates.
 
+### Changed
+
+- `sweetspot scout` now emits JSON to stdout by default; human table output is opt-in with `--format table`.
+
 ### Fixed
 
 - `sweetspot scout` now labels placement scores as configuration-scoped on per-pool rows instead of implying per-instance/AZ placement guarantees.

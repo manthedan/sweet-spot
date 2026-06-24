@@ -393,7 +393,8 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     ap.add_argument("--cloudwatch-log-cost-per-gb", type=float, default=0.50)
     ap.add_argument("--s3-storage-gb-month-per-1m-units", type=float, default=0.0)
     ap.add_argument("--s3-storage-cost-per-gb-month", type=float, default=0.023)
-    ap.add_argument("--json-out", type=Path)
+    ap.add_argument("--format", choices=["json", "table"], default="json", help="Output format; JSON stdout is the default for agent workflows")
+    ap.add_argument("--json-out", type=Path, help="Optional path to also write the JSON report")
     args = ap.parse_args(argv)
     if args.worker_vcpus <= 0:
         ap.error("--worker-vcpus must be greater than 0")
@@ -553,9 +554,14 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         "regions": region_rows,
         "top_instance_pools": instance_rows[: max(0, args.top_instance_rows)],
     }
+    report_json = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        args.json_out.write_text(report_json)
+
+    if args.format == "json":
+        print(report_json, end="")
+        return 0
 
     print(f"checked_at: {now.isoformat()}")
     print(f"bucket_region: {bucket_region}")

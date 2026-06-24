@@ -62,13 +62,28 @@ class CostModelTests(unittest.TestCase):
                 mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2}),
                 contextlib.redirect_stdout(out),
             ):
-                self.assertEqual(scout.main(["--regions", "us-west-2", "--instance-types", "c7i.large", "--json-out", str(json_out)]), 0)
+                self.assertEqual(scout.main(["--regions", "us-west-2", "--instance-types", "c7i.large", "--json-out", str(json_out), "--format", "table"]), 0)
             report = json.loads(json_out.read_text())
         pool = report["top_instance_pools"][0]
         self.assertEqual(pool["configuration_placement_score"], 8)
         self.assertEqual(pool["placement_score_scope"], "region_instance_type_configuration")
         self.assertNotIn("placement_score", pool)
         self.assertIn("cfg_score", out.getvalue())
+
+    def test_scout_emits_json_stdout_by_default(self) -> None:
+        out = io.StringIO()
+        with (
+            mock.patch("sweetspot.scout.boto3.Session", return_value=mock.Mock(client=mock.Mock(return_value=mock.Mock()))),
+            mock.patch("sweetspot.scout.placement_scores", return_value={512: {"us-west-2": 8}}),
+            mock.patch("sweetspot.scout.latest_spot_prices", return_value={("c7i.large", "usw2-az1"): 0.02}),
+            mock.patch("sweetspot.scout.instance_vcpus", return_value={"c7i.large": 2}),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(scout.main(["--regions", "us-west-2", "--instance-types", "c7i.large"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.scout.v1")
+        self.assertEqual(report["top_instance_pools"][0]["instance_type"], "c7i.large")
+        self.assertNotIn("TOP INSTANCE POOLS", out.getvalue())
 
     def test_scout_caps_packed_workers_by_memory_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,6 +110,8 @@ class CostModelTests(unittest.TestCase):
                             "4096",
                             "--json-out",
                             str(json_out),
+                            "--format",
+                            "table",
                         ]
                     ),
                     0,
