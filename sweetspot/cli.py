@@ -1506,7 +1506,26 @@ def cmd_cancel_jobs(args: argparse.Namespace) -> int:
         "reason": args.reason,
         "jobs": rows,
     }
-    print(json.dumps(report, indent=2, sort_keys=True))
+    if getattr(args, "format", "json") == "table":
+        _print_key_values(
+            "SweetSpot cancel-jobs",
+            {
+                "checked_at": report["checked_at"],
+                "apply": report["apply"],
+                "matched_count": report["matched_count"],
+                "actionable_count": report["actionable_count"],
+                "cancelled_count": report["cancelled_count"],
+                "terminated_count": report["terminated_count"],
+                "skipped_count": report["skipped_count"],
+                "terminate_running": report["terminate_running"],
+                "job_name_regex": report["job_name_regex"],
+            },
+        )
+        if rows:
+            print()
+            _print_table("jobs", ["jobId", "jobName", "jobQueue", "status", "action", "skip_reason"], rows)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -2231,7 +2250,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
-    "cancel-jobs": {"apply", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
+    "cancel-jobs": {"apply", "format", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
     "dlq": {"apply", "dlq_url", "format", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
@@ -2253,6 +2272,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "queue_url",
         "region",
         "run_id",
+        "sqs_queue_url",
         "submit",
         "subtract_active",
         "task_timeout_seconds",
@@ -2260,7 +2280,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "vcpus",
         "visibility_timeout",
     },
-    "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "submit", "tasks_jsonl"},
+    "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "sqs_queue_url", "submit", "tasks_jsonl"},
     "finalize": {"allow_legacy_done_markers", "artifact_dir", "dry_run", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
     "describe-job": {"format", "job_id", "profile", "region"},
     "jobs": {"format", "job_name_regex", "job_queue", "max_jobs", "profile", "region"},
@@ -2556,7 +2576,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--run-id")
     p.add_argument("--artifact-dir", type=Path)
@@ -2572,7 +2592,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--run-id")
     p.add_argument("--artifact-dir", type=Path)
@@ -2693,6 +2713,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reason", default="Cancelled by sweetspot cancel-jobs")
     p.add_argument("--terminate-running", action="store_true", help="also terminate STARTING/RUNNING jobs instead of skipping them")
     p.add_argument("--apply", action="store_true", help="perform cancellation/termination; default is dry-run")
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_cancel_jobs)
 
     p = _add_parser_with_examples(

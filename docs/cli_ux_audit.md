@@ -1,6 +1,6 @@
 # SweetSpot CLI and UX Audit (Re-audit)
 
-> Re-audited after commit `590fee6` which addresses the original findings.
+> Re-audited after commit `26202cd` which addresses the second round of findings.
 > Original audit items are marked with their resolution status.
 
 ## Resolution summary
@@ -8,20 +8,20 @@
 | Original item | Status | Commit(s) |
 |---|---|---|
 | A. No help epilog/examples | **RESOLVED** | `3b3bf58` |
-| B. No --output-format option | **PARTIALLY RESOLVED** | `5fefa27` (status only) |
+| B. No --output-format option | **RESOLVED** | `5fefa27`, `1e7ff77`, `26202cd` |
 | C. Three separate entry points | **RESOLVED** | `3381903` |
 | D. No version/status command | **RESOLVED** | `3790549`, `8b061c2` |
 | E. No --profile/--region on AWS commands | **RESOLVED** | `4297dd5` |
-| F. Argument duplication | **NOT ADDRESSED** | - |
+| F. Argument duplication | **RESOLVED** | `96181f7` |
 | G. No config file support | **RESOLVED** | `6b4cfb8` |
-| H. finalize --dry-run | **NOT ADDRESSED** | - |
+| H. finalize --dry-run | **RESOLVED** | `7808fd4` |
 | I. No progress output | **NOT ADDRESSED** | - |
 | J. No sweetspot init | **NOT ADDRESSED** | - |
 | K. logs --limit/--tail confusion | **RESOLVED** | `590fee6` |
-| L. No cancel/drain | **NOT ADDRESSED** | - |
+| L. No cancel/drain | **PARTIALLY RESOLVED** | `7a78615` (cancel-jobs only) |
 | M. Mixed SystemExit/RuntimeError | **RESOLVED** | `b336960` |
 | N. No shell completion | **NOT ADDRESSED** | - |
-| O. 2226-line cli.py monolith | **WORSENED** (now 2692 lines) | - |
+| O. 2226-line cli.py monolith | **IMPROVED** | `26202cd` (extracted output.py) |
 | P. Inconsistent queue URL flag | **RESOLVED** | `2e7126d` |
 | (New) Repair-plan log scanning | **IMPROVED** | `4999b0a` |
 | (New) Enqueue-and-submit sizing | **IMPROVED** | `4999b0a` |
@@ -30,7 +30,7 @@
 
 Three entry points (`pyproject.scripts`):
 
-- `sweetspot` - the main CLI (now 2692 lines, 22 subcommands including `version`, `status`, `scout`, `lane-manager`)
+- `sweetspot` - the main CLI (now 2910 lines across `cli.py` + `output.py`, 22 subcommands including `version`, `status`, `scout`, `lane-manager`, `cancel-jobs`)
 - `sweetspot-scout` - Spot pool ranking tool (`scout.py`, 533 lines), also available as `sweetspot scout`
 - `sweetspot-lane-manager` - multi-region lane allocator (`lane_manager.py`, 224 lines), also available as `sweetspot lane-manager`
 
@@ -53,6 +53,7 @@ Three entry points (`pyproject.scripts`):
 | `cleanup-stale-messages` | Dry-run/apply deletion of stale SQS messages |
 | `estimate-runtime` | Estimate wall time/cost from telemetry |
 | `describe-job` | Inspect a Batch job |
+| `cancel-jobs` | Cancel/terminate Batch jobs by name pattern (dry-run by default) |
 | `jobs` | List/filter Batch jobs |
 | `logs` | Fetch CloudWatch logs for a job/stream |
 | `watch-job` | Poll a Batch job until terminal |
@@ -290,15 +291,99 @@ The file grew from 2226 to 2692 lines (466 lines added). The config system, vers
 
 ---
 
-## 6. Remaining improvement priorities (updated)
+## 6. Re-audit round 2: New findings on latest commits
+
+### B. --output-format -- NOW FULLY RESOLVED
+
+`--format table` is now available on all read-oriented commands: `status`, `jobs`, `describe-job`, `logs`, `watch-job`, `doctor`, and `dlq`. Table output uses the extracted `output.py` module with `print_table`, `print_key_values`, and `format_table_value` helpers. Control characters in log messages are escaped (`test_logs_table_output_escapes_control_characters`). JSON remains the default.
+
+Implementation quality is clean: `format_table_value` handles None, dict/list (JSON-serialized), and all C0/C1 control characters. The `output.py` module is well-separated and reusable.
+
+### F. Argument duplication -- RESOLVED
+
+Three shared argument helper functions extracted:
+- `_add_batch_worker_target_args`: `--batch-job-queue`, `--job-definition`, `--job-name-prefix`
+- `_add_worker_sizing_args`: `--messages-per-worker`, `--max-workers`, `--min-workers`, `--subtract-active`, `--include-not-visible`
+- `_add_worker_runtime_args`: `--vcpus`, `--memory`, `--visibility-timeout`, `--heartbeat-seconds`, `--task-timeout-seconds`, `--retry-attempts`, `--env`, `--allowed-s3-prefix`, `--log-tail-bytes`, `--max-log-bytes`, `--redact-regex`, `--allow-legacy-done-markers`
+
+Used by `submit-workers`, `supervise-workers`, and `enqueue-and-submit`. The `legacy_done_markers_help` parameter allows per-command help text. This eliminated ~120 lines of repeated `add_argument` calls.
+
+### H. finalize --dry-run -- RESOLVED
+
+`sweetspot finalize --dry-run` scans tasks, writes local artifacts, but skips all S3 mutations (no manifest uploads, no READY deletion, no READY publishing). The output report includes `dry_run: true` plus `would_*` fields showing what S3 targets would have been written (`would_final_manifest_s3`, `would_ready_s3`, etc.). `--publish-ready` is allowed with `--dry-run` for previewing READY targets without requiring a live upload.
+
+The implementation is correct: `effective_upload = requested_upload and not dry_run` cleanly gates all S3 write paths. The refused-ready path (incomplete + require-complete) also reports `dry_run` and `would_ready_s3`.
+
+### L. cancel/drain -- PARTIALLY RESOLVED
+
+`sweetspot cancel-jobs` implemented with strong safety guardrails:
+- `--job-name-regex` is **required** (no broad cancellation possible)
+- Dry-run by default; `--apply` needed for actual cancellation
+- `SUBMITTED`/`PENDING`/`RUNNABLE` jobs are cancelled via `cancel_job`
+- `STARTING`/`RUNNING` jobs require explicit `--terminate-running` flag (uses `terminate_job`)
+- Terminal statuses (SUCCEEDED/FAILED) are always skipped
+- `--reason` is passed to the AWS API
+- Output includes `matched_count`, `actionable_count`, `cancelled_count`, `terminated_count`, `skipped_count`
+- Added to `CONFIG_COMMAND_KEYS` for config file support
+
+Queue drain (`drain-queue`) is still not implemented.
+
+### O. cli.py monolith -- IMPROVED
+
+Table output logic extracted to `sweetspot/output.py` (41 lines: `format_table_value`, `print_table`, `print_key_values`). Shared worker argument helpers extracted to `_add_batch_worker_target_args`, `_add_worker_sizing_args`, `_add_worker_runtime_args` (item F). `cli.py` is still 2869 lines but the extraction pattern is established and can continue incrementally.
+
+### New minor observations
+
+1. **`--format` added to `CONFIG_COMMAND_KEYS`**: Correctly includes `format` for commands that support it (`dlq`, `doctor`, `status`, and others), so config files can set default output format.
+
+2. **`cancel-jobs` in production loop**: README step 6 now references `sweetspot cancel-jobs` as part of the safe production workflow, before stale-message cleanup.
+
+3. **`dlq` table output**: Correctly renders `by_run` and `by_schema` as JSON-serialized values in table mode (via `format_table_value`), since they are dicts.
+
+4. **`watch-job` table output**: Uses single-line tab-separated format per poll iteration, which is appropriate for monitoring.
+
+---
+
+## 8. Re-audit round 2: New issues found
+
+### Q. `cancel-jobs` missing `--format` support -- RESOLVED
+
+`cancel-jobs` now supports `--format json|table`, includes `"format"` in its `CONFIG_COMMAND_KEYS` entry, and renders the matched job list through `_print_table` in table mode. JSON remains the default output.
+
+### R. `supervise-workers` partially bypasses `_add_worker_sizing_args`
+
+`submit-workers` and `enqueue-and-submit` both use `_add_worker_sizing_args` for shared sizing flags, but `supervise-workers` inlines its own `--messages-per-worker` and `--include-not-visible` instead. The remaining sizing flags are replaced by supervisor-specific equivalents (`--target-active-workers`, `--max-active-workers`, `--max-submit-per-loop`), which is correct. However, `--messages-per-worker` and `--include-not-visible` are genuinely shared semantics that could drift independently if the helper is updated later.
+
+**Recommendation**: Either extract just `--messages-per-worker` and `--include-not-visible` into a smaller shared helper used by all three commands, or document that `supervise-workers` intentionally owns these flags.
+
+### S. `enqueue-and-submit` uses different `--queue-url` convention -- RESOLVED
+
+`enqueue-and-submit` and `enqueue-jsonl` now accept `--sqs-queue-url` as an alias for `--queue-url`, and both commands allow `sqs_queue_url` in JSON config defaults. Existing `--queue-url` usage and JSON output behavior are unchanged.
+
+### T. `_print_status_table` builds queue rows manually instead of using `_print_table` -- RESOLVED
+
+`_print_status_table` now collects queue rows and passes them through `_print_table`, so queue values use the shared table formatting path.
+
+### U. `watch-job` table header uses a manual boolean flag pattern
+
+The `printed_table_header` boolean tracks whether the header has been printed across poll iterations. This works correctly, but the pattern is fragile: if someone adds an early-return or exception path between the header check and data print, the header could appear without data. Using `_print_key_values` per iteration (which always includes the title) would be more robust, though slightly more verbose.
+
+**Recommendation**: Acceptable as-is for a monitoring command. If refactored later, prefer `_print_key_values` per iteration.
+
+### V. `finalize --dry-run` writes local artifacts by design
+
+`--dry-run` skips S3 mutations but still writes `final_manifest.json`, `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` to the local artifact directory. This is documented in the `--help` text ("Scan and write local artifacts, but skip S3 manifest uploads") and is intentional. However, an operator using `finalize --dry-run` in a CI gate or ephemeral container still needs a writable filesystem.
+
+**Recommendation**: Acceptable as-is. If a future use case requires pure no-side-effect dry-run, add a `--no-artifacts` flag or stream results to stdout instead.
+
+---
+
+## 9. Remaining improvement priorities (updated)
 
 | Priority | Feature | Rationale |
 |---|---|---|
-| Medium | `--format table` on `jobs`, `dlq`, `doctor`, `describe-job` | Extend the pattern started by `status` |
-| Medium | `finalize --dry-run` | Safety parity with all other mutating commands |
-| Medium | `sweetspot cancel-jobs` / `drain-queue` | Operational completeness |
-| Medium | Extract shared worker argument helper | Reduce ~120 lines of flag duplication across 3 commands |
-| Low | Split `cli.py` (now 2692 lines) into a package | Maintainability is degrading with each addition |
+| Low | `sweetspot drain-queue` | Complement to cancel-jobs for graceful queue drain |
+| Low | Split `cli.py` further (still 2869 lines) | Continue extraction pattern started with output.py |
 | Low | `sweetspot init` guided setup | Onboarding |
 | Low | `sweetspot logs --follow` | Live log tailing |
 | Low | Progress output during `finalize`/`supervise-workers` | Visual feedback for long ops |
