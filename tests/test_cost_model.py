@@ -83,6 +83,9 @@ class CostModelTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertEqual(report["schema"], "sweetspot.scout.v1")
         self.assertEqual(report["top_instance_pools"][0]["instance_type"], "c7i.large")
+        self.assertIn("throughput_default_used", {reason["code"] for reason in report["reasons"]})
+        self.assertIn("cost_components_not_provided", {reason["code"] for reason in report["reasons"]})
+        self.assertIn("cloudwatch_log_ingest", report["cost_model"]["omitted_cost_components"])
         self.assertNotIn("TOP INSTANCE POOLS", out.getvalue())
 
     def test_scout_caps_packed_workers_by_memory_request(self) -> None:

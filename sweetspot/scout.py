@@ -129,6 +129,12 @@ PRESETS = {
     "mixed": X86_CPU_TYPES + ARM_CPU_TYPES,
 }
 
+SCOUT_REASON_CODES: dict[str, str] = {
+    "cost_components_not_provided": "One or more optional non-compute cost components were left at zero and may be omitted from the estimate.",
+    "replay_fraction_unobserved": "Replay/interruption overhead was not observed and defaults to zero unless explicitly overridden.",
+    "throughput_default_used": "No observed throughput summaries were provided, so default units/sec was used.",
+}
+
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     p = urlparse(uri)
@@ -305,6 +311,52 @@ def observed_perf(session: boto3.Session, refs: list[str], max_files: int) -> di
         "observed_replay_fraction": observed_replay_fraction,
         "bytes_transferred": bytes_transferred,
     }
+
+
+def omitted_cost_components(args: argparse.Namespace) -> list[str]:
+    out = []
+    if args.extra_cost_per_1m_units == 0:
+        out.append("extra_external_costs")
+    if args.cross_region_gb_per_1m_units == 0:
+        out.append("cross_region_transfer")
+    if args.nat_gb_per_1m_units == 0:
+        out.append("nat_or_private_link_data_processing")
+    if args.cloudwatch_log_gb_per_1m_units == 0:
+        out.append("cloudwatch_log_ingest")
+    if args.s3_storage_gb_month_per_1m_units == 0:
+        out.append("s3_storage")
+    return out
+
+
+def scout_reasons(args: argparse.Namespace, obs: dict[str, Any]) -> list[dict[str, Any]]:
+    reasons: list[dict[str, Any]] = []
+    if not obs.get("count"):
+        reasons.append(
+            {
+                "code": "throughput_default_used",
+                "severity": "warning",
+                "message": SCOUT_REASON_CODES["throughput_default_used"],
+            }
+        )
+    if args.expected_replay_fraction is None and not obs.get("useful_compute_seconds"):
+        reasons.append(
+            {
+                "code": "replay_fraction_unobserved",
+                "severity": "warning",
+                "message": SCOUT_REASON_CODES["replay_fraction_unobserved"],
+            }
+        )
+    omitted = omitted_cost_components(args)
+    if omitted:
+        reasons.append(
+            {
+                "code": "cost_components_not_provided",
+                "severity": "info",
+                "message": SCOUT_REASON_CODES["cost_components_not_provided"],
+                "components": omitted,
+            }
+        )
+    return reasons
 
 
 def noncompute_cost_per_1m_units(args: argparse.Namespace, *, bucket_local: bool | None) -> float:
@@ -527,6 +579,7 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     report = {
         "schema": "sweetspot.scout.v1",
         "checked_at": now.isoformat(),
+        "reasons": scout_reasons(args, obs),
         "home_region": args.home_region,
         "bucket": args.bucket,
         "bucket_region": bucket_region,
@@ -550,6 +603,7 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
             "cloudwatch_log_cost_per_gb": args.cloudwatch_log_cost_per_gb,
             "s3_storage_gb_month_per_1m_units": args.s3_storage_gb_month_per_1m_units,
             "s3_storage_cost_per_gb_month": args.s3_storage_cost_per_gb_month,
+            "omitted_cost_components": omitted_cost_components(args),
         },
         "regions": region_rows,
         "top_instance_pools": instance_rows[: max(0, args.top_instance_rows)],
