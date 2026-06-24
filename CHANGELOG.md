@@ -23,6 +23,7 @@ All notable changes to this project are documented here. This project uses human
 - Opt-in human-readable `sweetspot status --format table` output while keeping JSON as the default.
 - Clearer `sweetspot logs` aliases: `--max-events` for `--limit` and `--last` for `--tail`.
 - Opt-in `--format table` output for read-oriented operator commands: `jobs`, `describe-job`, `logs`, `watch-job`, `doctor`, and `dlq`.
+- `sweetspot finalize --dry-run` for previewing upload/READY targets while skipping S3 mutations.
 
 ### Fixed
 

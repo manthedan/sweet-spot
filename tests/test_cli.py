@@ -1451,6 +1451,49 @@ class FinalizeTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "--upload"):
             cmd_finalize(args)
 
+    def test_finalize_dry_run_skips_uploads_and_ready_mutations(self) -> None:
+        s3 = FakeFinalizeS3()
+        s3.objects[("bucket", "runs/r1/done/task-1.done.json")] = {
+            "Body": json.dumps({"schema": "sweetspot.done_marker.v1", "run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt"}).encode()
+        }
+        s3.objects[("bucket", "runs/r1/shards/task-1.txt")] = {"Body": b"ok"}
+        task = {"run_id": "r1", "task_id": "task-1", "output_s3": "s3://bucket/runs/r1/shards/task-1.txt", "done_s3": "s3://bucket/runs/r1/done/task-1.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = Path(tmp) / "tasks.jsonl"
+            task_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(
+                run_id="r1",
+                output_prefix="s3://bucket/runs/r1",
+                tasks_jsonl=task_path,
+                tasks_s3=None,
+                artifact_dir=Path(tmp) / "finalizer",
+                workers=1,
+                progress_interval=0,
+                write_repair_jsonl=None,
+                upload=True,
+                dry_run=True,
+                publish_ready=True,
+                ready_key="READY",
+                allow_incomplete_ready=False,
+                allow_legacy_done_markers=True,
+                require_complete=True,
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", return_value=s3), contextlib.redirect_stdout(out):
+                rc = cmd_finalize(args)
+            self.assertEqual(rc, 0)
+            self.assertEqual(s3.deleted, [])
+            self.assertNotIn(("bucket", "runs/r1/manifests/final_manifest.json"), s3.objects)
+            self.assertNotIn(("bucket", "runs/r1/READY"), s3.objects)
+            manifest = json.loads((Path(tmp) / "finalizer" / "final_manifest.json").read_text())
+            self.assertTrue(manifest["dry_run"])
+            self.assertIsNone(manifest["final_manifest_s3"])
+            self.assertEqual(manifest["would_final_manifest_s3"], "s3://bucket/runs/r1/manifests/final_manifest.json")
+            summary = json.loads(out.getvalue())
+            self.assertTrue(summary["dry_run"])
+            self.assertIsNone(summary["ready_s3"])
+            self.assertEqual(summary["would_ready_s3"], "s3://bucket/runs/r1/READY")
+
     def test_ready_key_cannot_collide_with_manifest(self) -> None:
         args = types.SimpleNamespace(publish_ready=True, upload=True, ready_key="manifests/final_manifest.json")
         with self.assertRaisesRegex(SystemExit, "collide"):

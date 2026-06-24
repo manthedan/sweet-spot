@@ -1136,8 +1136,11 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     import concurrent.futures as cf
     import sys
 
-    if args.publish_ready and not args.upload:
-        raise SystemExit("--publish-ready requires --upload")
+    dry_run = bool(getattr(args, "dry_run", False))
+    requested_upload = bool(args.upload)
+    effective_upload = requested_upload and not dry_run
+    if args.publish_ready and not (requested_upload or dry_run):
+        raise SystemExit("--publish-ready requires --upload unless --dry-run is set")
     args.ready_key = str(args.ready_key).strip("/")
     reserved_ready_keys = {"manifests/final_manifest.json", "manifests/repair_tasks.jsonl", "manifests/task_status.jsonl", "manifests/outputs.jsonl"}
     if args.publish_ready and (not args.ready_key or args.ready_key in reserved_ready_keys):
@@ -1272,13 +1275,21 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         "outputs": inline_outputs,
         "outputs_truncated": counts["output_manifest"] > len(inline_outputs),
         "outputs_manifest": str(outputs_path),
-        "outputs_manifest_s3": outputs_s3 if args.upload else None,
+        "outputs_manifest_s3": outputs_s3 if effective_upload else None,
         "task_status": str(status_path),
-        "task_status_s3": status_s3 if args.upload else None,
+        "task_status_s3": status_s3 if effective_upload else None,
         "repair_task_count": counts["missing"],
-        "final_manifest_s3": final_s3 if args.upload else None,
-        "repair_tasks_s3": repair_s3 if args.upload and counts["missing"] else None,
-        "ready_s3": ready_s3 if args.publish_ready else None,
+        "final_manifest_s3": final_s3 if effective_upload else None,
+        "repair_tasks_s3": repair_s3 if effective_upload and counts["missing"] else None,
+        "ready_s3": ready_s3 if args.publish_ready and effective_upload else None,
+        "dry_run": dry_run,
+        "would_upload": requested_upload,
+        "would_publish_ready": bool(args.publish_ready and (counts["missing"] == 0 or args.allow_incomplete_ready)),
+        "would_final_manifest_s3": final_s3 if requested_upload else None,
+        "would_repair_tasks_s3": repair_s3 if requested_upload and counts["missing"] else None,
+        "would_task_status_s3": status_s3 if requested_upload else None,
+        "would_outputs_manifest_s3": outputs_s3 if requested_upload else None,
+        "would_ready_s3": ready_s3 if args.publish_ready else None,
         "existence_index_prefixes": existence_index.indexed_prefixes() if existence_index else [],
     }
     if submitted != checked:
@@ -1288,7 +1299,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
 
     final_path.write_text(json.dumps(final_manifest, indent=2, sort_keys=True) + "\n")
 
-    if args.upload:
+    if effective_upload:
         if args.publish_ready:
             s3_delete(s3, ready_s3)
         s3_upload_text(s3, json.dumps(final_manifest, indent=2, sort_keys=True) + "\n", final_s3)
@@ -1306,9 +1317,12 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                     "repair_tasks": str(repair_path),
                     "task_status": str(status_path),
                     "outputs_manifest": str(outputs_path),
-                    "final_manifest_s3": final_s3 if args.upload else None,
+                    "final_manifest_s3": final_s3 if effective_upload else None,
                     "ready_s3": None,
+                    "dry_run": dry_run,
                     "refused_ready": True,
+                    "would_final_manifest_s3": final_s3 if requested_upload else None,
+                    "would_ready_s3": ready_s3 if args.publish_ready else None,
                 },
                 indent=2,
                 sort_keys=True,
@@ -1316,7 +1330,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if args.upload and args.publish_ready:
+    if effective_upload and args.publish_ready:
         ready = {"schema": "sweetspot.ready_marker.v1", "run_id": args.run_id, "ready_at": iso_now(), "final_manifest_s3": final_s3, "complete": final_manifest["complete"]}
         s3_upload_text(s3, json.dumps(ready, indent=2, sort_keys=True) + "\n", ready_s3)
     print(
@@ -1327,8 +1341,11 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                 "repair_tasks": str(repair_path),
                 "task_status": str(status_path),
                 "outputs_manifest": str(outputs_path),
-                "final_manifest_s3": final_s3 if args.upload else None,
-                "ready_s3": ready_s3 if args.publish_ready and args.upload else None,
+                "final_manifest_s3": final_s3 if effective_upload else None,
+                "ready_s3": ready_s3 if args.publish_ready and effective_upload else None,
+                "dry_run": dry_run,
+                "would_final_manifest_s3": final_s3 if requested_upload else None,
+                "would_ready_s3": ready_s3 if args.publish_ready else None,
             },
             indent=2,
             sort_keys=True,
@@ -2191,7 +2208,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "visibility_timeout",
     },
     "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "submit", "tasks_jsonl"},
-    "finalize": {"allow_legacy_done_markers", "artifact_dir", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
+    "finalize": {"allow_legacy_done_markers", "artifact_dir", "dry_run", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
     "describe-job": {"format", "job_id", "profile", "region"},
     "jobs": {"format", "job_name_regex", "job_queue", "max_jobs", "profile", "region"},
     "logs": {"format", "job_id", "log_group", "log_stream", "profile", "region"},
@@ -2256,6 +2273,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "artifact_dir": ("--artifact-dir", False),
     "batch_job_queue": ("--batch-job-queue", False),
     "dlq_url": ("--dlq-url", False),
+    "dry_run": ("--dry-run", False),
     "format": ("--format", False),
     "heartbeat_seconds": ("--heartbeat-seconds", False),
     "include_not_visible": ("--include-not-visible", False),
@@ -2587,6 +2605,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--preload-s3-prefix", action="append", default=[], help="Additional s3://bucket/prefix to preload into the finalizer existence index; repeatable")
     p.add_argument("--write-repair-jsonl", type=Path)
     p.add_argument("--upload", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="Scan and write local artifacts, but skip S3 manifest uploads, READY deletion, and READY publishing")
     p.add_argument("--publish-ready", action="store_true")
     p.add_argument("--ready-key", default="READY")
     p.add_argument("--allow-incomplete-ready", action="store_true", help="unsafe: publish READY even when tasks are incomplete")

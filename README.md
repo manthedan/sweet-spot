@@ -102,7 +102,7 @@ For production, set `SWEETSPOT_ALLOWED_S3_PREFIXES` or pass `--allowed-s3-prefix
 
 Legacy v1 done markers are not accepted by default because they do not bind the full task hash or immutable attempt output. Use `--allow-legacy-done-markers` / `SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1` only for an explicit migration pass, including `sweetspot finalize --allow-legacy-done-markers` for old runs.
 
-Finalization is streaming and scale-oriented: `sweetspot finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
+Finalization is streaming and scale-oriented: `sweetspot finalize` reads task JSONL line-by-line, writes complete `task_status.jsonl`, `repair_tasks.jsonl`, and `outputs.jsonl` artifacts, and keeps only bounded samples in `final_manifest.json`. Use `--dry-run` to preview upload/READY targets while still writing local artifacts but skipping S3 uploads, READY deletion, and READY publishing. Use `--use-listing-index` or repeat `--preload-s3-prefix` for large runs to trade S3 LIST calls for fewer per-task HEAD requests.
 
 Worker observability is on by default: child stdout/stderr are streamed to container logs for CloudWatch, a bounded redacted tail is stored in the task summary, and capped redacted attempt logs are uploaded to S3. Use `--log-tail-bytes`, `--max-log-bytes`, and repeatable `--redact-regex` on `worker`, `submit-workers`, or `supervise-workers` for sensitive workloads. Redaction is applied per newline-terminated log record; overlong unterminated records are suppressed with a placeholder rather than risk leaking a partial secret.
 
@@ -237,6 +237,16 @@ sweetspot finalize \
   --workers 32 \
   --use-listing-index \
   --write-repair-jsonl artifacts/hello-001/repair_tasks.jsonl \
+  --require-complete
+
+# preview upload/READY targets without mutating S3
+sweetspot finalize \
+  --run-id hello-001 \
+  --output-prefix s3://my-bucket/runs/hello-001 \
+  --tasks-jsonl artifacts/hello-001/tasks.jsonl \
+  --upload \
+  --publish-ready \
+  --dry-run \
   --require-complete
 
 # optionally upload final_manifest.json and publish READY only when complete
