@@ -7,6 +7,7 @@ import json
 import os
 import re
 import statistics
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -2020,8 +2021,242 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-def main() -> int:
+CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
+    "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
+    "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
+    "dlq": {"apply", "dlq_url", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
+    "doctor": {"dlq_url", "heartbeat_seconds", "job_definition", "job_queue", "profile", "queue_url", "region", "s3_prefix", "task_timeout_seconds", "visibility_timeout"},
+    "enqueue-and-submit": {
+        "allow_legacy_done_markers",
+        "allowed_s3_prefix",
+        "artifact_dir",
+        "batch_job_queue",
+        "heartbeat_seconds",
+        "include_not_visible",
+        "job_definition",
+        "job_name_prefix",
+        "max_workers",
+        "memory",
+        "messages_per_worker",
+        "min_workers",
+        "profile",
+        "queue_url",
+        "region",
+        "run_id",
+        "submit",
+        "subtract_active",
+        "task_timeout_seconds",
+        "tasks_jsonl",
+        "vcpus",
+        "visibility_timeout",
+    },
+    "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "submit", "tasks_jsonl"},
+    "finalize": {"allow_legacy_done_markers", "artifact_dir", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
+    "jobs": {"job_name_regex", "job_queue", "max_jobs", "profile", "region"},
+    "logs": {"job_id", "log_group", "log_stream", "profile", "region"},
+    "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
+    "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
+    "status": {"dlq_url", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
+    "submit-workers": {
+        "allow_legacy_done_markers",
+        "allowed_s3_prefix",
+        "batch_job_queue",
+        "heartbeat_seconds",
+        "include_not_visible",
+        "job_definition",
+        "job_name_prefix",
+        "max_workers",
+        "memory",
+        "messages_per_worker",
+        "min_workers",
+        "profile",
+        "queue_url",
+        "region",
+        "sqs_queue_url",
+        "submit",
+        "subtract_active",
+        "task_timeout_seconds",
+        "vcpus",
+        "visibility_timeout",
+    },
+    "supervise-workers": {
+        "allow_legacy_done_markers",
+        "allowed_s3_prefix",
+        "artifact_dir",
+        "batch_job_queue",
+        "dlq_url",
+        "heartbeat_seconds",
+        "include_not_visible",
+        "job_definition",
+        "job_name_prefix",
+        "max_active_workers",
+        "memory",
+        "messages_per_worker",
+        "profile",
+        "queue_url",
+        "region",
+        "run_id",
+        "sqs_queue_url",
+        "submit",
+        "target_active_workers",
+        "task_timeout_seconds",
+        "vcpus",
+        "visibility_timeout",
+    },
+    "watch-job": {"job_id", "profile", "region"},
+    "worker": {"allow_legacy_done_markers", "allowed_s3_prefix", "heartbeat_seconds", "profile", "queue_url", "region", "task_timeout_seconds", "visibility_timeout"},
+}
+
+CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
+    "active_workers": ("--active-workers", False),
+    "allowed_s3_prefix": ("--allowed-s3-prefix", True),
+    "apply": ("--apply", False),
+    "allow_legacy_done_markers": ("--allow-legacy-done-markers", False),
+    "artifact_dir": ("--artifact-dir", False),
+    "batch_job_queue": ("--batch-job-queue", False),
+    "dlq_url": ("--dlq-url", False),
+    "heartbeat_seconds": ("--heartbeat-seconds", False),
+    "include_not_visible": ("--include-not-visible", False),
+    "job_definition": ("--job-definition", False),
+    "job_id": ("--job-id", False),
+    "job_name_prefix": ("--job-name-prefix", False),
+    "job_name_regex": ("--job-name-regex", False),
+    "job_queue": ("--job-queue", False),
+    "log_group": ("--log-group", False),
+    "log_stream": ("--log-stream", False),
+    "max_jobs": ("--max-jobs", False),
+    "max_messages": ("--max-messages", False),
+    "max_workers": ("--max-workers", False),
+    "memory": ("--memory", False),
+    "messages_per_worker": ("--messages-per-worker", False),
+    "min_workers": ("--min-workers", False),
+    "out_dir": ("--out-dir", False),
+    "out_jsonl": ("--out-jsonl", False),
+    "output_prefix": ("--output-prefix", False),
+    "prefix": ("--prefix", False),
+    "profile": ("--profile", False),
+    "publish_ready": ("--publish-ready", False),
+    "queue_url": ("--queue-url", False),
+    "region": ("--region", False),
+    "run_id": ("--run-id", False),
+    "sqs_queue_url": ("--queue-url", False),
+    "s3_prefix": ("--s3-prefix", True),
+    "submit": ("--submit", False),
+    "subtract_active": ("--subtract-active", False),
+    "target_active_workers": ("--target-active-workers", False),
+    "task_count": ("--task-count", False),
+    "task_status_jsonl": ("--task-status-jsonl", False),
+    "task_timeout_seconds": ("--task-timeout-seconds", False),
+    "tasks_jsonl": ("--tasks-jsonl", False),
+    "upload": ("--upload", False),
+    "delete": ("--delete", False),
+    "completion_marker_s3": ("--completion-marker-s3", False),
+    "min_prefix_chars": ("--min-prefix-chars", False),
+    "vcpus": ("--vcpus", False),
+    "visibility_timeout": ("--visibility-timeout", False),
+}
+
+
+def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
+    config_path: Path | None = Path(os.environ["SWEETSPOT_CONFIG"]) if os.environ.get("SWEETSPOT_CONFIG") else None
+    stripped: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--config":
+            if i + 1 >= len(argv):
+                raise SystemExit("--config requires a path")
+            config_path = Path(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--config="):
+            config_path = Path(arg.split("=", 1)[1])
+            i += 1
+            continue
+        stripped.append(arg)
+        i += 1
+    return config_path, stripped
+
+
+def _load_config(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"failed to read --config {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid JSON in --config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("--config must contain a JSON object")
+    return data
+
+
+def _command_name(argv: list[str]) -> str | None:
+    for arg in argv:
+        if arg == "--":
+            return None
+        if not arg.startswith("-"):
+            return arg
+    return None
+
+
+def _config_values(config: dict[str, Any], command: str | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for section in ("defaults", "default"):
+        raw = config.get(section)
+        if isinstance(raw, dict):
+            merged.update(raw)
+    if command:
+        for section in (command, command.replace("-", "_")):
+            raw = config.get(section)
+            if isinstance(raw, dict):
+                merged.update(raw)
+    return {str(k).replace("-", "_"): v for k, v in merged.items()}
+
+
+def _argv_has_flag(argv: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+
+def _apply_config_defaults(argv: list[str], config: dict[str, Any], command: str | None) -> list[str]:
+    if command is None or command not in CONFIG_COMMAND_KEYS:
+        return argv
+    allowed_keys = CONFIG_COMMAND_KEYS[command]
+    values = _config_values(config, command)
+    injected: list[str] = []
+    for key, value in values.items():
+        if key not in allowed_keys:
+            continue
+        mapped = CONFIG_FLAG_MAP.get(key)
+        if mapped is None or value is None:
+            continue
+        flag, repeatable = mapped
+        if _argv_has_flag(argv, flag):
+            continue
+        if isinstance(value, bool):
+            if value:
+                injected.append(flag)
+            continue
+        if repeatable and isinstance(value, list):
+            for item in value:
+                injected.extend([flag, str(item)])
+            continue
+        injected.extend([flag, str(value)])
+    if command and command in argv:
+        idx = argv.index(command)
+        return [*argv[: idx + 1], *injected, *argv[idx + 1 :]]
+    return [*injected, *argv]
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    config_path, raw_argv = _extract_config_arg(raw_argv)
+    config = _load_config(config_path)
+    raw_argv = _apply_config_defaults(raw_argv, config, _command_name(raw_argv))
+
     ap = argparse.ArgumentParser(prog="sweetspot")
+    ap.add_argument("--config", type=Path, help="JSON config file with 'defaults' and per-command sections")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("version", help="Print the installed SweetSpot package version")
@@ -2388,7 +2623,8 @@ def main() -> int:
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_dlq)
 
-    args = ap.parse_args()
+    args = ap.parse_args(raw_argv)
+    args.config = config_path
     if getattr(args, "cmd", None) == "worker" and not args.queue_url:
         raise SystemExit("worker requires --queue-url or SWEETSPOT_SQS_QUEUE_URL")
     return int(args.func(args))

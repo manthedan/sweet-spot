@@ -78,6 +78,56 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(report["version"], "1.2.3")
 
 
+class ConfigTests(unittest.TestCase):
+    def test_config_prepopulates_required_worker_submit_flags(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                self.queue_url = kwargs["QueueUrl"]
+                return {
+                    "Attributes": {
+                        "ApproximateNumberOfMessages": "4",
+                        "ApproximateNumberOfMessagesNotVisible": "0",
+                        "ApproximateNumberOfMessagesDelayed": "0",
+                    }
+                }
+
+        sqs = FakeSQS()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return object()
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "sweetspot.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "defaults": {"queue_url": "configured-queue"},
+                        "submit-workers": {"batch_job_queue": "jq", "job_definition": "jd", "messages_per_worker": 2},
+                    }
+                )
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--config", str(config_path), "submit-workers"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(sqs.queue_url, "configured-queue")
+        self.assertEqual(report["messages_per_worker"], 2)
+        self.assertEqual(report["raw_desired_workers"], 2)
+
+    def test_config_defaults_do_not_break_non_configurable_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "sweetspot.json"
+            config_path.write_text(json.dumps({"defaults": {"profile": "prod", "queue_url": "q"}}))
+            out = io.StringIO()
+            with patch("sweetspot.cli.importlib_metadata.version", return_value="1.0"), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--config", str(config_path), "version"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["version"], "1.0")
+
+
 class StatusTests(unittest.TestCase):
     def test_status_reports_identity_queue_and_active_workers(self) -> None:
         class FakeSTS:

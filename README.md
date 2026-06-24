@@ -196,6 +196,23 @@ sweetspot supervise-workers \
 
 # add --submit after reviewing the dry-run
 
+# optional: put repeated defaults in JSON and pass --config (or SWEETSPOT_CONFIG)
+cat > sweetspot.json <<'JSON'
+{
+  "defaults": {
+    "profile": "prod",
+    "region": "us-west-2",
+    "queue_url": "https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue"
+  },
+  "submit-workers": {
+    "batch_job_queue": "my-batch-spot-queue",
+    "job_definition": "my-worker-jobdef:1",
+    "messages_per_worker": 4
+  }
+}
+JSON
+sweetspot --config sweetspot.json submit-workers --job-name-prefix hello-001-worker
+
 # preflight AWS/SQS/S3/Batch/CloudWatch permissions and configuration
 sweetspot doctor \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
