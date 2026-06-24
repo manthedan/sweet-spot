@@ -17,6 +17,7 @@ All notable changes to this project are documented here. This project uses human
 - `sweetspot version` command for checking the installed package version.
 - `--queue-url` alias for worker-submission commands that previously exposed only `--sqs-queue-url`.
 - Short argparse help examples for high-traffic production workflow commands.
+- `sweetspot status` command for a one-shot AWS identity, queue-depth, DLQ-depth, and active-worker overview.
 
 ### Fixed
 

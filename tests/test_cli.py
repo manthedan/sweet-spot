@@ -58,6 +58,7 @@ from sweetspot.cli import (
     cmd_logs,
     cmd_repair_plan,
     cmd_s3_delete_prefix,
+    cmd_status,
     cmd_supervise_workers,
     cmd_version,
     main,
@@ -75,6 +76,63 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(report["schema"], "sweetspot.version.v1")
         self.assertEqual(report["package"], "sweetspot")
         self.assertEqual(report["version"], "1.2.3")
+
+
+class StatusTests(unittest.TestCase):
+    def test_status_reports_identity_queue_and_active_workers(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123", "Arn": "arn:aws:iam::123:user/test", "UserId": "u"}
+
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                visible = "5" if kwargs["QueueUrl"] == "source" else "1"
+                return {
+                    "Attributes": {
+                        "ApproximateNumberOfMessages": visible,
+                        "ApproximateNumberOfMessagesNotVisible": "2",
+                        "ApproximateNumberOfMessagesDelayed": "0",
+                    }
+                }
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                if kwargs["jobStatus"] == "RUNNING":
+                    return [{"jobSummaryList": [{"jobId": "j1", "jobName": "run-worker", "createdAt": 1}]}]
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                self.name = name
+                return FakePaginator()
+
+        class FakeSession:
+            region_name = "us-west-2"
+
+            def __init__(self, profile_name=None, region_name=None):
+                self.profile_name = profile_name
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                raise AssertionError(service)
+
+        args = types.SimpleNamespace(profile="prof", region="us-west-2", queue_url="source", dlq_url="dlq", job_queue="jq", job_name_prefix="run")
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_status(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.status.v1")
+        self.assertEqual(report["identity"]["account"], "123")
+        self.assertEqual(report["queues"]["source"]["depth"]["visible"], 5)
+        self.assertEqual(report["queues"]["dlq"]["depth"]["visible"], 1)
+        self.assertEqual(report["batch"]["active_count"], 1)
+        self.assertEqual(report["batch"]["active_by_status"], {"RUNNING": 1})
 
 
 class HelpExamplesTests(unittest.TestCase):

@@ -230,6 +230,46 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+    sts = session.client("sts", region_name=args.region)
+    identity = sts.get_caller_identity()
+    queues: dict[str, Any] = {}
+    if args.queue_url:
+        sqs = session.client("sqs", region_name=args.region)
+        queues["source"] = {"queue_url": args.queue_url, "depth": queue_depth(sqs, args.queue_url)}
+    if args.dlq_url:
+        sqs = session.client("sqs", region_name=args.region)
+        queues["dlq"] = {"queue_url": args.dlq_url, "depth": queue_depth(sqs, args.dlq_url)}
+    batch_status: dict[str, Any] | None = None
+    if args.job_queue:
+        batch = session.client("batch", region_name=args.region)
+        active = active_jobs(batch, args.job_queue, args.job_name_prefix)
+        by_status = dict(Counter(str(job.get("status")) for job in active).most_common())
+        batch_status = {
+            "job_queue": args.job_queue,
+            "job_name_prefix": args.job_name_prefix,
+            "active_count": len(active),
+            "active_by_status": by_status,
+            "active_examples": active[:20],
+        }
+    print(
+        json.dumps(
+            {
+                "schema": "sweetspot.status.v1",
+                "checked_at": iso_now(),
+                "region": args.region or session.region_name,
+                "identity": {"account": identity.get("Account"), "arn": identity.get("Arn"), "user_id": identity.get("UserId")},
+                "queues": queues,
+                "batch": batch_status,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
     tasks = _read_jsonl(args.tasks_jsonl)
     if args.run_id:
@@ -1986,6 +2026,20 @@ def main() -> int:
 
     p = sub.add_parser("version", help="Print the installed SweetSpot package version")
     p.set_defaults(func=cmd_version)
+
+    p = _add_parser_with_examples(
+        sub,
+        "status",
+        help="Show AWS identity, queue depth, DLQ depth, and active Batch worker summary",
+        examples="  sweetspot status --profile prod --region us-west-2 --queue-url https://sqs... --dlq-url https://sqs... --job-queue jq --job-name-prefix run-1",
+    )
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--dlq-url")
+    p.add_argument("--job-queue")
+    p.add_argument("--job-name-prefix", default="sweetspot-worker")
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("worker", help="Run an SQS worker inside AWS Batch")
     p.add_argument("--profile")
