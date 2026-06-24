@@ -126,6 +126,12 @@ A safe production loop is:
 
 For Spot, prefer many short tasks over a few long tasks. If a task cannot checkpoint or finish quickly, use an On-Demand repair lane or split it further.
 
+## Agent-facing direction
+
+The commands below expose SweetSpot's current operator phases. They remain useful for advanced debugging and controlled production runs, but they are not the intended long-term agent contract. SweetSpot is moving toward `sweetspot plan`, `sweetspot run`, `sweetspot status`, `sweetspot repair`, and `sweetspot cancel`, where agents provide workload intent, budget, deadline, and output locations while SweetSpot chooses shard size, resource shape, architecture, and parallelism.
+
+Until that controller exists, treat direct sizing flags such as worker count, vCPU, memory, task timeout, and messages per worker as advanced controls that require canary evidence and dry-run review.
+
 ## Recommended cost optimization workflow
 
 Cost optimization works best when it starts before the main run, not after workers are already launched:

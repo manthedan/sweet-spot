@@ -171,7 +171,7 @@ If `stop_reason` is `"dlq_not_empty"`, the supervisor stopped because the DLQ re
 
 ## Sizing guidance
 
-1. **messages_per_worker**: Set to 1 for long tasks (minutes+), 4+ for short tasks (seconds). Higher values mean fewer Batch jobs but more work lost on Spot interruption.
+1. **messages_per_worker**: Set to 1 for long tasks (minutes+), 4+ for short tasks (seconds). Higher values mean fewer Batch jobs because each worker processes more messages sequentially, but the worker receives and commits one SQS message at a time; on Spot interruption, only the currently executing task is exposed to replay.
 2. **max_workers**: Start with SQS visible depth / messages_per_worker. Use `--subtract-active` to avoid oversubscription.
 3. **Spot vs On-Demand**: Use Spot queues for cheap retryable work. Use On-Demand queues for repair lanes.
 4. **timeout_seconds**: Must fit within SQS visibility timeout. Default 11h cap. Prefer much shorter tasks.
@@ -211,6 +211,6 @@ Worker commands receive at runtime:
 1. **Forgetting `--submit`**: Without it, the command is a dry-run and submits nothing. This is by design.
 2. **Not subtracting active workers**: If workers are already running, `submit-workers` will oversubscribe without `--subtract-active`.
 3. **No `--stop-on-dlq`**: Without this, the supervisor keeps submitting even when tasks are failing to the DLQ.
-4. **messages_per_worker too high for Spot**: If each worker processes many messages and a Spot host dies, all in-flight work is lost.
+4. **messages_per_worker too high for long tasks**: Very high values can keep a worker running longer than intended and delay fleet scale-down. It does not make already completed messages replay; the worker commits and deletes each SQS message before receiving the next.
 5. **Architecture mismatch**: ARM instance queues need ARM-compatible or multi-arch worker images. An x86-only image can fail immediately on Graviton even if the Spot price is attractive.
 6. **Queue URL mismatch**: The queue URL must match the one the workers poll. Double-check region and account.
