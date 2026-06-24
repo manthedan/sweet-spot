@@ -746,6 +746,8 @@ def run_worker(
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
     redact_regexes: Iterable[str] | str | None = None,
     allow_legacy_done_markers: bool = False,
+    profile: str | None = None,
+    region: str | None = None,
 ) -> int:
     validate_worker_timing(visibility_timeout=visibility_timeout, heartbeat_seconds=heartbeat_seconds, task_timeout_seconds=task_timeout_seconds)
     allowed_s3_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
@@ -754,8 +756,13 @@ def run_worker(
     if env_redact_regexes:
         redact_regexes.extend([p for p in env_redact_regexes.splitlines() if p.strip()])
     parse_redact_patterns(redact_regexes)
-    sqs = boto3.client("sqs")
-    s3 = boto3.client("s3")
+    if profile or region:
+        session = boto3.Session(profile_name=profile, region_name=region)
+        sqs = session.client("sqs", region_name=region)
+        s3 = session.client("s3", region_name=region)
+    else:
+        sqs = boto3.client("sqs")
+        s3 = boto3.client("s3")
     work_dir.mkdir(parents=True, exist_ok=True)
     processed = 0
     while processed < max_messages:

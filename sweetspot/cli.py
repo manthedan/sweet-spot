@@ -66,6 +66,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _aws_client(args: argparse.Namespace, service: str):
+    profile = getattr(args, "profile", None)
+    region = getattr(args, "region", None)
+    if profile or region:
+        return boto3.Session(profile_name=profile, region_name=region).client(service, region_name=region)
+    return boto3.client(service)
+
+
 def _validate_unique_task_ids(tasks: list[dict[str, Any]], *, context: str) -> None:
     seen: dict[str, int] = {}
     duplicates: list[str] = []
@@ -222,7 +230,7 @@ def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
     if args.submit:
         if not args.queue_url:
             raise SystemExit("--submit requires --queue-url")
-        sqs = boto3.client("sqs")
+        sqs = _aws_client(args, "sqs")
         sent = _send_tasks_to_sqs(sqs, queue_url=args.queue_url, tasks=tasks)
     print(
         json.dumps(
@@ -443,8 +451,8 @@ def cmd_submit_workers(args: argparse.Namespace) -> int:
         validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    sqs = boto3.client("sqs")
-    batch = boto3.client("batch")
+    sqs = _aws_client(args, "sqs")
+    batch = _aws_client(args, "batch")
     depth = queue_depth(sqs, args.sqs_queue_url)
     backlog = depth["visible"] + (depth["not_visible"] if args.include_not_visible else 0)
     raw_desired = desired_worker_count(backlog, args.messages_per_worker, args.min_workers, args.max_workers)
@@ -519,8 +527,8 @@ def cmd_enqueue_and_submit(args: argparse.Namespace) -> int:
     artifact_dir = args.artifact_dir or Path("artifacts") / (args.run_id or f"run-{utc_stamp()}")
     tasks_out = _write_enqueue_artifacts(tasks, artifact_dir)
 
-    sqs = boto3.client("sqs")
-    batch = boto3.client("batch")
+    sqs = _aws_client(args, "sqs")
+    batch = _aws_client(args, "batch")
     sent = 0
     wait_history: list[dict[str, Any]] = []
     depth = queue_depth(sqs, args.queue_url)
@@ -982,7 +990,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         raise SystemExit("--ready-key must not be empty or collide with SweetSpot manifest paths")
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
-    s3 = boto3.client("s3")
+    s3 = _aws_client(args, "s3")
     existence_index = _finalizer_existence_index(args, s3)
     artifact_dir = args.artifact_dir or Path("artifacts") / args.run_id / "finalizer"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1378,8 +1386,8 @@ def cmd_repair_plan(args: argparse.Namespace) -> int:
 def cmd_cleanup_stale_messages(args: argparse.Namespace) -> int:
     if not args.queue_url:
         raise SystemExit("missing --queue-url or SWEETSPOT_SQS_QUEUE_URL")
-    sqs = boto3.client("sqs")
-    s3 = boto3.client("s3")
+    sqs = _aws_client(args, "sqs")
+    s3 = _aws_client(args, "s3")
     scanned = deleted = done = invalid = kept = 0
     examples: list[dict[str, Any]] = []
     while scanned < args.max_messages:
@@ -1735,7 +1743,7 @@ def _queue_arn(sqs, queue_url: str) -> str:
 def cmd_dlq(args: argparse.Namespace) -> int:
     if args.apply and not args.queue_url and not getattr(args, "native_redrive", False):
         raise SystemExit("--apply requires --queue-url")
-    sqs = boto3.client("sqs")
+    sqs = _aws_client(args, "sqs")
     if getattr(args, "native_redrive", False):
         if not args.apply:
             raise SystemExit("--native-redrive requires --apply")
@@ -1963,6 +1971,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("worker", help="Run an SQS worker inside AWS Batch")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--max-messages", type=int, default=int(os.environ.get("SWEETSPOT_MAX_MESSAGES", "1")))
     p.add_argument("--visibility-timeout", type=int, default=int(os.environ.get("SWEETSPOT_VISIBILITY_TIMEOUT", "1800")))
@@ -1991,10 +2001,14 @@ def main() -> int:
             max_log_bytes=a.max_log_bytes,
             redact_regexes=a.redact_regex,
             allow_legacy_done_markers=a.allow_legacy_done_markers,
+            profile=a.profile,
+            region=a.region,
         )
     )
 
     p = sub.add_parser("enqueue-jsonl")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--run-id")
@@ -2004,6 +2018,8 @@ def main() -> int:
     p.set_defaults(func=cmd_enqueue_jsonl)
 
     p = sub.add_parser("enqueue-and-submit", help="Atomically enqueue tasks, wait for SQS visibility, then submit Batch workers")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--run-id")
@@ -2046,6 +2062,8 @@ def main() -> int:
     p.set_defaults(func=cmd_derive_canary)
 
     p = sub.add_parser("submit-workers")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--sqs-queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--batch-job-queue", required=True)
     p.add_argument("--job-definition", required=True)
@@ -2107,6 +2125,8 @@ def main() -> int:
     p.set_defaults(func=cmd_supervise_workers)
 
     p = sub.add_parser("finalize")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--run-id", required=True)
     p.add_argument("--output-prefix", required=True)
     p.add_argument("--tasks-jsonl", type=Path)
@@ -2153,6 +2173,8 @@ def main() -> int:
     p.set_defaults(func=cmd_repair_plan)
 
     p = sub.add_parser("cleanup-stale-messages", help="Dry-run/apply deletion of visible SQS messages whose S3 done marker already exists")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
     p.add_argument("--run-id", help="Only consider messages for this run_id")
     p.add_argument("--max-messages", type=int, default=100)
@@ -2236,6 +2258,8 @@ def main() -> int:
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("dlq")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--dlq-url", required=True)
     p.add_argument("--queue-url")
     p.add_argument("--run-id")

@@ -13,6 +13,7 @@ All notable changes to this project are documented here. This project uses human
 - `estimate-runtime` command for canary-derived wall-time, timeout-risk, and compute-cost estimates.
 - `cleanup-stale-messages` command for dry-run/apply deletion of visible duplicate SQS messages whose done markers already exist.
 - README guidance for small idempotent chunks, canary sizing, safe repair planning, and stale-message cleanup.
+- Consistent `--profile`/`--region` options for AWS-touching CLI commands.
 
 ### Fixed
 

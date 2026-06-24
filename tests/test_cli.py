@@ -226,6 +226,42 @@ class EnqueueValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "duplicate task_id"):
                 cmd_enqueue_jsonl(args)
 
+    def test_enqueue_uses_profile_region_session_when_supplied(self) -> None:
+        class FakeSQS:
+            def send_message_batch(self, **kwargs):
+                return {"Successful": kwargs["Entries"]}
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.profile_name = profile_name
+                self.region_name = region_name
+                sessions.append(self)
+
+            def client(self, service, region_name=None):
+                client_calls.append((service, region_name))
+                return FakeSQS()
+
+        sessions = []
+        client_calls = []
+        task = {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(
+                profile="prof",
+                region="us-west-2",
+                queue_url="q",
+                tasks_jsonl=tasks_path,
+                run_id=None,
+                artifact_dir=Path(tmp) / "artifacts",
+                allowed_s3_prefix=["s3://bucket/runs/r1"],
+                submit=True,
+            )
+            with patch("sweetspot.cli.boto3.Session", FakeSession):
+                self.assertEqual(cmd_enqueue_jsonl(args), 0)
+        self.assertEqual([(s.profile_name, s.region_name) for s in sessions], [("prof", "us-west-2")])
+        self.assertEqual(client_calls, [("sqs", "us-west-2")])
+
     def test_worker_overrides_pass_allowed_s3_prefixes(self) -> None:
         overrides = _worker_overrides(
             sqs_queue_url="https://sqs.example/q",
