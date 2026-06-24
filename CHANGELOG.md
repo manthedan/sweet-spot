@@ -28,6 +28,7 @@ All notable changes to this project are documented here. This project uses human
 - Mixed-architecture cost guidance, including opt-in ARM/Graviton scouting docs, per-lane lane-manager instance type overrides, and a mixed x86/ARM lane example.
 - `sweetspot cancel-jobs --format table` plus `--sqs-queue-url` aliases/config defaults for enqueue workflows.
 - `sweetspot.job.v1` / `sweetspot.plan.v1` contract validation foundations with examples and stable planner reason codes.
+- Initial `sweetspot plan JOB_SPEC` command that validates the declarative job contract and emits JSON plan status/reason codes without mutating AWS resources.
 
 ### Fixed
 

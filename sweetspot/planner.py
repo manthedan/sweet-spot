@@ -64,6 +64,44 @@ def load_plan(path: Path) -> dict[str, Any]:
     return validate_plan(load_json_object(path))
 
 
+def initial_blocked_plan(job_spec: dict[str, Any]) -> dict[str, Any]:
+    """Return a machine-readable placeholder plan until calibration exists.
+
+    This deliberately does not invent worker count, shard size, vCPU, memory, or architecture choices. It gives agents stable reason codes and a validated Plan envelope while future planner phases add canary-backed execution settings.
+    """
+
+    spec = validate_job_spec(job_spec)
+    constraints = spec["constraints"]
+    plan: dict[str, Any] = {
+        "schema": PLAN_SCHEMA_V1,
+        "run_id": spec["run_id"],
+        "status": "blocked",
+        "job": {
+            "image": spec["image"],
+            "command": spec["command"],
+            "input_manifest": spec["input_manifest"],
+            "output_prefix": spec["output_prefix"],
+        },
+        "constraints": {
+            "max_cost_usd": constraints["max_cost_usd"],
+            "completion_fraction": constraints.get("completion_fraction", 1.0),
+            "architectures": constraints.get("architectures", ["x86_64"]),
+        },
+        "reasons": [
+            {
+                "code": "insufficient_telemetry",
+                "severity": "warning",
+                "message": "The planner contract is valid, but canary telemetry and adaptive sizing are not available yet.",
+            }
+        ],
+    }
+    if "deadline_hours" in constraints:
+        plan["constraints"]["deadline_seconds"] = constraints["deadline_hours"] * 3600
+    if constraints.get("low_urgency") is True:
+        plan["constraints"]["low_urgency"] = True
+    return validate_plan(plan)
+
+
 def validate_job_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise PlannerSpecError("JobSpec must be a JSON object")

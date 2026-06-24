@@ -81,6 +81,25 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(report["version"], "1.2.3")
 
 
+class PlanCommandTests(unittest.TestCase):
+    def test_plan_emits_blocked_json_plan_for_valid_job_spec(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["plan", "examples/job.x86.example.json"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.plan.v1")
+        self.assertEqual(report["run_id"], "example-x86-run")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["reasons"][0]["code"], "insufficient_telemetry")
+
+    def test_plan_reports_invalid_job_spec_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "job.json"
+            path.write_text(json.dumps({"schema": "sweetspot.job.v1"}))
+            with self.assertRaisesRegex(SystemExit, "run_id"):
+                main(["plan", str(path)])
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_prepopulates_required_worker_submit_flags(self) -> None:
         class FakeSQS:
