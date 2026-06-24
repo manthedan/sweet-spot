@@ -114,6 +114,36 @@ class PlanCommandTests(unittest.TestCase):
         self.assertEqual(report["canaries"][0]["purpose"], "adaptive_shard_sizing")
         self.assertEqual(report["canaries"][0]["decision"]["selected_units_per_task"], 3000)
 
+    def test_plan_writes_initial_canary_tasks_without_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "manifest.jsonl"
+            canary_tasks_path = Path(tmp) / "canary_tasks.jsonl"
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(9)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "plan",
+                            "examples/job.x86.example.json",
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--out-canary-tasks-jsonl",
+                            str(canary_tasks_path),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["canaries"][0]["decision"]["reasons"][0]["code"], "canary_required")
+            self.assertNotIn("production_shards", report["canaries"][0])
+            self.assertEqual(report["artifacts"]["canary_task_count"], 3)
+            tasks = [json.loads(line) for line in canary_tasks_path.read_text().splitlines()]
+        self.assertEqual([task["job_type"] for task in tasks], ["canary", "canary", "canary"])
+        self.assertEqual([task["logical_unit_start"] for task in tasks], [0, 4, 8])
+        self.assertTrue(tasks[0]["output_s3"].endswith("/canaries/shards/canary-000000"))
+        validate_task_model(tasks[0], default_timeout_seconds=300, max_timeout_seconds=39600)
+
     def test_plan_counts_manifest_units_for_adaptive_shard_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             summaries = Path(tmp) / "summaries.jsonl"
@@ -211,6 +241,38 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(report["plan"]["schema"], "sweetspot.plan.v1")
         self.assertEqual(report["phases"][0]["name"], "plan")
         self.assertEqual(report["phases"][1]["status"], "skipped")
+
+    def test_run_writes_initial_canary_tasks_when_summaries_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(9)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "run",
+                            "examples/job.x86.example.json",
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--artifact-dir",
+                            str(artifact_dir),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            canary_tasks_path = artifact_dir / "canary_tasks.jsonl"
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            self.assertEqual(report["artifacts"]["canary_tasks_jsonl"], str(canary_tasks_path))
+            self.assertEqual(report["artifacts"]["canary_task_count"], 3)
+            self.assertEqual(phases["materialize_production_tasks"]["status"], "skipped")
+            self.assertEqual(phases["materialize_canary_tasks"]["status"], "completed")
+            tasks = [json.loads(line) for line in canary_tasks_path.read_text().splitlines()]
+        self.assertEqual([task["job_type"] for task in tasks], ["canary", "canary", "canary"])
+        self.assertEqual([task["logical_unit_start"] for task in tasks], [0, 4, 8])
 
     def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

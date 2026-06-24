@@ -124,7 +124,8 @@ def plan_with_adaptive_canaries(
         "decision": shard_decision,
     }
     selected_units = shard_decision.get("selected_units_per_task")
-    if logical_unit_count is not None and isinstance(selected_units, int):
+    observations_used = shard_decision.get("observations_used")
+    if logical_unit_count is not None and isinstance(selected_units, int) and isinstance(observations_used, int) and observations_used > 0:
         canary_entry["production_shards"] = logical_shard_plan(logical_unit_count, selected_units, max_inline_ranges=0)
     plan["canaries"] = [canary_entry]
     return validate_plan(plan)
@@ -140,7 +141,41 @@ def iter_production_tasks_from_logical_unit_count(job_spec: dict[str, Any], tota
     for shard_index in range(task_count):
         unit_start = shard_index * units
         unit_count = min(units, total - unit_start)
-        yield _production_task_for_range(spec, shard_index=shard_index, unit_start=unit_start, unit_count=unit_count)
+        yield _task_for_range(spec, job_type="production", task_id=f"shard-{shard_index:06d}", base_prefix="", unit_start=unit_start, unit_count=unit_count)
+
+
+def iter_canary_tasks_from_logical_unit_count(job_spec: dict[str, Any], total_units: int, units_per_task: int, *, max_tasks: int = 3) -> Iterator[dict[str, Any]]:
+    """Yield bounded adaptive-canary tasks sampled across a logical manifest.
+
+    The controller owns these tiny shards so agents do not need to invent shard
+    sizes.  Samples are spread across the manifest (first/middle/last for the
+    default of three tasks) to avoid calibrating exclusively on the first rows.
+    """
+
+    spec = validate_job_spec(job_spec)
+    total = _non_negative_int(total_units, "total_units")
+    units = _positive_int(units_per_task, "units_per_task")
+    limit = _positive_int(max_tasks, "max_tasks")
+    shard_count = math.ceil(total / units)
+    if shard_count == 0:
+        return
+    sample_count = min(limit, shard_count)
+    if sample_count == 1:
+        shard_indices = [0]
+    else:
+        shard_indices = sorted({round(i * (shard_count - 1) / (sample_count - 1)) for i in range(sample_count)})
+    for sample_index, shard_index in enumerate(shard_indices):
+        unit_start = shard_index * units
+        unit_count = min(units, total - unit_start)
+        yield _task_for_range(
+            spec,
+            job_type="canary",
+            task_id=f"canary-{sample_index:06d}",
+            base_prefix="canaries",
+            unit_start=unit_start,
+            unit_count=unit_count,
+            extra_input={"logical_shard_index": shard_index},
+        )
 
 
 def production_tasks_from_logical_shard_plan(job_spec: dict[str, Any], shard_plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -168,30 +203,41 @@ def production_tasks_from_logical_shard_plan(job_spec: dict[str, Any], shard_pla
         shard_index = _non_negative_int(range_obj.get("shard_index"), "shard_index")
         unit_start = _non_negative_int(range_obj.get("unit_start"), "unit_start")
         unit_count = _positive_int(range_obj.get("unit_count"), "unit_count")
-        tasks.append(_production_task_for_range(spec, shard_index=shard_index, unit_start=unit_start, unit_count=unit_count))
+        tasks.append(_task_for_range(spec, job_type="production", task_id=f"shard-{shard_index:06d}", base_prefix="", unit_start=unit_start, unit_count=unit_count))
     return tasks
 
 
-def _production_task_for_range(spec: dict[str, Any], *, shard_index: int, unit_start: int, unit_count: int) -> dict[str, Any]:
-    task_id = f"shard-{shard_index:06d}"
-    output_s3 = s3_join(spec["output_prefix"], "shards", task_id)
+def _task_for_range(
+    spec: dict[str, Any],
+    *,
+    job_type: str,
+    task_id: str,
+    base_prefix: str,
+    unit_start: int,
+    unit_count: int,
+    extra_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    output_s3 = s3_join(spec["output_prefix"], base_prefix, "shards", task_id)
+    input_obj: dict[str, Any] = {
+        "manifest_s3": spec["input_manifest"],
+        "logical_unit_start": unit_start,
+        "logical_unit_count": unit_count,
+    }
+    if extra_input:
+        input_obj.update(extra_input)
     return {
         "schema": TASK_SCHEMA_V1,
         "run_id": spec["run_id"],
         "task_id": task_id,
-        "job_type": "production",
+        "job_type": job_type,
         "command": list(spec["command"]),
         "input_s3": spec["input_manifest"],
-        "input": {
-            "manifest_s3": spec["input_manifest"],
-            "logical_unit_start": unit_start,
-            "logical_unit_count": unit_count,
-        },
+        "input": input_obj,
         "logical_unit_start": unit_start,
         "logical_unit_count": unit_count,
         "output_s3": output_s3,
-        "summary_s3": s3_join(spec["output_prefix"], "summaries", f"{task_id}.summary.json"),
-        "done_s3": s3_join(spec["output_prefix"], "done", f"{task_id}.done.json"),
+        "summary_s3": s3_join(spec["output_prefix"], base_prefix, "summaries", f"{task_id}.summary.json"),
+        "done_s3": s3_join(spec["output_prefix"], base_prefix, "done", f"{task_id}.done.json"),
     }
 
 
