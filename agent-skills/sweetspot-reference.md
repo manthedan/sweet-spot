@@ -11,6 +11,8 @@ Master CLI reference for SweetSpot, a cost-aware AWS Batch Spot work runner for 
 
 Invoke this skill when an agent needs to understand, reference, or execute any SweetSpot CLI command. This is the comprehensive reference covering all current `sweetspot` subcommands plus the standalone `sweetspot-scout` and `sweetspot-lane-manager` compatibility entry points.
 
+For new runs, prefer the thin `sweetspot-run` skill and the controller workflow: `plan`, `run`, `status`, `repair`, and `cancel`. The lower-level phase commands documented here remain advanced/operator controls for debugging, migration, and manual recovery.
+
 ## Architecture
 
 SweetSpot implements a reliability pattern for large retryable AWS Batch jobs:
