@@ -213,6 +213,13 @@ cat > sweetspot.json <<'JSON'
 JSON
 sweetspot --config sweetspot.json submit-workers --job-name-prefix hello-001-worker
 
+# quick operator overview; JSON remains the default, table is opt-in
+sweetspot status \
+  --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \
+  --job-queue my-batch-spot-queue \
+  --job-name-prefix hello-001-worker \
+  --format table
+
 # preflight AWS/SQS/S3/Batch/CloudWatch permissions and configuration
 sweetspot doctor \
   --queue-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-work-queue \

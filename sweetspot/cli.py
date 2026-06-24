@@ -240,6 +240,33 @@ def cmd_lane_manager(args: argparse.Namespace) -> int:
     return int(lane_manager.main(args.lane_manager_args, prog="sweetspot lane-manager"))
 
 
+def _print_status_table(report: dict[str, Any]) -> None:
+    identity = report.get("identity") or {}
+    print("SweetSpot status")
+    print(f"checked_at\t{report.get('checked_at')}")
+    print(f"region\t{report.get('region')}")
+    print(f"account\t{identity.get('account')}")
+    print(f"arn\t{identity.get('arn')}")
+    queues = report.get("queues") or {}
+    if queues:
+        print("\nqueues")
+        print("name\tvisible\tnot_visible\tdelayed\tqueue_url")
+        for name, queue in queues.items():
+            depth = queue.get("depth") or {}
+            print(f"{name}\t{depth.get('visible', 0)}\t{depth.get('not_visible', 0)}\t{depth.get('delayed', 0)}\t{queue.get('queue_url')}")
+    batch = report.get("batch")
+    if batch:
+        print("\nbatch")
+        print(f"job_queue\t{batch.get('job_queue')}")
+        print(f"job_name_prefix\t{batch.get('job_name_prefix')}")
+        print(f"active_count\t{batch.get('active_count')}")
+        by_status = batch.get("active_by_status") or {}
+        if by_status:
+            print("status\tcount")
+            for status, count in by_status.items():
+                print(f"{status}\t{count}")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     sts = session.client("sts", region_name=args.region)
@@ -263,20 +290,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             "active_by_status": by_status,
             "active_examples": active[:20],
         }
-    print(
-        json.dumps(
-            {
-                "schema": "sweetspot.status.v1",
-                "checked_at": iso_now(),
-                "region": args.region or session.region_name,
-                "identity": {"account": identity.get("Account"), "arn": identity.get("Arn"), "user_id": identity.get("UserId")},
-                "queues": queues,
-                "batch": batch_status,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    report = {
+        "schema": "sweetspot.status.v1",
+        "checked_at": iso_now(),
+        "region": args.region or session.region_name,
+        "identity": {"account": identity.get("Account"), "arn": identity.get("Arn"), "user_id": identity.get("UserId")},
+        "queues": queues,
+        "batch": batch_status,
+    }
+    if args.format == "table":
+        _print_status_table(report)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -2065,7 +2090,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "logs": {"job_id", "log_group", "log_stream", "profile", "region"},
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
-    "status": {"dlq_url", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
+    "status": {"dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
     "submit-workers": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -2124,6 +2149,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "artifact_dir": ("--artifact-dir", False),
     "batch_job_queue": ("--batch-job-queue", False),
     "dlq_url": ("--dlq-url", False),
+    "format": ("--format", False),
     "heartbeat_seconds": ("--heartbeat-seconds", False),
     "include_not_visible": ("--include-not-visible", False),
     "job_definition": ("--job-definition", False),
@@ -2296,7 +2322,7 @@ def main(argv: list[str] | None = None) -> int:
         sub,
         "status",
         help="Show AWS identity, queue depth, DLQ depth, and active Batch worker summary",
-        examples="  sweetspot status --profile prod --region us-west-2 --queue-url https://sqs... --dlq-url https://sqs... --job-queue jq --job-name-prefix run-1",
+        examples="  sweetspot status --profile prod --region us-west-2 --queue-url https://sqs... --dlq-url https://sqs... --job-queue jq --job-name-prefix run-1\n  sweetspot status --queue-url https://sqs... --format table",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -2304,6 +2330,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dlq-url")
     p.add_argument("--job-queue")
     p.add_argument("--job-name-prefix", default="sweetspot-worker")
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("worker", help="Run an SQS worker inside AWS Batch")
