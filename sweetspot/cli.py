@@ -18,7 +18,7 @@ import boto3
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
-from .planner import PlannerSpecError, initial_blocked_plan, load_job_spec, plan_with_adaptive_canaries
+from .planner import PlannerSpecError, initial_blocked_plan, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
@@ -272,11 +272,27 @@ def cmd_plan(args: argparse.Namespace) -> int:
         spec = load_job_spec(args.job_spec)
         if args.input_manifest_jsonl and not args.canary_summary_jsonl:
             raise SystemExit("--input-manifest-jsonl requires --canary-summary-jsonl so shard counts are tied to measured canary sizing")
+        if args.out_production_tasks_jsonl and not (args.canary_summary_jsonl and args.input_manifest_jsonl):
+            raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
         logical_unit_count = _count_jsonl_objects(args.input_manifest_jsonl) if args.input_manifest_jsonl else None
         if args.canary_summary_jsonl:
             plan = plan_with_adaptive_canaries(spec, _read_jsonl(args.canary_summary_jsonl), logical_unit_count=logical_unit_count)
         else:
             plan = initial_blocked_plan(spec)
+        if args.out_production_tasks_jsonl:
+            assert logical_unit_count is not None
+            decision = plan["canaries"][0]["decision"]
+            selected_units = decision.get("selected_units_per_task")
+            if not isinstance(selected_units, int):
+                raise SystemExit("adaptive shard decision is blocked; cannot write production tasks")
+            args.out_production_tasks_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            task_count = 0
+            with args.out_production_tasks_jsonl.open("w", encoding="utf-8") as f:
+                for task in iter_production_tasks_from_logical_unit_count(spec, logical_unit_count, selected_units):
+                    f.write(json.dumps(task, sort_keys=True) + "\n")
+                    task_count += 1
+            plan.setdefault("artifacts", {})["production_tasks_jsonl"] = str(args.out_production_tasks_jsonl)
+            plan["artifacts"]["production_task_count"] = task_count
     except PlannerSpecError as exc:
         raise SystemExit(str(exc)) from exc
     except ValueError as exc:
@@ -2546,6 +2562,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("job_spec", type=Path, help="Path to a sweetspot.job.v1 JSON JobSpec")
     p.add_argument("--canary-summary-jsonl", type=Path, help="Optional local JSONL of canary worker summaries or normalized observations for adaptive shard sizing")
     p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units; with --canary-summary-jsonl, emits adaptive production shard counts")
+    p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL; requires --canary-summary-jsonl and --input-manifest-jsonl")
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)

@@ -38,6 +38,7 @@ All notable changes to this project are documented here. This project uses human
 - Internal adaptive shard-sizing helper for growing canaries toward replay-safe task durations without agent-supplied shard sizes.
 - `sweetspot plan --canary-summary-jsonl` to embed adaptive shard-sizing decisions from local canary summaries in the Plan JSON envelope.
 - `sweetspot plan --input-manifest-jsonl` can combine a local logical-unit manifest copy with canary sizing to report adaptive production shard counts without mutating AWS resources.
+- `sweetspot plan --out-production-tasks-jsonl` for explicitly writing calibrated production `sweetspot.task.v1` shards as a local review/enqueue artifact.
 
 ### Changed
 

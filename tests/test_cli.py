@@ -152,6 +152,47 @@ class PlanCommandTests(unittest.TestCase):
         self.assertEqual(shard_plan["logical_unit_count"], 0)
         self.assertEqual(shard_plan["task_count"], 0)
 
+    def test_plan_can_write_calibrated_production_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries.jsonl"
+            manifest = Path(tmp) / "manifest.jsonl"
+            tasks_path = Path(tmp) / "artifacts" / "tasks.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "plan",
+                            "examples/job.x86.example.json",
+                            "--canary-summary-jsonl",
+                            str(summaries),
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--out-production-tasks-jsonl",
+                            str(tasks_path),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["artifacts"]["production_tasks_jsonl"], str(tasks_path))
+            self.assertEqual(report["artifacts"]["production_task_count"], 3)
+            tasks = [json.loads(line) for line in tasks_path.read_text().splitlines()]
+        self.assertEqual([task["task_id"] for task in tasks], ["shard-000000", "shard-000001", "shard-000002"])
+        self.assertEqual(tasks[-1]["logical_unit_start"], 6000)
+        self.assertEqual(tasks[-1]["logical_unit_count"], 500)
+        validate_task_model(tasks[0], default_timeout_seconds=300, max_timeout_seconds=39600)
+
+    def test_plan_requires_manifest_for_production_task_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries.jsonl"
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            with self.assertRaisesRegex(SystemExit, "requires --canary-summary-jsonl and --input-manifest-jsonl"):
+                main(["plan", "examples/job.x86.example.json", "--canary-summary-jsonl", str(summaries), "--out-production-tasks-jsonl", str(tasks_path)])
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_prepopulates_required_worker_submit_flags(self) -> None:

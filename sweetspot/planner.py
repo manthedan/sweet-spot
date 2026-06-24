@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .adaptive import choose_next_shard_units, logical_shard_plan
-from .s3util import parse_s3_uri
-from .task_model import SAFE_ID_RE
+from .s3util import parse_s3_uri, s3_join
+from .task_model import SAFE_ID_RE, TASK_SCHEMA_V1
 
 
 JOB_SPEC_SCHEMA_V1 = "sweetspot.job.v1"
@@ -123,6 +123,71 @@ def plan_with_adaptive_canaries(
         canary_entry["production_shards"] = logical_shard_plan(logical_unit_count, selected_units, max_inline_ranges=0)
     plan["canaries"] = [canary_entry]
     return validate_plan(plan)
+
+
+def iter_production_tasks_from_logical_unit_count(job_spec: dict[str, Any], total_units: int, units_per_task: int) -> Iterator[dict[str, Any]]:
+    """Yield deterministic production task payloads without materializing the full run."""
+
+    spec = validate_job_spec(job_spec)
+    total = _non_negative_int(total_units, "total_units")
+    units = _positive_int(units_per_task, "units_per_task")
+    task_count = math.ceil(total / units)
+    for shard_index in range(task_count):
+        unit_start = shard_index * units
+        unit_count = min(units, total - unit_start)
+        yield _production_task_for_range(spec, shard_index=shard_index, unit_start=unit_start, unit_count=unit_count)
+
+
+def production_tasks_from_logical_shard_plan(job_spec: dict[str, Any], shard_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Materialize deterministic SweetSpot task payloads from a logical shard plan.
+
+    Commands receive the manifest URI and contiguous logical range in
+    SWEETSPOT_TASK_JSON. The helper is pure and writes nothing; CLI/controller
+    code decides whether to persist or enqueue the generated JSONL.
+    """
+
+    spec = validate_job_spec(job_spec)
+    ranges = shard_plan.get("ranges")
+    if not isinstance(ranges, list):
+        raise PlannerSpecError("logical shard plan must include ranges to materialize production tasks")
+    task_count = _non_negative_int(shard_plan.get("task_count"), "task_count")
+    ranges_omitted = _non_negative_int(shard_plan.get("ranges_omitted", 0), "ranges_omitted")
+    if ranges_omitted:
+        raise PlannerSpecError("logical shard plan omitted ranges and cannot be materialized safely")
+    if len(ranges) != task_count:
+        raise PlannerSpecError("logical shard plan range count does not match task_count")
+    tasks: list[dict[str, Any]] = []
+    for range_obj in ranges:
+        if not isinstance(range_obj, dict):
+            raise PlannerSpecError("logical shard ranges must be objects")
+        shard_index = _non_negative_int(range_obj.get("shard_index"), "shard_index")
+        unit_start = _non_negative_int(range_obj.get("unit_start"), "unit_start")
+        unit_count = _positive_int(range_obj.get("unit_count"), "unit_count")
+        tasks.append(_production_task_for_range(spec, shard_index=shard_index, unit_start=unit_start, unit_count=unit_count))
+    return tasks
+
+
+def _production_task_for_range(spec: dict[str, Any], *, shard_index: int, unit_start: int, unit_count: int) -> dict[str, Any]:
+    task_id = f"shard-{shard_index:06d}"
+    output_s3 = s3_join(spec["output_prefix"], "shards", task_id)
+    return {
+        "schema": TASK_SCHEMA_V1,
+        "run_id": spec["run_id"],
+        "task_id": task_id,
+        "job_type": "production",
+        "command": list(spec["command"]),
+        "input_s3": spec["input_manifest"],
+        "input": {
+            "manifest_s3": spec["input_manifest"],
+            "logical_unit_start": unit_start,
+            "logical_unit_count": unit_count,
+        },
+        "logical_unit_start": unit_start,
+        "logical_unit_count": unit_count,
+        "output_s3": output_s3,
+        "summary_s3": s3_join(spec["output_prefix"], "summaries", f"{task_id}.summary.json"),
+        "done_s3": s3_join(spec["output_prefix"], "done", f"{task_id}.done.json"),
+    }
 
 
 def _base_blocked_plan(job_spec: dict[str, Any]) -> dict[str, Any]:
@@ -304,6 +369,18 @@ def _validate_validation(value: Any) -> None:
     output_check = value.get("output_check", "done_marker")
     if output_check not in OUTPUT_CHECKS:
         raise PlannerSpecError(f"JobSpec validation.output_check must be one of: {', '.join(sorted(OUTPUT_CHECKS))}")
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PlannerSpecError(f"{field} must be a positive integer")
+    return value
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PlannerSpecError(f"{field} must be a non-negative integer")
+    return value
 
 
 def _positive_number(value: Any, field: str) -> float:

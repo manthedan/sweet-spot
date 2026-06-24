@@ -3,7 +3,18 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from sweetspot.planner import PlannerSpecError, load_job_spec, load_plan, plan_with_adaptive_canaries, validate_job_spec, validate_plan
+from sweetspot.adaptive import logical_shard_plan
+from sweetspot.planner import (
+    PlannerSpecError,
+    iter_production_tasks_from_logical_unit_count,
+    load_job_spec,
+    load_plan,
+    plan_with_adaptive_canaries,
+    production_tasks_from_logical_shard_plan,
+    validate_job_spec,
+    validate_plan,
+)
+from sweetspot.task_model import validate_task_model
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +106,42 @@ class PlannerContractTests(unittest.TestCase):
         self.assertEqual(shard_plan["logical_unit_count"], 6500)
         self.assertEqual(shard_plan["task_count"], 3)
         self.assertEqual(shard_plan["ranges_omitted"], 3)
+
+    def test_iter_production_tasks_from_logical_unit_count_streams_task_payloads(self) -> None:
+        tasks = list(iter_production_tasks_from_logical_unit_count(self._valid_job_spec(), 25, 10))
+        self.assertEqual([task["task_id"] for task in tasks], ["shard-000000", "shard-000001", "shard-000002"])
+        self.assertEqual(tasks[-1]["logical_unit_start"], 20)
+        self.assertEqual(tasks[-1]["logical_unit_count"], 5)
+        validate_task_model(tasks[0], default_timeout_seconds=300, max_timeout_seconds=39600)
+
+    def test_production_tasks_from_logical_shard_plan_materializes_task_payloads(self) -> None:
+        tasks = production_tasks_from_logical_shard_plan(self._valid_job_spec(), logical_shard_plan(25, 10))
+        self.assertEqual([task["task_id"] for task in tasks], ["shard-000000", "shard-000001", "shard-000002"])
+        self.assertEqual(tasks[0]["schema"], "sweetspot.task.v1")
+        self.assertEqual(tasks[0]["input_s3"], "s3://bucket/inputs/items.jsonl")
+        self.assertEqual(tasks[0]["input"]["logical_unit_start"], 0)
+        self.assertEqual(tasks[0]["input"]["logical_unit_count"], 10)
+        self.assertEqual(tasks[-1]["logical_unit_start"], 20)
+        self.assertEqual(tasks[-1]["logical_unit_count"], 5)
+        self.assertEqual(tasks[0]["output_s3"], "s3://bucket/runs/run-1/shards/shard-000000")
+        self.assertEqual(tasks[0]["done_s3"], "s3://bucket/runs/run-1/done/shard-000000.done.json")
+        validate_task_model(tasks[0], default_timeout_seconds=300, max_timeout_seconds=39600)
+
+    def test_production_tasks_require_inline_logical_ranges(self) -> None:
+        with self.assertRaisesRegex(PlannerSpecError, "must include ranges"):
+            production_tasks_from_logical_shard_plan(self._valid_job_spec(), logical_shard_plan(25, 10, max_inline_ranges=0))
+
+    def test_production_tasks_reject_partial_logical_ranges(self) -> None:
+        shard_plan = logical_shard_plan(25, 10)
+        shard_plan["ranges"] = shard_plan["ranges"][:2]
+        with self.assertRaisesRegex(PlannerSpecError, "range count does not match"):
+            production_tasks_from_logical_shard_plan(self._valid_job_spec(), shard_plan)
+
+    def test_production_tasks_reject_omitted_logical_ranges(self) -> None:
+        shard_plan = logical_shard_plan(25, 10)
+        shard_plan["ranges_omitted"] = 1
+        with self.assertRaisesRegex(PlannerSpecError, "omitted ranges"):
+            production_tasks_from_logical_shard_plan(self._valid_job_spec(), shard_plan)
 
     def test_ready_plan_requires_selected_execution_settings(self) -> None:
         plan = {
