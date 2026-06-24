@@ -10,12 +10,28 @@ output "batch_spot_queue" {
   value = aws_batch_job_queue.spot.arn
 }
 
+output "batch_spot_x86_queue" {
+  value = aws_batch_job_queue.spot.arn
+}
+
+output "batch_spot_arm_queue" {
+  value = var.create_arm_spot_queue ? aws_batch_job_queue.spot_arm[0].arn : null
+}
+
 output "batch_ondemand_queue" {
   value = var.create_ondemand_queue ? aws_batch_job_queue.ondemand[0].arn : null
 }
 
 output "worker_job_definition" {
   value = aws_batch_job_definition.worker.arn
+}
+
+output "worker_x86_job_definition" {
+  value = aws_batch_job_definition.worker.arn
+}
+
+output "worker_arm_job_definition" {
+  value = var.create_arm_spot_queue ? aws_batch_job_definition.worker_arm[0].arn : null
 }
 
 output "worker_task_role_arn" {

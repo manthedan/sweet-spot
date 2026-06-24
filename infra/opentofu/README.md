@@ -3,11 +3,13 @@
 Creates the AWS primitives used by `SweetSpot`:
 
 - SQS work queue + DLQ with SSE, longer DLQ retention, and a narrow redrive allow policy
-- AWS Batch Spot compute environment + queue
+- AWS Batch x86 Spot compute environment + queue
+- optional separate ARM/Graviton Spot compute environment + queue
 - optional On-Demand repair queue
 - no-ingress Batch security group by default, unless explicit security groups are supplied
 - Batch launch template requiring IMDSv2 and encrypted gp3 root volumes
-- generic worker job definition that explicitly runs `sweetspot worker`
+- generic x86 worker job definition that explicitly runs `sweetspot worker`
+- optional ARM worker job definition for a verified ARM or multi-arch image
 - IAM roles for Batch/ECS/worker task
 - optional CloudWatch dashboard and baseline alarms
 - optional monthly AWS Budget alert
@@ -40,7 +42,7 @@ tofu apply -var-file=example.tfvars
 ## Notes
 
 - Default Spot allocation strategy is `SPOT_PRICE_CAPACITY_OPTIMIZED`.
-- Default Spot instance types are x86-only for workload compatibility. To evaluate ARM/Graviton savings, run `sweetspot scout --preset mixed --observed-summaries ...`, then opt into ARM only after a canary proves the worker image and native dependencies are compatible.
+- Default Spot instance types are x86-only for workload compatibility. To evaluate ARM/Graviton savings, run `sweetspot scout --preset mixed --observed-summaries ...`, then opt into the separate ARM queue only after a canary proves the worker image and native dependencies are compatible.
 - The committed `.terraform.lock.hcl` is part of the reproducibility contract; CI runs `tofu init -lockfile=readonly`, `tofu fmt`, and `tofu validate`.
 - For production, pass explicit private `subnet_ids` and set `require_explicit_subnets = true` so the module does not silently use every subnet in the selected/default VPC.
 - If `security_group_ids` is empty, the module creates a dedicated no-ingress security group. Set `create_no_ingress_security_group = false` only when intentionally falling back to the VPC default security group.
@@ -58,13 +60,19 @@ tofu apply -var-file=example.tfvars
 
 ## Opt-in ARM / Graviton lanes
 
-ARM is not the module default because many user workloads or container images are x86-only. When a canary proves ARM compatibility, deploy a separate ARM-oriented stack or queue by overriding `spot_instance_types`:
+ARM is not the module default because many user workloads or container images are x86-only. When a canary proves ARM compatibility, enable the separate ARM queue and job definition:
 
 ```hcl
-spot_instance_types = [
+create_arm_spot_queue = true
+
+# Optional. Leave empty only if worker_image_uri is a verified multi-arch image.
+worker_image_uri_arm = "ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/my-sweetspot-worker-arm64:latest"
+
+spot_arm_instance_types = [
   "c7g.large", "c7g.xlarge", "c7g.2xlarge",
   "m7g.large", "m7g.xlarge", "m7g.2xlarge",
 ]
+max_vcpus_spot_arm = 64
 ```
 
-For mixed x86/ARM operations, prefer separate Batch queues and job definitions per architecture, then model them as separate `sweetspot lane-manager` lanes with per-lane `instance_types`. Only place x86 and ARM types in the same Batch compute environment when the worker image is verified multi-arch and all native dependencies work on both architectures.
+The existing `batch_spot_queue` / `worker_job_definition` outputs remain the default x86 lane. Use `batch_spot_arm_queue` and `worker_arm_job_definition` for ARM canaries or ARM production lanes, then model x86 and ARM as separate `sweetspot lane-manager` lanes with per-lane `instance_types`. Only place x86 and ARM types in the same Batch compute environment when the worker image is verified multi-arch and all native dependencies work on both architectures.

@@ -31,6 +31,7 @@ locals {
     for p in local.worker_s3_prefixes_normalized :
     p == "" ? ["*"] : [p, "${p}/*"]
   ]))
+  worker_image_uri_arm_effective = var.worker_image_uri_arm != "" ? var.worker_image_uri_arm : var.worker_image_uri
   worker_allowed_s3_prefixes_effective = length(var.worker_allowed_s3_prefixes) > 0 ? var.worker_allowed_s3_prefixes : [
     for p in local.worker_s3_prefixes_normalized :
     p == "" ? "s3://${var.worker_s3_bucket}/" : "s3://${var.worker_s3_bucket}/${p}"

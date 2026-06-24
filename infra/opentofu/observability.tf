@@ -45,11 +45,18 @@ resource "aws_cloudwatch_dashboard" "sweetspot" {
         properties = {
           title  = "AWS Batch job states (best-effort namespace metrics)"
           region = var.aws_region
-          metrics = [
-            ["AWS/Batch", "FailedJobs", "JobQueue", aws_batch_job_queue.spot.name, { label = "spot failed" }],
-            [".", "RunnableJobs", ".", ".", { label = "spot runnable" }],
-            [".", "RunningJobs", ".", ".", { label = "spot running" }]
-          ]
+          metrics = concat(
+            [
+              ["AWS/Batch", "FailedJobs", "JobQueue", aws_batch_job_queue.spot.name, { label = "x86 spot failed" }],
+              [".", "RunnableJobs", ".", ".", { label = "x86 spot runnable" }],
+              [".", "RunningJobs", ".", ".", { label = "x86 spot running" }]
+            ],
+            var.create_arm_spot_queue ? [
+              ["AWS/Batch", "FailedJobs", "JobQueue", aws_batch_job_queue.spot_arm[0].name, { label = "arm64 spot failed" }],
+              [".", "RunnableJobs", ".", ".", { label = "arm64 spot runnable" }],
+              [".", "RunningJobs", ".", ".", { label = "arm64 spot running" }]
+            ] : []
+          )
           stat   = "Maximum"
           period = 60
         }
@@ -132,6 +139,42 @@ resource "aws_cloudwatch_metric_alarm" "batch_runnable_jobs" {
   namespace           = "AWS/Batch"
   metric_name         = "RunnableJobs"
   dimensions          = { JobQueue = aws_batch_job_queue.spot.name }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = var.runnable_jobs_alarm_evaluation_periods
+  threshold           = var.runnable_jobs_alarm_threshold
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = var.alarm_sns_topic_arns
+  ok_actions          = var.alarm_sns_topic_arns
+  tags                = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "batch_arm_failed_jobs" {
+  count               = var.create_observability && var.create_arm_spot_queue ? 1 : 0
+  alarm_name          = "${var.project_name}-batch-arm64-failed-jobs"
+  alarm_description   = "AWS Batch reports failed jobs for the optional ARM/Graviton Spot queue. Check canary compatibility, worker structured events, and CloudWatch logs."
+  namespace           = "AWS/Batch"
+  metric_name         = "FailedJobs"
+  dimensions          = { JobQueue = aws_batch_job_queue.spot_arm[0].name }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = var.alarm_evaluation_periods
+  threshold           = var.batch_failed_jobs_alarm_threshold
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = var.alarm_sns_topic_arns
+  ok_actions          = var.alarm_sns_topic_arns
+  tags                = local.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "batch_arm_runnable_jobs" {
+  count               = var.create_observability && var.create_arm_spot_queue ? 1 : 0
+  alarm_name          = "${var.project_name}-batch-arm64-runnable-jobs"
+  alarm_description   = "AWS Batch runnable jobs remain above threshold on the optional ARM/Graviton Spot queue. This can indicate insufficient capacity, invalid compute resources, image incompatibility, or Spot scarcity."
+  namespace           = "AWS/Batch"
+  metric_name         = "RunnableJobs"
+  dimensions          = { JobQueue = aws_batch_job_queue.spot_arm[0].name }
   statistic           = "Maximum"
   period              = 60
   evaluation_periods  = var.runnable_jobs_alarm_evaluation_periods

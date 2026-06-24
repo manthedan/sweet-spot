@@ -33,6 +33,7 @@ All notable changes to this project are documented here. This project uses human
 - Machine-readable `sweetspot scout` reason codes for default throughput, unobserved replay, and omitted optional cost components.
 - Worker telemetry now records requested worker vCPU/memory, task-reported peak memory when available, and best-effort IMDS instance type/AZ fallback.
 - Scout observed-performance telemetry now exposes `ApproximateReceiveCount` replay lower bounds and warns when replay cost is lower-bound-only or only partially captured by discarded-compute summaries.
+- Optional OpenTofu ARM/Graviton Spot queue and worker job definition for canary-gated x86/ARM lane separation.
 
 ### Changed
 

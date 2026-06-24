@@ -82,6 +82,12 @@ variable "max_vcpus_spot" {
   default = 256
 }
 
+variable "max_vcpus_spot_arm" {
+  type        = number
+  description = "Maximum vCPUs for the optional ARM/Graviton Spot compute environment. Used only when create_arm_spot_queue=true."
+  default     = 64
+}
+
 variable "max_vcpus_ondemand" {
   type    = number
   default = 16
@@ -105,7 +111,7 @@ variable "spot_bid_percentage" {
 
 variable "spot_instance_types" {
   type        = list(string)
-  description = "Broad compatible instance list for Spot."
+  description = "Broad x86-compatible instance list for the default Spot queue. Keep this x86-only unless your worker image and dependencies are verified multi-arch."
   default = [
     "c5.large", "c5.xlarge", "c5.2xlarge", "c5.4xlarge",
     "c6i.large", "c6i.xlarge", "c6i.2xlarge", "c6i.4xlarge",
@@ -115,6 +121,29 @@ variable "spot_instance_types" {
     "m6a.large", "m6a.xlarge", "m6a.2xlarge", "m6a.4xlarge",
     "m7i.large", "m7i.xlarge", "m7i.2xlarge", "m7i.4xlarge",
   ]
+}
+
+variable "create_arm_spot_queue" {
+  type        = bool
+  description = "Create a separate opt-in ARM/Graviton Spot compute environment, queue, and worker job definition. Keep false until a canary proves image/dependency compatibility."
+  default     = false
+}
+
+variable "spot_arm_instance_types" {
+  type        = list(string)
+  description = "Broad ARM/Graviton instance list for the optional ARM Spot queue. Used only when create_arm_spot_queue=true."
+  default = [
+    "c6g.large", "c6g.xlarge", "c6g.2xlarge", "c6g.4xlarge",
+    "c7g.large", "c7g.xlarge", "c7g.2xlarge", "c7g.4xlarge",
+    "m6g.large", "m6g.xlarge", "m6g.2xlarge", "m6g.4xlarge",
+    "m7g.large", "m7g.xlarge", "m7g.2xlarge", "m7g.4xlarge",
+  ]
+}
+
+variable "worker_image_uri_arm" {
+  type        = string
+  description = "Optional ARM-specific worker image URI. Empty means reuse worker_image_uri, which must then be a verified multi-arch image before create_arm_spot_queue is enabled."
+  default     = ""
 }
 
 variable "sqs_visibility_timeout_seconds" {
