@@ -217,6 +217,10 @@ def _auto_canary_indices(tasks: list[dict[str, Any]], task_count: int) -> list[i
     return selected
 
 
+def _add_parser_with_examples(subparsers: Any, name: str, *, help: str | None = None, examples: str) -> argparse.ArgumentParser:
+    return subparsers.add_parser(name, help=help, formatter_class=argparse.RawDescriptionHelpFormatter, epilog=f"examples:\n{examples}")
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     try:
         version = importlib_metadata.version("sweetspot")
@@ -2019,7 +2023,11 @@ def main() -> int:
         )
     )
 
-    p = sub.add_parser("enqueue-jsonl")
+    p = _add_parser_with_examples(
+        sub,
+        "enqueue-jsonl",
+        examples="  sweetspot enqueue-jsonl --tasks-jsonl tasks.jsonl --allowed-s3-prefix s3://bucket/run --submit --queue-url https://sqs...",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
@@ -2030,7 +2038,12 @@ def main() -> int:
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_enqueue_jsonl)
 
-    p = sub.add_parser("enqueue-and-submit", help="Atomically enqueue tasks, wait for SQS visibility, then submit Batch workers")
+    p = _add_parser_with_examples(
+        sub,
+        "enqueue-and-submit",
+        help="Atomically enqueue tasks, wait for SQS visibility, then submit Batch workers",
+        examples="  sweetspot enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url https://sqs... --batch-job-queue jq --job-definition jd --allowed-s3-prefix s3://bucket/run --submit",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
@@ -2063,7 +2076,11 @@ def main() -> int:
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_enqueue_and_submit)
 
-    p = sub.add_parser("derive-canary")
+    p = _add_parser_with_examples(
+        sub,
+        "derive-canary",
+        examples="  sweetspot derive-canary --tasks-jsonl tasks.jsonl --out-dir artifacts/canary --task-count 4 --rewrite-run-id",
+    )
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--run-id", default=f"canary-{utc_stamp()}")
@@ -2074,7 +2091,11 @@ def main() -> int:
     p.add_argument("--dlq-probe-prefix", help="S3 prefix for the intentional DLQ probe done marker; required when selected tasks do not already have a done-marker prefix")
     p.set_defaults(func=cmd_derive_canary)
 
-    p = sub.add_parser("submit-workers")
+    p = _add_parser_with_examples(
+        sub,
+        "submit-workers",
+        examples="  sweetspot submit-workers --queue-url https://sqs... --batch-job-queue jq --job-definition jd --messages-per-worker 1 --submit",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--sqs-queue-url", "--queue-url", dest="sqs_queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
@@ -2101,7 +2122,11 @@ def main() -> int:
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_submit_workers)
 
-    p = sub.add_parser("supervise-workers")
+    p = _add_parser_with_examples(
+        sub,
+        "supervise-workers",
+        examples="  sweetspot supervise-workers --queue-url https://sqs... --batch-job-queue jq --job-definition jd --target-active-workers 16 --loops 10 --submit",
+    )
     p.add_argument("--run-id")
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -2137,7 +2162,11 @@ def main() -> int:
     p.add_argument("--submit", action="store_true")
     p.set_defaults(func=cmd_supervise_workers)
 
-    p = sub.add_parser("finalize")
+    p = _add_parser_with_examples(
+        sub,
+        "finalize",
+        examples="  sweetspot finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--run-id", required=True)
@@ -2168,7 +2197,12 @@ def main() -> int:
     p.add_argument("--max-jobs", type=int, default=1000)
     p.set_defaults(func=cmd_jobs)
 
-    p = sub.add_parser("repair-plan", help="Build a repair JSONL from finalizer status while excluding tasks already owned by active jobs")
+    p = _add_parser_with_examples(
+        sub,
+        "repair-plan",
+        help="Build a repair JSONL from finalizer status while excluding tasks already owned by active jobs",
+        examples="  sweetspot repair-plan --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --out-jsonl repair.jsonl --job-queue jq --job-name-regex run-1",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--tasks-jsonl", type=Path, required=True)
@@ -2185,7 +2219,12 @@ def main() -> int:
     p.add_argument("--max-jobs", type=int, default=1000)
     p.set_defaults(func=cmd_repair_plan)
 
-    p = sub.add_parser("cleanup-stale-messages", help="Dry-run/apply deletion of visible SQS messages whose S3 done marker already exists")
+    p = _add_parser_with_examples(
+        sub,
+        "cleanup-stale-messages",
+        help="Dry-run/apply deletion of visible SQS messages whose S3 done marker already exists",
+        examples="  sweetspot cleanup-stale-messages --queue-url https://sqs... --run-id run-1 --max-messages 100\n  sweetspot cleanup-stale-messages --queue-url https://sqs... --run-id run-1 --apply",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
@@ -2197,7 +2236,12 @@ def main() -> int:
     p.add_argument("--apply", action="store_true", help="Delete stale done messages; default is dry-run")
     p.set_defaults(func=cmd_cleanup_stale_messages)
 
-    p = sub.add_parser("estimate-runtime", help="Estimate wall time/cost from canary or task summary telemetry")
+    p = _add_parser_with_examples(
+        sub,
+        "estimate-runtime",
+        help="Estimate wall time/cost from canary or task summary telemetry",
+        examples="  sweetspot estimate-runtime --sample-jsonl canary_summaries.jsonl --target-units 10000000 --active-workers 32 --price-per-vcpu-hour 0.02",
+    )
     p.add_argument("--sample-jsonl", action="append", type=Path, default=[], help="JSONL with task summaries/metrics containing completed_units+seconds; repeatable")
     p.add_argument("--completed-units", type=float)
     p.add_argument("--elapsed-seconds", type=float)
@@ -2253,7 +2297,12 @@ def main() -> int:
     p.add_argument("--completion-marker-s3")
     p.set_defaults(func=cmd_s3_delete_prefix)
 
-    p = sub.add_parser("doctor", help="Validate common AWS/SQS/S3/Batch/CloudWatch operator prerequisites")
+    p = _add_parser_with_examples(
+        sub,
+        "doctor",
+        help="Validate common AWS/SQS/S3/Batch/CloudWatch operator prerequisites",
+        examples="  sweetspot doctor --profile prod --region us-west-2 --queue-url https://sqs... --job-queue jq --job-definition jd --s3-prefix s3://bucket/run",
+    )
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))

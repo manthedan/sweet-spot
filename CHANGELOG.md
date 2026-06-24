@@ -16,6 +16,7 @@ All notable changes to this project are documented here. This project uses human
 - Consistent `--profile`/`--region` options for AWS-touching CLI commands.
 - `sweetspot version` command for checking the installed package version.
 - `--queue-url` alias for worker-submission commands that previously exposed only `--sqs-queue-url`.
+- Short argparse help examples for high-traffic production workflow commands.
 
 ### Fixed
 

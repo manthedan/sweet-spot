@@ -77,6 +77,18 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(report["version"], "1.2.3")
 
 
+class HelpExamplesTests(unittest.TestCase):
+    def test_high_traffic_help_includes_examples(self) -> None:
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["sweetspot", "enqueue-and-submit", "--help"]), contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+        self.assertEqual(cm.exception.code, 0)
+        help_text = out.getvalue()
+        self.assertIn("examples:", help_text)
+        self.assertIn("sweetspot enqueue-and-submit", help_text)
+
+
 class QueueAliasTests(unittest.TestCase):
     def test_submit_workers_accepts_queue_url_alias(self) -> None:
         class FakeSQS:
