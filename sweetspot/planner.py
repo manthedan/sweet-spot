@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .adaptive import choose_next_shard_units
+from .adaptive import choose_next_shard_units, logical_shard_plan
 from .s3util import parse_s3_uri
 from .task_model import SAFE_ID_RE
 
@@ -87,6 +87,7 @@ def plan_with_adaptive_canaries(
     canary_observations: list[dict[str, Any]],
     *,
     target_task_seconds: float = 300.0,
+    logical_unit_count: int | None = None,
 ) -> dict[str, Any]:
     """Return a Plan envelope with an adaptive shard-sizing canary decision.
 
@@ -113,12 +114,14 @@ def plan_with_adaptive_canaries(
                 "message": "Adaptive shard telemetry is available, but resource, architecture, and cost calibration are not complete enough to select full execution settings.",
             }
         ]
-    plan["canaries"] = [
-        {
-            "purpose": "adaptive_shard_sizing",
-            "decision": shard_decision,
-        }
-    ]
+    canary_entry: dict[str, Any] = {
+        "purpose": "adaptive_shard_sizing",
+        "decision": shard_decision,
+    }
+    selected_units = shard_decision.get("selected_units_per_task")
+    if logical_unit_count is not None and isinstance(selected_units, int):
+        canary_entry["production_shards"] = logical_shard_plan(logical_unit_count, selected_units, max_inline_ranges=0)
+    plan["canaries"] = [canary_entry]
     return validate_plan(plan)
 
 

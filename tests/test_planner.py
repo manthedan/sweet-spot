@@ -83,6 +83,19 @@ class PlannerContractTests(unittest.TestCase):
         self.assertEqual(plan["reasons"][0]["code"], "memory_shape_rejected_oom")
         self.assertEqual(plan["canaries"][0]["decision"]["status"], "blocked")
 
+    def test_plan_with_adaptive_canaries_counts_production_shards(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [{"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}],
+            logical_unit_count=6500,
+        )
+        shard_plan = plan["canaries"][0]["production_shards"]
+        self.assertEqual(shard_plan["schema"], "sweetspot.logical_shard_plan.v1")
+        self.assertEqual(shard_plan["units_per_task"], 3000)
+        self.assertEqual(shard_plan["logical_unit_count"], 6500)
+        self.assertEqual(shard_plan["task_count"], 3)
+        self.assertEqual(shard_plan["ranges_omitted"], 3)
+
     def test_ready_plan_requires_selected_execution_settings(self) -> None:
         plan = {
             "schema": "sweetspot.plan.v1",

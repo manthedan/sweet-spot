@@ -111,6 +111,47 @@ class PlanCommandTests(unittest.TestCase):
         self.assertEqual(report["canaries"][0]["purpose"], "adaptive_shard_sizing")
         self.assertEqual(report["canaries"][0]["decision"]["selected_units_per_task"], 3000)
 
+    def test_plan_counts_manifest_units_for_adaptive_shard_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries.jsonl"
+            manifest = Path(tmp) / "manifest.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "plan",
+                            "examples/job.x86.example.json",
+                            "--canary-summary-jsonl",
+                            str(summaries),
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                        ]
+                    ),
+                    0,
+                )
+        shard_plan = json.loads(out.getvalue())["canaries"][0]["production_shards"]
+        self.assertEqual(shard_plan["logical_unit_count"], 6500)
+        self.assertEqual(shard_plan["task_count"], 3)
+
+    def test_plan_allows_empty_manifest_for_adaptive_shard_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries.jsonl"
+            manifest = Path(tmp) / "empty.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(["plan", "examples/job.x86.example.json", "--canary-summary-jsonl", str(summaries), "--input-manifest-jsonl", str(manifest)]),
+                    0,
+                )
+        shard_plan = json.loads(out.getvalue())["canaries"][0]["production_shards"]
+        self.assertEqual(shard_plan["logical_unit_count"], 0)
+        self.assertEqual(shard_plan["task_count"], 0)
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_prepopulates_required_worker_submit_flags(self) -> None:

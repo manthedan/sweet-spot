@@ -47,6 +47,10 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return list(_iter_jsonl(path))
 
 
+def _count_jsonl_objects(path: Path) -> int:
+    return sum(1 for _ in _iter_jsonl(path))
+
+
 def _chunks(xs: list[dict[str, Any]], n: int) -> Iterable[list[dict[str, Any]]]:
     for i in range(0, len(xs), n):
         yield xs[i : i + n]
@@ -266,8 +270,11 @@ def cmd_version(args: argparse.Namespace) -> int:
 def cmd_plan(args: argparse.Namespace) -> int:
     try:
         spec = load_job_spec(args.job_spec)
+        if args.input_manifest_jsonl and not args.canary_summary_jsonl:
+            raise SystemExit("--input-manifest-jsonl requires --canary-summary-jsonl so shard counts are tied to measured canary sizing")
+        logical_unit_count = _count_jsonl_objects(args.input_manifest_jsonl) if args.input_manifest_jsonl else None
         if args.canary_summary_jsonl:
-            plan = plan_with_adaptive_canaries(spec, _read_jsonl(args.canary_summary_jsonl))
+            plan = plan_with_adaptive_canaries(spec, _read_jsonl(args.canary_summary_jsonl), logical_unit_count=logical_unit_count)
         else:
             plan = initial_blocked_plan(spec)
     except PlannerSpecError as exc:
@@ -2538,6 +2545,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("job_spec", type=Path, help="Path to a sweetspot.job.v1 JSON JobSpec")
     p.add_argument("--canary-summary-jsonl", type=Path, help="Optional local JSONL of canary worker summaries or normalized observations for adaptive shard sizing")
+    p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units; with --canary-summary-jsonl, emits adaptive production shard counts")
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)

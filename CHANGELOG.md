@@ -37,6 +37,7 @@ All notable changes to this project are documented here. This project uses human
 - Worker telemetry now records best-effort EC2 Spot interruption and rebalance notices from IMDS when available.
 - Internal adaptive shard-sizing helper for growing canaries toward replay-safe task durations without agent-supplied shard sizes.
 - `sweetspot plan --canary-summary-jsonl` to embed adaptive shard-sizing decisions from local canary summaries in the Plan JSON envelope.
+- `sweetspot plan --input-manifest-jsonl` can combine a local logical-unit manifest copy with canary sizing to report adaptive production shard counts without mutating AWS resources.
 
 ### Changed
 

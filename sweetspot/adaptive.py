@@ -6,6 +6,7 @@ import statistics
 from typing import Any
 
 ADAPTIVE_SHARD_SCHEMA_V1 = "sweetspot.adaptive_shard_decision.v1"
+LOGICAL_SHARD_PLAN_SCHEMA_V1 = "sweetspot.logical_shard_plan.v1"
 ADAPTIVE_SHARD_REASON_CODES: dict[str, str] = {
     "canary_required": "No measurable canary summary was available, so the next canary should use the minimum shard size.",
     "geometric_growth_cap": "The measured rate supports a larger shard, but growth was capped to keep canaries replay-safe.",
@@ -61,6 +62,45 @@ def canary_observation_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
     if units and seconds:
         observation["units_per_second"] = units / seconds
     return {k: v for k, v in observation.items() if v is not None}
+
+
+def logical_shard_plan(total_units: int, units_per_task: int, *, max_inline_ranges: int = 1000) -> dict[str, Any]:
+    """Plan deterministic contiguous shards for a logical-unit manifest.
+
+    This is intentionally side-effect-free: it only describes how a future run
+    controller should split a manifest after canary-backed shard sizing. The
+    controller can choose not to inline ranges in large Plan JSON outputs.
+    """
+
+    if isinstance(total_units, bool) or not isinstance(total_units, int) or total_units < 0:
+        raise ValueError("total_units must be a non-negative integer")
+    if isinstance(units_per_task, bool) or not isinstance(units_per_task, int) or units_per_task <= 0:
+        raise ValueError("units_per_task must be a positive integer")
+    if isinstance(max_inline_ranges, bool) or not isinstance(max_inline_ranges, int) or max_inline_ranges < 0:
+        raise ValueError("max_inline_ranges must be non-negative")
+
+    task_count = math.ceil(total_units / units_per_task)
+    out: dict[str, Any] = {
+        "schema": LOGICAL_SHARD_PLAN_SCHEMA_V1,
+        "logical_unit_count": total_units,
+        "units_per_task": units_per_task,
+        "task_count": task_count,
+    }
+    if task_count <= max_inline_ranges:
+        ranges: list[dict[str, int]] = []
+        for shard_index in range(task_count):
+            unit_start = shard_index * units_per_task
+            ranges.append(
+                {
+                    "shard_index": shard_index,
+                    "unit_start": unit_start,
+                    "unit_count": min(units_per_task, total_units - unit_start),
+                }
+            )
+        out["ranges"] = ranges
+    else:
+        out["ranges_omitted"] = task_count
+    return out
 
 
 def choose_next_shard_units(

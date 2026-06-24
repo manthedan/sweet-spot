@@ -130,7 +130,7 @@ For Spot, prefer many short tasks over a few long tasks. If a task cannot checkp
 
 The commands below expose SweetSpot's current operator phases. They remain useful for advanced debugging and controlled production runs, but they are not the intended long-term agent contract. SweetSpot is moving toward `sweetspot plan`, `sweetspot run`, `sweetspot status`, `sweetspot repair`, and `sweetspot cancel`, where agents provide workload intent, budget, deadline, and output locations while SweetSpot chooses shard size, resource shape, architecture, and parallelism.
 
-Until that controller exists, treat direct sizing flags such as worker count, vCPU, memory, task timeout, shard size, and messages per worker as advanced controls that require canary evidence and dry-run review. Adaptive shard-sizing helpers now consume canary summaries internally so the future controller can grow from tiny replay-safe canaries instead of asking agents to invent chunk sizes; `sweetspot plan --canary-summary-jsonl summaries.jsonl` exposes that shard-sizing decision in JSON without mutating AWS resources.
+Until that controller exists, treat direct sizing flags such as worker count, vCPU, memory, task timeout, shard size, and messages per worker as advanced controls that require canary evidence and dry-run review. Adaptive shard-sizing helpers now consume canary summaries internally so the future controller can grow from tiny replay-safe canaries instead of asking agents to invent chunk sizes; `sweetspot plan --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl` exposes that shard-sizing decision and production shard count in JSON without mutating AWS resources.
 
 ## Recommended cost optimization workflow
 

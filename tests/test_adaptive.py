@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sweetspot.adaptive import canary_observation_from_summary, choose_next_shard_units
+from sweetspot.adaptive import canary_observation_from_summary, choose_next_shard_units, logical_shard_plan
 
 
 class AdaptiveShardTests(unittest.TestCase):
@@ -59,6 +59,31 @@ class AdaptiveShardTests(unittest.TestCase):
         self.assertEqual(decision["status"], "blocked")
         self.assertIsNone(decision["selected_units_per_task"])
         self.assertIn("memory_shape_rejected_oom", {reason["code"] for reason in decision["reasons"]})
+
+    def test_logical_shard_plan_emits_deterministic_ranges(self) -> None:
+        plan = logical_shard_plan(25, 10)
+        self.assertEqual(plan["schema"], "sweetspot.logical_shard_plan.v1")
+        self.assertEqual(plan["task_count"], 3)
+        self.assertEqual(
+            plan["ranges"],
+            [
+                {"shard_index": 0, "unit_start": 0, "unit_count": 10},
+                {"shard_index": 1, "unit_start": 10, "unit_count": 10},
+                {"shard_index": 2, "unit_start": 20, "unit_count": 5},
+            ],
+        )
+
+    def test_logical_shard_plan_can_omit_large_range_lists(self) -> None:
+        plan = logical_shard_plan(25, 10, max_inline_ranges=2)
+        self.assertEqual(plan["task_count"], 3)
+        self.assertEqual(plan["ranges_omitted"], 3)
+        self.assertNotIn("ranges", plan)
+
+    def test_logical_shard_plan_allows_empty_manifest(self) -> None:
+        plan = logical_shard_plan(0, 10)
+        self.assertEqual(plan["logical_unit_count"], 0)
+        self.assertEqual(plan["task_count"], 0)
+        self.assertEqual(plan["ranges"], [])
 
     def test_canary_observation_from_worker_summary(self) -> None:
         observation = canary_observation_from_summary(
