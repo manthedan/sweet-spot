@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -412,6 +413,208 @@ class StatusTests(unittest.TestCase):
         self.assertIn("source\t5\t2\t0\tsource", table)
         self.assertIn("active_count\t1\nstatus\tcount\nRUNNING\t1", table)
         self.assertNotIn("\nstatus\nstatus\tcount", table)
+
+    def test_status_run_id_summarizes_local_artifacts_without_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "run_state.json").write_text(json.dumps({"schema": "sweetspot.run.v1", "run_id": "run-1", "status": "submitted"}) + "\n")
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t1"}) + "\n")
+            finalizer_dir = artifact_dir / "finalizer"
+            finalizer_dir.mkdir()
+            (finalizer_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t0", "state": "done"}) + "\n" + json.dumps({"task_id": "t1", "state": "incomplete"}) + "\n")
+            (finalizer_dir / "repair_tasks.jsonl").write_text(json.dumps({"task_id": "t1"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["run_id"], "run-1")
+        self.assertEqual(report["run"]["status"], "repair_needed")
+        self.assertEqual(report["run"]["production_task_count"], 2)
+        self.assertEqual(report["run"]["task_status"]["total"], 2)
+        self.assertEqual(report["run"]["task_status"]["by_status"], {"done": 1, "incomplete": 1})
+        self.assertEqual(report["run"]["repair_task_count"], 1)
+        self.assertIsNone(report["identity"])
+
+    def test_status_run_id_ignores_queue_url_env_for_local_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "run_state.json").write_text(json.dumps({"schema": "sweetspot.run.v1", "run_id": "run-1"}) + "\n")
+            out = io.StringIO()
+            with (
+                patch.dict(os.environ, {"SWEETSPOT_SQS_QUEUE_URL": "env-queue"}),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["queues"], {})
+        self.assertIsNone(report["identity"])
+
+    def test_status_run_id_defaults_batch_prefix_to_run_id(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123", "Arn": "arn", "UserId": "u"}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                if kwargs["jobStatus"] == "RUNNING":
+                    return [{"jobSummaryList": [{"jobId": "j1", "jobName": "run-1-worker", "status": "RUNNING"}]}]
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeSession:
+            region_name = "us-west-2"
+
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "batch":
+                    return FakeBatch()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(Path(tmp) / "missing"), "--job-queue", "jq"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["batch"]["job_name_prefix"], "run-1-")
+        self.assertEqual(report["batch"]["active_count"], 1)
+
+    def test_status_artifact_only_uses_inferred_run_id_for_batch_prefix(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123", "Arn": "arn", "UserId": "u"}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                if kwargs["jobStatus"] == "RUNNING":
+                    return [{"jobSummaryList": [{"jobId": "j1", "jobName": "run-1-worker", "status": "RUNNING"}]}]
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeSession:
+            region_name = "us-west-2"
+
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "batch":
+                    return FakeBatch()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "run_state.json").write_text(json.dumps({"schema": "sweetspot.run.v1", "run_id": "run-1"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "--artifact-dir", str(artifact_dir), "--job-queue", "jq"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["batch"]["job_name_prefix"], "run-1-")
+        self.assertEqual(report["batch"]["active_count"], 1)
+
+    def test_status_treats_mixed_success_names_as_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t0", "state": "done"}) + "\n" + json.dumps({"task_id": "t1", "status": "completed"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["status"], "complete")
+
+    def test_status_marks_empty_status_for_expected_tasks_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n")
+            (artifact_dir / "task_status.jsonl").write_text("")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["status"], "incomplete")
+        self.assertEqual(report["run"]["missing_task_status_count"], 1)
+
+    def test_status_does_not_mark_partial_status_coverage_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t1"}) + "\n")
+            (artifact_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t0", "state": "done"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["status"], "incomplete")
+        self.assertEqual(report["run"]["missing_task_status_count"], 1)
+
+    def test_status_does_not_mark_duplicate_status_rows_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t1"}) + "\n")
+            (artifact_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t0", "state": "done"}) + "\n" + json.dumps({"task_id": "t0", "state": "done"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["status"], "invalid_artifacts")
+        self.assertEqual(report["run"]["missing_task_status_count"], 1)
+        self.assertEqual(report["run"]["task_status"]["duplicate_task_status_count"], 1)
+
+    def test_status_does_not_mark_duplicate_production_tasks_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t0"}) + "\n")
+            (artifact_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t0", "state": "done"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["status"], "invalid_artifacts")
+        self.assertEqual(report["run"]["duplicate_production_task_count"], 1)
+
+    def test_status_does_not_mark_unknown_status_tasks_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n")
+            (artifact_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t0", "state": "done"}) + "\n" + json.dumps({"task_id": "extra", "state": "done"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir)]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["run"]["status"], "invalid_artifacts")
+        self.assertEqual(report["run"]["task_status"]["unknown_task_status_count"], 1)
+
+    def test_status_run_id_rejects_non_scoped_job_prefix(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "must start with RUN_ID"):
+            main(["status", "run-1", "--job-name-prefix", "other"])
+
+    def test_status_run_id_rejects_prefix_collision(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "must start with RUN_ID"):
+            main(["status", "run-1", "--job-name-prefix", "run-10-"])
+
+    def test_status_run_id_rejects_bare_run_id_prefix(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "must start with RUN_ID"):
+            main(["status", "run-1", "--job-name-prefix", "run-1"])
 
 
 class HelpExamplesTests(unittest.TestCase):

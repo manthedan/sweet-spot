@@ -393,15 +393,41 @@ def cmd_lane_manager(args: argparse.Namespace) -> int:
 
 def _print_status_table(report: dict[str, Any]) -> None:
     identity = report.get("identity") or {}
+    run = report.get("run") or {}
     _print_key_values(
         "SweetSpot status",
         {
             "checked_at": report.get("checked_at"),
+            "run_id": run.get("run_id"),
+            "run_status": run.get("status"),
             "region": report.get("region"),
             "account": identity.get("account"),
             "arn": identity.get("arn"),
         },
     )
+    if run:
+        print()
+        artifacts = run.get("artifacts") or {}
+        task_status = run.get("task_status") or {}
+        _print_key_values(
+            "run",
+            {
+                "artifact_dir": run.get("artifact_dir"),
+                "run_state_json": artifacts.get("run_state_json"),
+                "production_tasks": artifacts.get("production_tasks_jsonl"),
+                "production_task_count": run.get("production_task_count"),
+                "task_status_jsonl": artifacts.get("task_status_jsonl"),
+                "task_status_count": task_status.get("total"),
+                "missing_task_status_count": run.get("missing_task_status_count"),
+                "repair_tasks_jsonl": artifacts.get("repair_tasks_jsonl"),
+                "repair_task_count": run.get("repair_task_count"),
+            },
+        )
+        by_status = task_status.get("by_status") or {}
+        if by_status:
+            print("status\tcount")
+            for status, count in by_status.items():
+                print(f"{_format_table_value(status)}\t{_format_table_value(count)}")
     queues = report.get("queues") or {}
     if queues:
         print()
@@ -436,25 +462,198 @@ def _print_status_table(report: dict[str, Any]) -> None:
                 print(f"{_format_table_value(status)}\t{_format_table_value(count)}")
 
 
+def _first_existing_path(paths: Iterable[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def _jsonl_task_id_set(path: Path) -> tuple[int, set[str], int]:
+    row_count = 0
+    task_ids: set[str] = set()
+    duplicate_count = 0
+    for obj in _iter_jsonl(path):
+        row_count += 1
+        task_id = obj.get("task_id")
+        if task_id is None:
+            continue
+        task_id_s = str(task_id)
+        if task_id_s in task_ids:
+            duplicate_count += 1
+        task_ids.add(task_id_s)
+    return row_count, task_ids, duplicate_count
+
+
+def _jsonl_status_counts(path: Path, *, expected_run_id: str | None = None, expected_task_ids: set[str] | None = None) -> dict[str, Any]:
+    counts: Counter[str] = Counter()
+    total = 0
+    wrong_run_examples: list[str] = []
+    status_task_ids: set[str] = set()
+    duplicate_task_status_count = 0
+    unknown_task_status_count = 0
+    for obj in _iter_jsonl(path):
+        total += 1
+        if expected_run_id and obj.get("run_id") is not None and obj.get("run_id") != expected_run_id and len(wrong_run_examples) < 10:
+            wrong_run_examples.append(str(obj.get("task_id") or f"line-{total}"))
+        task_id = obj.get("task_id")
+        if task_id is not None:
+            task_id_s = str(task_id)
+            if task_id_s in status_task_ids:
+                duplicate_task_status_count += 1
+            status_task_ids.add(task_id_s)
+            if expected_task_ids is not None and task_id_s not in expected_task_ids:
+                unknown_task_status_count += 1
+        status = str(obj.get("status") or obj.get("state") or "<missing>")
+        counts[status] += 1
+    if wrong_run_examples:
+        raise SystemExit(f"status RUN_ID found task_status records for another run; mismatched task_ids: {wrong_run_examples}")
+    missing_task_status_count = None if expected_task_ids is None else len(expected_task_ids - status_task_ids)
+    return {
+        "total": total,
+        "unique_task_count": len(status_task_ids),
+        "duplicate_task_status_count": duplicate_task_status_count,
+        "unknown_task_status_count": unknown_task_status_count,
+        "missing_task_status_count": missing_task_status_count,
+        "by_status": dict(counts.most_common()),
+    }
+
+
+def _is_run_scoped_job_prefix(run_id: str, job_name_prefix: str) -> bool:
+    return job_name_prefix.startswith(f"{run_id}-")
+
+
+def _run_status_report(run_id: str | None, artifact_dir: Path | None) -> dict[str, Any] | None:
+    if not run_id and artifact_dir is None:
+        return None
+    effective_artifact_dir = artifact_dir or Path("artifacts") / str(run_id)
+    run_state_path = effective_artifact_dir / "run_state.json"
+    state: dict[str, Any] = {}
+    if run_state_path.exists():
+        loaded = json.loads(run_state_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"run state at {run_state_path} is not a JSON object")
+        state = loaded
+    effective_run_id = run_id or str(state.get("run_id") or "")
+    if run_id and state.get("run_id") not in (None, run_id):
+        raise SystemExit(f"status RUN_ID expected run_state run_id={run_id!r}, found {state.get('run_id')!r}")
+    raw_state_artifacts = state.get("artifacts")
+    state_artifacts: dict[str, Any] = raw_state_artifacts if isinstance(raw_state_artifacts, dict) else {}
+
+    def artifact_path(key: str, candidates: list[Path]) -> Path | None:
+        raw = state_artifacts.get(key)
+        if isinstance(raw, str):
+            path = Path(raw)
+            if path.exists():
+                return path
+        return _first_existing_path(candidates)
+
+    production_tasks_path = artifact_path("production_tasks_jsonl", [effective_artifact_dir / "production_tasks.jsonl"])
+    task_status_path = artifact_path(
+        "task_status_jsonl",
+        [
+            effective_artifact_dir / "task_status.jsonl",
+            effective_artifact_dir / "finalizer" / "task_status.jsonl",
+        ],
+    )
+    repair_tasks_path = artifact_path(
+        "repair_tasks_jsonl",
+        [
+            effective_artifact_dir / "repair_tasks.jsonl",
+            effective_artifact_dir / "finalizer" / "repair_tasks.jsonl",
+            effective_artifact_dir / "repair" / "repair_tasks.jsonl",
+        ],
+    )
+    artifacts: dict[str, str] = {}
+    if run_state_path.exists():
+        artifacts["run_state_json"] = str(run_state_path)
+    if production_tasks_path is not None:
+        artifacts["production_tasks_jsonl"] = str(production_tasks_path)
+    if task_status_path is not None:
+        artifacts["task_status_jsonl"] = str(task_status_path)
+    if repair_tasks_path is not None:
+        artifacts["repair_tasks_jsonl"] = str(repair_tasks_path)
+
+    production_task_count = None
+    production_task_ids: set[str] | None = None
+    duplicate_production_task_count = None
+    if production_tasks_path is not None:
+        production_task_count, production_task_ids, duplicate_production_task_count = _jsonl_task_id_set(production_tasks_path)
+    task_status = _jsonl_status_counts(task_status_path, expected_run_id=effective_run_id or None, expected_task_ids=production_task_ids) if task_status_path is not None else None
+    repair_task_count = _count_jsonl_objects(repair_tasks_path) if repair_tasks_path is not None else None
+    status = "unknown"
+    missing_task_status_count = None
+    if task_status is not None:
+        by_status = task_status["by_status"]
+        total = task_status["total"]
+        if production_task_count is not None:
+            missing_task_status_count = task_status["missing_task_status_count"]
+        if duplicate_production_task_count or task_status["duplicate_task_status_count"] or task_status["unknown_task_status_count"]:
+            status = "invalid_artifacts"
+        elif missing_task_status_count:
+            status = "incomplete"
+        elif total == 0:
+            status = "empty"
+        elif any(by_status.get(state, 0) for state in ("failed", "incomplete", "invalid_done_marker", "missing", "missing_output", "output_without_done")):
+            status = "repair_needed"
+        elif by_status.get("done", 0) + by_status.get("completed", 0) == total:
+            status = "complete"
+        else:
+            status = "incomplete"
+    elif state.get("status"):
+        status = str(state["status"])
+
+    return {
+        "run_id": effective_run_id or None,
+        "artifact_dir": str(effective_artifact_dir),
+        "status": status,
+        "artifacts": artifacts,
+        "run_state_status": state.get("status"),
+        "production_task_count": production_task_count,
+        "duplicate_production_task_count": duplicate_production_task_count,
+        "task_status": task_status,
+        "missing_task_status_count": missing_task_status_count,
+        "repair_task_count": repair_task_count,
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    session = boto3.Session(profile_name=args.profile, region_name=args.region)
-    sts = session.client("sts", region_name=args.region)
-    identity = sts.get_caller_identity()
+    run_id = getattr(args, "run_id", None)
+    artifact_dir = getattr(args, "artifact_dir", None)
+    run_report = _run_status_report(run_id, artifact_dir)
+    effective_run_id = str(run_report.get("run_id")) if run_report and run_report.get("run_id") else run_id
+    job_name_prefix = getattr(args, "job_name_prefix", None)
+    if effective_run_id and job_name_prefix and not _is_run_scoped_job_prefix(effective_run_id, job_name_prefix):
+        raise SystemExit("status --job-name-prefix must start with RUN_ID-; omit it to use the safe default")
+    effective_job_name_prefix = job_name_prefix or (f"{effective_run_id}-" if effective_run_id else "sweetspot-worker")
+    queue_url = args.queue_url
+    if queue_url is None and run_id is None and artifact_dir is None:
+        queue_url = os.environ.get("SWEETSPOT_SQS_QUEUE_URL", "")
+    needs_aws = bool(queue_url or args.dlq_url or args.job_queue or (run_id is None and artifact_dir is None))
+    session = boto3.Session(profile_name=args.profile, region_name=args.region) if needs_aws else None
+    identity: dict[str, Any] | None = None
+    if session is not None:
+        sts = session.client("sts", region_name=args.region)
+        raw_identity = sts.get_caller_identity()
+        identity = {"account": raw_identity.get("Account"), "arn": raw_identity.get("Arn"), "user_id": raw_identity.get("UserId")}
     queues: dict[str, Any] = {}
-    if args.queue_url:
+    if queue_url:
+        assert session is not None
         sqs = session.client("sqs", region_name=args.region)
-        queues["source"] = {"queue_url": args.queue_url, "depth": queue_depth(sqs, args.queue_url)}
+        queues["source"] = {"queue_url": queue_url, "depth": queue_depth(sqs, queue_url)}
     if args.dlq_url:
+        assert session is not None
         sqs = session.client("sqs", region_name=args.region)
         queues["dlq"] = {"queue_url": args.dlq_url, "depth": queue_depth(sqs, args.dlq_url)}
     batch_status: dict[str, Any] | None = None
     if args.job_queue:
+        assert session is not None
         batch = session.client("batch", region_name=args.region)
-        active = active_jobs(batch, args.job_queue, args.job_name_prefix)
+        active = active_jobs(batch, args.job_queue, effective_job_name_prefix)
         by_status = dict(Counter(str(job.get("status")) for job in active).most_common())
         batch_status = {
             "job_queue": args.job_queue,
-            "job_name_prefix": args.job_name_prefix,
+            "job_name_prefix": effective_job_name_prefix,
             "active_count": len(active),
             "active_by_status": by_status,
             "active_examples": active[:20],
@@ -462,8 +661,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     report = {
         "schema": "sweetspot.status.v1",
         "checked_at": iso_now(),
-        "region": args.region or session.region_name,
-        "identity": {"account": identity.get("Account"), "arn": identity.get("Arn"), "user_id": identity.get("UserId")},
+        "run": run_report,
+        "region": args.region or (session.region_name if session is not None else None),
+        "identity": identity,
         "queues": queues,
         "batch": batch_status,
     }
@@ -2602,7 +2802,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
     "run": {"apply", "artifact_dir", "canary_summary_jsonl", "input_manifest_jsonl", "out_production_tasks_jsonl"},
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
-    "status": {"dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
+    "status": {"artifact_dir", "dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
     "submit-workers": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -2924,15 +3124,17 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "status",
-        help="Show AWS identity, queue depth, DLQ depth, and active Batch worker summary",
-        examples="  sweetspot status --profile prod --region us-west-2 --queue-url https://sqs... --dlq-url https://sqs... --job-queue jq --job-name-prefix run-1\n  sweetspot status --queue-url https://sqs... --format table",
+        help="Show run artifacts, queue depth, DLQ depth, and active Batch worker summary",
+        examples="  sweetspot status example-run --artifact-dir artifacts/example-run\n  sweetspot status example-run --profile prod --region us-west-2 --queue-url https://sqs... --dlq-url https://sqs... --job-queue jq\n  sweetspot status --queue-url https://sqs... --format table",
     )
+    p.add_argument("run_id", nargs="?", help="Optional SweetSpot run id; when set, local artifacts are summarized and Batch job-name prefix defaults to RUN_ID-")
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+    p.add_argument("--queue-url", default=None, help="Source SQS queue URL; for legacy non-run status only, SWEETSPOT_SQS_QUEUE_URL is used when omitted")
     p.add_argument("--dlq-url")
     p.add_argument("--job-queue")
-    p.add_argument("--job-name-prefix", default="sweetspot-worker")
+    p.add_argument("--job-name-prefix", help="Batch job-name prefix to inspect; with RUN_ID it must start with RUN_ID- and defaults to RUN_ID-")
+    p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory; defaults to artifacts/RUN_ID when RUN_ID is provided")
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_status)
 
