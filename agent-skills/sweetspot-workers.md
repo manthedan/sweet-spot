@@ -32,6 +32,17 @@ Invoke this skill when an agent needs to:
 
 ## CLI commands
 
+### Config file support
+
+All worker-submission commands support `--config <path.json>` (or `SWEETSPOT_CONFIG` env var) to pre-populate common flags like `--queue-url`, `--batch-job-queue`, `--job-definition`, `--allowed-s3-prefix`, etc. Explicit CLI flags override config values. Example config:
+
+```json
+{
+  "defaults": {"profile": "prod", "region": "us-west-2"},
+  "submit-workers": {"queue_url": "https://sqs...", "batch_job_queue": "jq", "job_definition": "jd:1"}
+}
+```
+
 ### Submit workers (one-shot)
 
 Dry-run (default) shows sizing without submitting:

@@ -89,7 +89,7 @@ Key arguments:
 - `--include-active`: Unsafe: include missing tasks even if active workers own them
 - `--only-known-failed`: Only repair tasks seen in FAILED job logs
 - `--log-group`: CloudWatch log group for task ID extraction
-- `--log-tail`: Number of log events to scan per job (default 100)
+- `--log-tail`: Maximum CloudWatch log events to scan per job for `task_id` patterns via `filter_log_events` (default 50000); falls back to `get_log_events` when FilterLogEvents is denied
 
 ### Clean up stale SQS messages
 

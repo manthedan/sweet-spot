@@ -12,7 +12,6 @@ Guide for operational diagnostics, DLQ management, and troubleshooting SweetSpot
 Invoke this skill when an agent needs to:
 - Diagnose SweetSpot or AWS infrastructure issues
 - Inspect or redrive DLQ messages
-- Cancel or drain in-flight work
 - Run the doctor preflight check
 - Troubleshoot failed or stalled jobs
 - Inspect logs and job details

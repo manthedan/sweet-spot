@@ -34,7 +34,8 @@ Three console-script entry points:
 
 - `--queue-url` / `--sqs-queue-url`: SQS queue URL (also from `SWEETSPOT_SQS_QUEUE_URL`)
 - `--allowed-s3-prefix`: S3 prefix allow-list, repeatable (also from `SWEETSPOT_ALLOWED_S3_PREFIXES`)
-- `--profile` / `--region`: AWS profile/region (not available on all commands)
+- `--profile` / `--region`: AWS profile/region (available on all AWS-calling commands)
+- `--config <path>`: JSON config file with `defaults` and per-command sections; also from `SWEETSPOT_CONFIG` env var. Explicit CLI flags override config values.
 - `--submit` / `--apply` / `--delete`: Mutation flags (always dry-run by default)
 - `--env KEY=VALUE`: Environment overrides for workers, repeatable
 - `--visibility-timeout`: SQS visibility timeout (default 1800s)
