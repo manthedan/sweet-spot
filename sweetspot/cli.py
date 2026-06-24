@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 import re
@@ -214,6 +215,15 @@ def _auto_canary_indices(tasks: list[dict[str, Any]], task_count: int) -> list[i
         if len(selected) >= task_count:
             break
     return selected
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    try:
+        version = importlib_metadata.version("sweetspot")
+    except importlib_metadata.PackageNotFoundError:
+        version = "0+unknown"
+    print(json.dumps({"schema": "sweetspot.version.v1", "package": "sweetspot", "version": version}, indent=2, sort_keys=True))
+    return 0
 
 
 def cmd_enqueue_jsonl(args: argparse.Namespace) -> int:
@@ -1969,6 +1979,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="sweetspot")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("version", help="Print the installed SweetSpot package version")
+    p.set_defaults(func=cmd_version)
 
     p = sub.add_parser("worker", help="Run an SQS worker inside AWS Batch")
     p.add_argument("--profile")

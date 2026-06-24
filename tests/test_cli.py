@@ -59,9 +59,21 @@ from sweetspot.cli import (
     cmd_repair_plan,
     cmd_s3_delete_prefix,
     cmd_supervise_workers,
+    cmd_version,
 )
 from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_reports_installed_package(self) -> None:
+        out = io.StringIO()
+        with patch("sweetspot.cli.importlib_metadata.version", return_value="1.2.3"), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_version(types.SimpleNamespace()), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.version.v1")
+        self.assertEqual(report["package"], "sweetspot")
+        self.assertEqual(report["version"], "1.2.3")
 
 
 class CanaryTests(unittest.TestCase):

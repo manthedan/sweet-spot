@@ -14,6 +14,7 @@ All notable changes to this project are documented here. This project uses human
 - `cleanup-stale-messages` command for dry-run/apply deletion of visible duplicate SQS messages whose done markers already exist.
 - README guidance for small idempotent chunks, canary sizing, safe repair planning, and stale-message cleanup.
 - Consistent `--profile`/`--region` options for AWS-touching CLI commands.
+- `sweetspot version` command for checking the installed package version.
 
 ### Fixed
 
