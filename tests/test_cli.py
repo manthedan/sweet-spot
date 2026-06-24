@@ -327,6 +327,28 @@ class EnqueueValidationTests(unittest.TestCase):
         self.assertEqual([(s.profile_name, s.region_name) for s in sessions], [("prof", "us-west-2")])
         self.assertEqual(client_calls, [("sqs", "us-west-2")])
 
+    def test_enqueue_reports_sqs_batch_failure_without_traceback(self) -> None:
+        class FailingSQS:
+            def send_message_batch(self, **kwargs):
+                return {"Failed": [{"Id": "0", "Code": "AccessDenied"}]}
+
+        task = {"schema": "sweetspot.task.v1", "run_id": "r1", "task_id": "t0", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://bucket/runs/r1/done/t0.done.json"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            tasks_path.write_text(json.dumps(task) + "\n")
+            args = types.SimpleNamespace(
+                profile=None,
+                region=None,
+                queue_url="q",
+                tasks_jsonl=tasks_path,
+                run_id=None,
+                artifact_dir=Path(tmp) / "artifacts",
+                allowed_s3_prefix=["s3://bucket/runs/r1"],
+                submit=True,
+            )
+            with patch("sweetspot.cli.boto3.client", return_value=FailingSQS()), self.assertRaisesRegex(SystemExit, "send_message_batch failed"):
+                cmd_enqueue_jsonl(args)
+
     def test_worker_overrides_pass_allowed_s3_prefixes(self) -> None:
         overrides = _worker_overrides(
             sqs_queue_url="https://sqs.example/q",
@@ -989,7 +1011,7 @@ class S3DeletePrefixTests(unittest.TestCase):
                 artifact_dir=Path(tmp),
                 completion_marker_s3="s3://bucket/markers/done.json",
             )
-            with patch("sweetspot.cli.boto3.Session", return_value=Session(s3)), self.assertRaisesRegex(RuntimeError, "DeleteObjects"):
+            with patch("sweetspot.cli.boto3.Session", return_value=Session(s3)), self.assertRaisesRegex(SystemExit, "DeleteObjects"):
                 cmd_s3_delete_prefix(args)
         self.assertFalse(s3.marker_written)
 

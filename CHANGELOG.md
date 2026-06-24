@@ -20,6 +20,7 @@ All notable changes to this project are documented here. This project uses human
 
 ### Fixed
 
+- Operator-facing CLI failures for SQS batch sends, S3 bulk deletes, DLQ queue ARN lookup, and doctor validation now report clean errors instead of uncaught `RuntimeError` tracebacks.
 - `scripts/verify_release.sh` now works on systems that provide `python3` but not `python`, and reports missing release-check dependencies with install guidance.
 
 ## sweetspot-v0.1.0 - 2026-06-23

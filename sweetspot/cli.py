@@ -110,7 +110,7 @@ def _send_tasks_to_sqs(sqs, *, queue_url: str, tasks: list[dict[str, Any]]) -> i
         entries = [{"Id": str(i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(batch)]
         resp = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
         if resp.get("Failed"):
-            raise RuntimeError(f"send_message_batch failed: {resp['Failed']}")
+            raise SystemExit(f"send_message_batch failed: {resp['Failed']}")
         sent += len(resp.get("Successful", []))
     return sent
 
@@ -1660,7 +1660,7 @@ def cmd_s3_delete_prefix(args: argparse.Namespace) -> int:
             resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
             errors = resp.get("Errors") or []
             if errors:
-                raise RuntimeError(f"S3 DeleteObjects reported {len(errors)} errors; first={errors[0]!r}")
+                raise SystemExit(f"S3 DeleteObjects reported {len(errors)} errors; first={errors[0]!r}")
             deleted += len(batch)
         batch = []
 
@@ -1750,7 +1750,7 @@ def _queue_arn(sqs, queue_url: str) -> str:
     attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"]).get("Attributes", {})
     arn = attrs.get("QueueArn")
     if not arn:
-        raise RuntimeError(f"queue has no QueueArn attribute: {queue_url}")
+        raise SystemExit(f"queue has no QueueArn attribute: {queue_url}")
     return str(arn)
 
 
@@ -1890,10 +1890,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             batch = session.client("batch", region_name=args.region)
             queues = batch.describe_job_queues(jobQueues=[args.job_queue]).get("jobQueues", [])
             if not queues:
-                raise RuntimeError(f"job queue not found: {args.job_queue}")
+                raise ValueError(f"job queue not found: {args.job_queue}")
             queue = queues[0]
             if queue.get("state") != "ENABLED" or queue.get("status") not in {"VALID", None}:
-                raise RuntimeError(f"job queue not ready: state={queue.get('state')} status={queue.get('status')}")
+                raise ValueError(f"job queue not ready: state={queue.get('state')} status={queue.get('status')}")
             return {"jobQueueName": queue.get("jobQueueName"), "state": queue.get("state"), "status": queue.get("status"), "computeEnvironmentOrder": queue.get("computeEnvironmentOrder")}
 
         checks.append(_doctor_check("batch_job_queue", check_job_queue))
@@ -1905,7 +1905,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             batch = session.client("batch", region_name=args.region)
             defs = batch.describe_job_definitions(jobDefinitions=[args.job_definition], status="ACTIVE").get("jobDefinitions", [])
             if not defs:
-                raise RuntimeError(f"active job definition not found: {args.job_definition}")
+                raise ValueError(f"active job definition not found: {args.job_definition}")
             job_def = defs[0]
             container = job_def.get("containerProperties") or {}
             log_group = _job_definition_log_group(job_def)
@@ -1955,7 +1955,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 ).get("Metrics", [])
                 found[metric_name] = len(metrics)
             if not any(found.values()):
-                raise RuntimeError(f"no AWS/Batch metrics found for JobQueue={job_queue_name}; validate dimensions after jobs have emitted data or use worker logs/EventBridge alarms")
+                raise ValueError(f"no AWS/Batch metrics found for JobQueue={job_queue_name}; validate dimensions after jobs have emitted data or use worker logs/EventBridge alarms")
             return {"job_queue": job_queue_name, "metrics_found": found}
 
         checks.append(_doctor_check("batch_metrics", check_batch_metrics))
@@ -1967,7 +1967,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             groups = logs.describe_log_groups(logGroupNamePrefix=discovered_log_group).get("logGroups", [])
             match = next((g for g in groups if g.get("logGroupName") == discovered_log_group), None)
             if not match:
-                raise RuntimeError(f"log group not found: {discovered_log_group}")
+                raise ValueError(f"log group not found: {discovered_log_group}")
             return {"log_group": discovered_log_group, "retentionInDays": match.get("retentionInDays"), "storedBytes": match.get("storedBytes")}
 
         checks.append(_doctor_check("cloudwatch_log_group", check_logs))
