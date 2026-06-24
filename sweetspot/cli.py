@@ -544,6 +544,10 @@ def _worker_overrides(
         {"name": "SWEETSPOT_HEARTBEAT_SECONDS", "value": str(heartbeat_seconds)},
         {"name": "SWEETSPOT_TASK_TIMEOUT_SECONDS", "value": str(task_timeout_seconds)},
     ]
+    if vcpus is not None:
+        base_env.append({"name": "SWEETSPOT_WORKER_VCPUS", "value": str(vcpus)})
+    if memory is not None:
+        base_env.append({"name": "SWEETSPOT_WORKER_MEMORY_MIB", "value": str(memory)})
     normalized_prefixes = parse_allowed_s3_prefixes(allowed_s3_prefixes)
     if normalized_prefixes:
         base_env.append({"name": "SWEETSPOT_ALLOWED_S3_PREFIXES", "value": ",".join(normalized_prefixes)})

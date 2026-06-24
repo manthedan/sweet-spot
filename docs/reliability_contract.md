@@ -53,8 +53,8 @@ Why done markers are the source of truth:
 
 Cost telemetry and optimization:
 
-- Commands may write a JSON object to `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, `output_bytes`, or `bytes_transferred`.
-- Task summaries include best-effort runtime metadata plus startup delay, retry/receive count, interruption/failure status, transferred bytes, useful throughput, and discarded compute seconds.
+- Commands may write a JSON object to `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, `output_bytes`, `bytes_transferred`, or peak-memory fields such as `peak_memory_mib` / `ru_maxrss_kib`.
+- Task summaries include best-effort runtime metadata plus requested worker vCPU/memory, startup delay, retry/receive count, interruption/failure status, transferred bytes, useful throughput, peak memory when reported, and discarded compute seconds.
 - `sweetspot-scout` consumes summary telemetry and ranks pools by expected total cost, including compute, replay, startup overhead, transfer, NAT/endpoints, CloudWatch logs, and S3 storage/request assumptions.
 - `sweetspot-lane-manager` allocates cost-annotated lanes cheapest-first among placement-score-eligible lanes. If `min_placement_score` is set and AWS cannot return a score, the lane fails closed unless that lane explicitly sets `allow_unknown_placement_score`.
 

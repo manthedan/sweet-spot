@@ -652,6 +652,24 @@ class EnqueueValidationTests(unittest.TestCase):
         env = {row["name"]: row["value"] for row in overrides["environment"]}
         self.assertEqual(env["SWEETSPOT_ALLOWED_S3_PREFIXES"], "s3://bucket/runs/r1,s3://bucket/runs/r2")
 
+    def test_worker_overrides_pass_resource_shape_telemetry_env(self) -> None:
+        overrides = _worker_overrides(
+            sqs_queue_url="https://sqs.example/q",
+            messages_per_worker=1,
+            visibility_timeout=1800,
+            heartbeat_seconds=300,
+            task_timeout_seconds=3600,
+            env=[],
+            allowed_s3_prefixes=[],
+            vcpus=4,
+            memory=8192,
+        )
+        env = {row["name"]: row["value"] for row in overrides["environment"]}
+        self.assertEqual(env["SWEETSPOT_WORKER_VCPUS"], "4")
+        self.assertEqual(env["SWEETSPOT_WORKER_MEMORY_MIB"], "8192")
+        self.assertEqual(overrides["vcpus"], 4)
+        self.assertEqual(overrides["memory"], 8192)
+
     def test_worker_overrides_pass_observability_controls(self) -> None:
         overrides = _worker_overrides(
             sqs_queue_url="https://sqs.example/q",

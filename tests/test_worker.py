@@ -26,10 +26,46 @@ if "botocore.exceptions" not in sys.modules:
     exceptions.ClientError = ClientError
     sys.modules["botocore.exceptions"] = exceptions
 
-from sweetspot.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, run_task, task_hash, validate_done_marker, validate_worker_timing
+from sweetspot.worker import SAFE_TASK_TIMEOUT_SECONDS, _heartbeat, _task_telemetry, _worker_resource_request, _worker_runtime_metadata, run_task, task_hash, validate_done_marker, validate_worker_timing
 
 
 class RunTaskTests(unittest.TestCase):
+    def test_worker_runtime_metadata_records_resource_shape_from_env(self) -> None:
+        meta = _worker_runtime_metadata(
+            {
+                "SWEETSPOT_WORKER_VCPUS": "4",
+                "SWEETSPOT_WORKER_MEMORY_MIB": "8192",
+                "SWEETSPOT_ARCHITECTURE": "x86_64",
+            }
+        )
+        self.assertEqual(meta["worker_vcpus"], 4.0)
+        self.assertEqual(meta["worker_memory_mib"], 8192.0)
+        self.assertEqual(meta["architecture"], "x86_64")
+
+    def test_worker_resource_request_converts_ecs_cpu_units(self) -> None:
+        request = _worker_resource_request({}, {"Limits": {"CPU": 4096, "Memory": 8192}})
+        self.assertEqual(request["worker_vcpus"], 4.0)
+        self.assertEqual(request["worker_memory_mib"], 8192.0)
+
+    def test_task_telemetry_records_peak_memory_when_metrics_report_it(self) -> None:
+        telemetry = _task_telemetry(
+            env={"SWEETSPOT_WORKER_VCPUS": "2", "SWEETSPOT_WORKER_MEMORY_MIB": "4096"},
+            metrics={"completed_units": 10, "useful_compute_seconds": 5, "ru_maxrss_kib": 262144},
+            metrics_error=None,
+            worker_context={},
+            command_started_at=time.time(),
+            elapsed=5.0,
+            timed_out=False,
+            returncode=0,
+            framework_error=None,
+            output_record=None,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        self.assertEqual(telemetry["worker_vcpus"], 2.0)
+        self.assertEqual(telemetry["worker_memory_mib"], 4096.0)
+        self.assertEqual(telemetry["peak_memory_mib"], 256.0)
+
     def test_existing_done_marker_wins_before_timeout_or_command_validation(self) -> None:
         task = {
             "schema": "sweetspot.task.v1",

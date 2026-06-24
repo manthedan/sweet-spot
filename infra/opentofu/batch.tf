@@ -102,6 +102,8 @@ resource "aws_batch_job_definition" "worker" {
     environment = [
       { name = "SWEETSPOT_SQS_QUEUE_URL", value = aws_sqs_queue.work.url },
       { name = "SWEETSPOT_MAX_MESSAGES", value = "1" },
+      { name = "SWEETSPOT_WORKER_VCPUS", value = tostring(var.worker_vcpus) },
+      { name = "SWEETSPOT_WORKER_MEMORY_MIB", value = tostring(var.worker_memory_mib) },
       { name = "SWEETSPOT_ALLOWED_S3_PREFIXES", value = join(",", local.worker_allowed_s3_prefixes_effective) }
     ]
     logConfiguration = {

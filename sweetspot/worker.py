@@ -71,6 +71,50 @@ def _region_from_az(az: str | None) -> str | None:
     return az[:-1] if len(az) > 1 and az[-1].isalpha() else None
 
 
+def _first_parseable_float(*values: Any) -> float | None:
+    for value in values:
+        parsed = _parse_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _metadata_cpu_limit_vcpus(value: Any) -> float | None:
+    parsed = _parse_float(value)
+    if parsed is None:
+        return None
+    # ECS metadata may expose CPU as task-definition CPU units (1024 units =
+    # 1 vCPU) rather than a vCPU count. Values above the largest practical
+    # single-container vCPU request are treated as CPU units.
+    return parsed / 1024 if parsed > 64 else parsed
+
+
+def _worker_resource_request(env: dict[str, str], container_meta: dict[str, Any]) -> dict[str, Any]:
+    limits = container_meta.get("Limits")
+    limits = limits if isinstance(limits, dict) else {}
+    vcpus = _first_parseable_float(env.get("SWEETSPOT_WORKER_VCPUS"), env.get("SWEETSPOT_VCPUS"))
+    if vcpus is None:
+        vcpus = _metadata_cpu_limit_vcpus(limits.get("CPU"))
+    memory_mib = _first_parseable_float(env.get("SWEETSPOT_WORKER_MEMORY_MIB"), env.get("SWEETSPOT_MEMORY_MIB"), limits.get("Memory"))
+    return {
+        "worker_vcpus": vcpus,
+        "worker_memory_mib": memory_mib,
+    }
+
+
+def _peak_memory_mib(metrics: dict[str, Any]) -> float | None:
+    direct = _first_parseable_float(metrics.get("peak_memory_mib"), metrics.get("max_memory_mib"), metrics.get("peak_rss_mib"), metrics.get("max_rss_mib"))
+    if direct is not None:
+        return direct
+    bytes_value = _first_parseable_float(metrics.get("peak_memory_bytes"), metrics.get("max_memory_bytes"), metrics.get("peak_rss_bytes"), metrics.get("max_rss_bytes"))
+    if bytes_value is not None:
+        return bytes_value / (1024 * 1024)
+    kib_value = _first_parseable_float(metrics.get("peak_memory_kib"), metrics.get("max_memory_kib"), metrics.get("peak_rss_kib"), metrics.get("max_rss_kib"), metrics.get("ru_maxrss_kib"))
+    if kib_value is not None:
+        return kib_value / 1024
+    return None
+
+
 def _worker_runtime_metadata(env: dict[str, str]) -> dict[str, Any]:
     metadata_uri = env.get("ECS_CONTAINER_METADATA_URI_V4") or env.get("ECS_CONTAINER_METADATA_URI") or ""
     container_meta = _http_json(metadata_uri) if metadata_uri else {}
@@ -89,6 +133,7 @@ def _worker_runtime_metadata(env: dict[str, str]) -> dict[str, Any]:
         "aws_batch_job_id": env.get("AWS_BATCH_JOB_ID"),
         "aws_batch_job_attempt": _parse_int(env.get("AWS_BATCH_JOB_ATTEMPT")),
         "ecs_task_arn": str(task_meta.get("TaskARN") or "") or None,
+        **_worker_resource_request(env, container_meta),
     }
 
 
@@ -138,6 +183,7 @@ def _task_telemetry(
     bytes_transferred = _parse_float(metrics.get("bytes_transferred"))
     if bytes_transferred is None:
         bytes_transferred = input_bytes + (output_bytes or 0.0) + stdout_bytes + stderr_bytes
+    peak_memory_mib = _peak_memory_mib(metrics)
     discarded_compute_sec = 0.0 if success else elapsed
     units_per_s = (completed_units / useful_compute_sec) if completed_units and useful_compute_sec and useful_compute_sec > 0 else None
     interruption_status = "timeout" if timed_out else ("failed" if returncode not in (0, None) or framework_error else "none")
@@ -151,6 +197,7 @@ def _task_telemetry(
         "output_bytes": output_bytes,
         "log_bytes": stdout_bytes + stderr_bytes,
         "bytes_transferred": bytes_transferred,
+        "peak_memory_mib": peak_memory_mib,
         "retry": bool(receive_count and receive_count > 1),
         "receive_count": receive_count,
         "interruption_status": interruption_status,
