@@ -47,6 +47,7 @@ from sweetspot.cli import (
     _supervisor_desired_workers,
     _validate_s3_delete_prefix,
     _worker_overrides,
+    cmd_cancel,
     cmd_cancel_jobs,
     cmd_cleanup_stale_messages,
     cmd_derive_canary,
@@ -1291,6 +1292,77 @@ class CancelJobsTests(unittest.TestCase):
         self.assertEqual(report["terminated_count"], 1)
         self.assertEqual(batch.cancelled, [{"jobId": "pending-1", "reason": "test reason"}])
         self.assertEqual(batch.terminated, [{"jobId": "running-1", "reason": "test reason"}])
+
+    def test_cancel_dry_run_matches_run_scoped_job_prefix(self) -> None:
+        batch = FakeCancelBatch()
+        args = types.SimpleNamespace(
+            run_id="run",
+            profile=None,
+            region=None,
+            job_queue=["jq"],
+            status=["PENDING", "RUNNING"],
+            job_name_prefix=None,
+            max_jobs=10,
+            apply=False,
+            terminate_running=False,
+            reason=None,
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeCancelSession(batch)), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_cancel(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.cancel.v1")
+        self.assertEqual(report["run_id"], "run")
+        self.assertEqual(report["job_name_regex"], "^run(?:-|$)")
+        self.assertEqual(report["matched_count"], 2)
+        self.assertEqual(report["actionable_count"], 1)
+        self.assertFalse(report["apply"])
+        self.assertEqual(batch.cancelled, [])
+        self.assertEqual(batch.terminated, [])
+
+    def test_cancel_apply_can_terminate_run_scoped_workers(self) -> None:
+        batch = FakeCancelBatch()
+        batch.jobs_by_status = {
+            "PENDING": [{"jobId": "pending-1", "jobName": "run-workers-20260624-0000"}],
+            "RUNNING": [{"jobId": "running-1", "jobName": "run-workers-20260624-0001"}],
+        }
+        args = types.SimpleNamespace(
+            run_id="run",
+            profile=None,
+            region=None,
+            job_queue=["jq"],
+            status=None,
+            job_name_prefix="run-workers",
+            max_jobs=10,
+            apply=True,
+            terminate_running=True,
+            reason="stop run",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeCancelSession(batch)), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_cancel(args), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["job_name_regex"], "^run\\-workers(?:-|$)")
+        self.assertEqual(report["cancelled_count"], 1)
+        self.assertEqual(report["terminated_count"], 1)
+        self.assertEqual(batch.cancelled, [{"jobId": "pending-1", "reason": "stop run"}])
+        self.assertEqual(batch.terminated, [{"jobId": "running-1", "reason": "stop run"}])
+
+    def test_cancel_rejects_prefix_that_does_not_include_run_id(self) -> None:
+        args = types.SimpleNamespace(
+            run_id="run-1",
+            profile=None,
+            region=None,
+            job_queue=["jq"],
+            status=None,
+            job_name_prefix="sweetspot-worker",
+            max_jobs=10,
+            apply=False,
+            terminate_running=False,
+            reason=None,
+        )
+        with self.assertRaisesRegex(SystemExit, "must include RUN_ID"):
+            cmd_cancel(args)
 
     def test_cancel_jobs_requires_name_regex_guardrail(self) -> None:
         args = types.SimpleNamespace(job_name_regex="", max_jobs=10)

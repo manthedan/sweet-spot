@@ -1570,7 +1570,7 @@ _CANCEL_JOB_STATUSES = {"SUBMITTED", "PENDING", "RUNNABLE"}
 _TERMINATE_JOB_STATUSES = {"STARTING", "RUNNING"}
 
 
-def cmd_cancel_jobs(args: argparse.Namespace) -> int:
+def _cancel_jobs_report(args: argparse.Namespace) -> dict[str, Any]:
     if not args.job_name_regex:
         raise SystemExit("cancel-jobs requires --job-name-regex to avoid broad cancellation")
     if args.max_jobs <= 0:
@@ -1614,7 +1614,7 @@ def cmd_cancel_jobs(args: argparse.Namespace) -> int:
         )
     if not args.apply:
         skipped = sum(1 for row in rows if row["action"] == "skip")
-    report = {
+    return {
         "schema": "sweetspot.cancel_jobs.v1",
         "checked_at": iso_now(),
         "apply": bool(args.apply),
@@ -1631,7 +1631,10 @@ def cmd_cancel_jobs(args: argparse.Namespace) -> int:
         "reason": args.reason,
         "jobs": rows,
     }
-    if getattr(args, "format", "json") == "table":
+
+
+def _print_cancel_jobs_report(report: dict[str, Any], *, output_format: str) -> None:
+    if output_format == "table":
         _print_key_values(
             "SweetSpot cancel-jobs",
             {
@@ -1646,11 +1649,55 @@ def cmd_cancel_jobs(args: argparse.Namespace) -> int:
                 "job_name_regex": report["job_name_regex"],
             },
         )
+        rows = report.get("jobs") or []
         if rows:
             print()
             _print_table("jobs", ["jobId", "jobName", "jobQueue", "status", "action", "skip_reason"], rows)
     else:
         print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def cmd_cancel_jobs(args: argparse.Namespace) -> int:
+    _print_cancel_jobs_report(_cancel_jobs_report(args), output_format=getattr(args, "format", "json"))
+    return 0
+
+
+def _run_scoped_job_name_regex(run_id: str, job_name_prefix: str | None) -> str:
+    prefix = job_name_prefix or run_id
+    if run_id not in prefix:
+        raise SystemExit("cancel --job-name-prefix must include RUN_ID; use cancel-jobs for advanced broad matching")
+    return rf"^{re.escape(prefix)}(?:-|$)"
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    cancel_args = argparse.Namespace(
+        apply=args.apply,
+        format="json",
+        job_name_regex=_run_scoped_job_name_regex(args.run_id, args.job_name_prefix),
+        job_queue=args.job_queue,
+        max_jobs=args.max_jobs,
+        profile=args.profile,
+        reason=args.reason or f"SweetSpot cancel requested for run {args.run_id}",
+        region=args.region,
+        status=args.status,
+        terminate_running=args.terminate_running,
+    )
+    inner = _cancel_jobs_report(cancel_args)
+    report = {
+        "schema": "sweetspot.cancel.v1",
+        "checked_at": inner["checked_at"],
+        "run_id": args.run_id,
+        "apply": bool(args.apply),
+        "job_name_prefix": args.job_name_prefix or args.run_id,
+        "job_name_regex": inner["job_name_regex"],
+        "matched_count": inner["matched_count"],
+        "actionable_count": inner["actionable_count"],
+        "cancelled_count": inner["cancelled_count"],
+        "terminated_count": inner["terminated_count"],
+        "terminate_running": inner["terminate_running"],
+        "cancel_jobs": inner,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -2375,6 +2422,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
+    "cancel": {"apply", "job_name_prefix", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cancel-jobs": {"apply", "format", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
@@ -2672,6 +2720,24 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("lane-manager", help="Dry-run/apply multi-region Spot worker lane submissions; forwards args to sweetspot-lane-manager", add_help=False)
     p.add_argument("lane_manager_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_lane_manager)
+
+    p = _add_parser_with_examples(
+        sub,
+        "cancel",
+        help="Dry-run/apply cancellation for Batch jobs whose names are scoped to a SweetSpot run ID",
+        examples="  sweetspot cancel example-run --job-queue jq\n  sweetspot cancel example-run --job-queue jq --terminate-running --apply",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--job-queue", action="append", required=True)
+    p.add_argument("--job-name-prefix", help="Run-scoped Batch job-name prefix; must include RUN_ID. Defaults to RUN_ID.")
+    p.add_argument("--status", action="append")
+    p.add_argument("--max-jobs", type=int, default=100)
+    p.add_argument("--terminate-running", action="store_true")
+    p.add_argument("--reason")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_cancel)
 
     p = _add_parser_with_examples(
         sub,
