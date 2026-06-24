@@ -265,7 +265,7 @@ sweetspot cleanup-stale-messages \
 # inspect AWS Batch jobs and logs
 sweetspot jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001
 sweetspot describe-job --job-id AWS_BATCH_JOB_ID
-sweetspot logs --job-id AWS_BATCH_JOB_ID --tail 50 --filter-regex 'progress|ERROR'
+sweetspot logs --job-id AWS_BATCH_JOB_ID --max-events 500 --last 50 --filter-regex 'progress|ERROR'
 # If --job-id is provided and --log-group is omitted, sweetspot uses the job's awslogs-group when AWS Batch reports it.
 sweetspot watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
 

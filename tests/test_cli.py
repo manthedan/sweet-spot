@@ -1082,6 +1082,14 @@ class BatchOperatorTests(unittest.TestCase):
             self.assertEqual(cmd_logs(args), 0)
         self.assertEqual(logs.kwargs["startFromHead"], True)
 
+    def test_logs_accepts_clearer_limit_aliases(self) -> None:
+        logs = FakeLogsClient()
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeLogSession(logs)), contextlib.redirect_stdout(out):
+            self.assertEqual(main(["logs", "--log-stream", "stream", "--log-group", "/aws/batch/job", "--max-events", "3", "--last", "2"]), 0)
+        self.assertEqual(logs.kwargs["limit"], 3)
+        self.assertEqual(json.loads(out.getvalue())["events"], [])
+
     def test_job_log_stream_reads_ecs_task_properties(self) -> None:
         job = {"attempts": [{"taskProperties": [{"containers": [{"logStreamName": "ecs-stream"}]}]}]}
         self.assertEqual(_job_log_stream(job), "ecs-stream")
