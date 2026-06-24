@@ -118,6 +118,39 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(report["messages_per_worker"], 2)
         self.assertEqual(report["raw_desired_workers"], 2)
 
+    def test_config_after_regular_subcommand_still_applies(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {
+                    "Attributes": {
+                        "ApproximateNumberOfMessages": "4",
+                        "ApproximateNumberOfMessagesNotVisible": "0",
+                        "ApproximateNumberOfMessagesDelayed": "0",
+                    }
+                }
+
+        def fake_client(service):
+            if service == "sqs":
+                return FakeSQS()
+            if service == "batch":
+                return object()
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "sweetspot.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "defaults": {"queue_url": "configured-queue"},
+                        "submit-workers": {"batch_job_queue": "jq", "job_definition": "jd", "messages_per_worker": 2},
+                    }
+                )
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["submit-workers", "--config", str(config_path)]), 0)
+        self.assertEqual(json.loads(out.getvalue())["raw_desired_workers"], 2)
+
     def test_config_defaults_do_not_break_non_configurable_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "sweetspot.json"
@@ -126,6 +159,18 @@ class ConfigTests(unittest.TestCase):
             with patch("sweetspot.cli.importlib_metadata.version", return_value="1.0"), contextlib.redirect_stdout(out):
                 self.assertEqual(main(["--config", str(config_path), "version"]), 0)
         self.assertEqual(json.loads(out.getvalue())["version"], "1.0")
+
+
+class NestedToolCommandTests(unittest.TestCase):
+    def test_scout_subcommand_forwards_arguments(self) -> None:
+        with patch("sweetspot.cli.scout.main", return_value=0) as fake:
+            self.assertEqual(main(["scout", "--preset", "arm", "--regions", "us-west-2"]), 0)
+        fake.assert_called_once_with(["--preset", "arm", "--regions", "us-west-2"], prog="sweetspot scout")
+
+    def test_lane_manager_keeps_its_config_argument(self) -> None:
+        with patch("sweetspot.cli.lane_manager.main", return_value=0) as fake:
+            self.assertEqual(main(["lane-manager", "--config", "lanes.json", "--submit"]), 0)
+        fake.assert_called_once_with(["--config", "lanes.json", "--submit"], prog="sweetspot lane-manager")
 
 
 class StatusTests(unittest.TestCase):

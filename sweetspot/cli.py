@@ -15,6 +15,7 @@ from typing import Any, Iterable, Iterator
 
 import boto3
 
+from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
@@ -229,6 +230,14 @@ def cmd_version(args: argparse.Namespace) -> int:
         version = "0+unknown"
     print(json.dumps({"schema": "sweetspot.version.v1", "package": "sweetspot", "version": version}, indent=2, sort_keys=True))
     return 0
+
+
+def cmd_scout(args: argparse.Namespace) -> int:
+    return int(scout.main(args.scout_args, prog="sweetspot scout"))
+
+
+def cmd_lane_manager(args: argparse.Namespace) -> int:
+    return int(lane_manager.main(args.lane_manager_args, prog="sweetspot lane-manager"))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -2160,9 +2169,18 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
 def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
     config_path: Path | None = Path(os.environ["SWEETSPOT_CONFIG"]) if os.environ.get("SWEETSPOT_CONFIG") else None
     stripped: list[str] = []
+    command: str | None = None
     i = 0
     while i < len(argv):
         arg = argv[i]
+        if arg == "--":
+            stripped.extend(argv[i:])
+            break
+        if command is None and not arg.startswith("-"):
+            command = arg
+        if command == "lane-manager":
+            stripped.extend(argv[i:])
+            break
         if arg == "--config":
             if i + 1 >= len(argv):
                 raise SystemExit("--config requires a path")
@@ -2254,6 +2272,10 @@ def main(argv: list[str] | None = None) -> int:
     config_path, raw_argv = _extract_config_arg(raw_argv)
     config = _load_config(config_path)
     raw_argv = _apply_config_defaults(raw_argv, config, _command_name(raw_argv))
+    if raw_argv and raw_argv[0] == "scout":
+        return int(scout.main(raw_argv[1:], prog="sweetspot scout"))
+    if raw_argv and raw_argv[0] == "lane-manager":
+        return int(lane_manager.main(raw_argv[1:], prog="sweetspot lane-manager"))
 
     ap = argparse.ArgumentParser(prog="sweetspot")
     ap.add_argument("--config", type=Path, help="JSON config file with 'defaults' and per-command sections")
@@ -2261,6 +2283,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("version", help="Print the installed SweetSpot package version")
     p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)
+    p.add_argument("scout_args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_scout)
+
+    p = sub.add_parser("lane-manager", help="Dry-run/apply multi-region Spot worker lane submissions; forwards args to sweetspot-lane-manager", add_help=False)
+    p.add_argument("lane_manager_args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_lane_manager)
 
     p = _add_parser_with_examples(
         sub,

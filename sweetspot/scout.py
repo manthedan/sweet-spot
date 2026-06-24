@@ -346,8 +346,8 @@ def instance_vcpus(ec2, instance_types: list[str]) -> dict[str, int]:
     return out
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
+    ap = argparse.ArgumentParser(prog=prog, description=__doc__)
     ap.add_argument("--profile", default=None)
     ap.add_argument("--home-region", default="us-west-2", help="Endpoint used for DescribeRegions and placement score calls")
     ap.add_argument("--regions", nargs="*", help="Regions to compare; default is all opted-in regions")
@@ -374,7 +374,7 @@ def main() -> int:
     ap.add_argument("--s3-storage-gb-month-per-1m-units", type=float, default=0.0)
     ap.add_argument("--s3-storage-cost-per-gb-month", type=float, default=0.023)
     ap.add_argument("--json-out", type=Path)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     session = boto3.Session(profile_name=args.profile)
     regions = args.regions or auto_regions(session, args.home_region)

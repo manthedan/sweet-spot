@@ -123,15 +123,15 @@ def submit_jobs(batch, lane: dict[str, Any], sqs_queue_url: str, count: int, dry
     return out
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
+    ap = argparse.ArgumentParser(prog=prog, description=__doc__)
     ap.add_argument("--config", type=Path, required=True)
     ap.add_argument("--profile")
     ap.add_argument("--home-region", default="us-west-2")
     ap.add_argument("--target-workers", type=int, help="Total desired active workers across lanes; default=sum lane max_workers")
     ap.add_argument("--include-not-visible", action="store_true")
     ap.add_argument("--submit", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     cfg = json.loads(args.config.read_text())
     lanes = cfg.get("lanes") or []

@@ -19,6 +19,7 @@ All notable changes to this project are documented here. This project uses human
 - Short argparse help examples for high-traffic production workflow commands.
 - `sweetspot status` command for a one-shot AWS identity, queue-depth, DLQ-depth, and active-worker overview.
 - JSON `--config` / `SWEETSPOT_CONFIG` support for prepopulating common command defaults and required workflow flags.
+- `sweetspot scout` and `sweetspot lane-manager` subcommands, while preserving the standalone entry points.
 
 ### Fixed
 
