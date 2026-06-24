@@ -262,12 +262,12 @@ sweetspot cleanup-stale-messages \
   --run-id hello-001 \
   --max-messages 100
 
-# inspect AWS Batch jobs and logs
-sweetspot jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001
-sweetspot describe-job --job-id AWS_BATCH_JOB_ID
-sweetspot logs --job-id AWS_BATCH_JOB_ID --max-events 500 --last 50 --filter-regex 'progress|ERROR'
+# inspect AWS Batch jobs and logs; JSON remains the default, table is opt-in
+sweetspot jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex hello-001 --format table
+sweetspot describe-job --job-id AWS_BATCH_JOB_ID --format table
+sweetspot logs --job-id AWS_BATCH_JOB_ID --max-events 500 --last 50 --filter-regex 'progress|ERROR' --format table
 # If --job-id is provided and --log-group is omitted, sweetspot uses the job's awslogs-group when AWS Batch reports it.
-sweetspot watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600
+sweetspot watch-job --job-id AWS_BATCH_JOB_ID --max-seconds 3600 --format table
 
 # dry-run a guarded S3 prefix cleanup; add --delete and exact --confirm-prefix to mutate.
 # Add --include-versions for versioned buckets so old versions and delete markers are included.
@@ -279,7 +279,8 @@ sweetspot s3-delete-prefix \
 # inspect DLQ; filtered manual redrive is available for small repairs
 sweetspot dlq \
   --dlq-url https://sqs.REGION.amazonaws.com/ACCOUNT/my-dlq \
-  --run-id hello-001
+  --run-id hello-001 \
+  --format table
 
 # whole-DLQ redrive should use native SQS StartMessageMoveTask where possible
 sweetspot dlq \

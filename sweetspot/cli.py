@@ -240,6 +240,42 @@ def cmd_lane_manager(args: argparse.Namespace) -> int:
     return int(lane_manager.main(args.lane_manager_args, prog="sweetspot lane-manager"))
 
 
+def _format_table_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, sort_keys=True)
+    out: list[str] = []
+    for ch in str(value):
+        code = ord(ch)
+        if ch == "\t":
+            out.append("\\t")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif code < 32 or code == 127:
+            out.append(f"\\x{code:02x}")
+        elif 128 <= code <= 159:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _print_table(title: str, headers: list[str], rows: Iterable[dict[str, Any]]) -> None:
+    print(title)
+    print("\t".join(headers))
+    for row in rows:
+        print("\t".join(_format_table_value(row.get(header)) for header in headers))
+
+
+def _print_key_values(title: str, values: dict[str, Any]) -> None:
+    print(title)
+    for key, value in values.items():
+        print(f"{key}\t{_format_table_value(value)}")
+
+
 def _print_status_table(report: dict[str, Any]) -> None:
     identity = report.get("identity") or {}
     print("SweetSpot status")
@@ -1344,7 +1380,14 @@ def cmd_jobs(args: argparse.Namespace) -> int:
                 break
         if len(rows) >= args.max_jobs:
             break
-    print(json.dumps({"schema": "sweetspot.jobs.v1", "checked_at": iso_now(), "job_queue": args.job_queue, "statuses": statuses, "count": len(rows), "jobs": rows}, indent=2, sort_keys=True))
+    report = {"schema": "sweetspot.jobs.v1", "checked_at": iso_now(), "job_queue": args.job_queue, "statuses": statuses, "count": len(rows), "jobs": rows}
+    if getattr(args, "format", "json") == "table":
+        _print_key_values("SweetSpot jobs", {"checked_at": report["checked_at"], "job_queue": args.job_queue, "statuses": ",".join(statuses), "count": len(rows)})
+        if rows:
+            print()
+            _print_table("jobs", ["jobId", "jobName", "status", "createdAt", "startedAt", "stoppedAt"], rows)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -1622,7 +1665,24 @@ def cmd_describe_job(args: argparse.Namespace) -> int:
         "logStreamName": _job_log_stream(job),
         "attempts": job.get("attempts", []),
     }
-    print(json.dumps(report, indent=2, sort_keys=True))
+    if getattr(args, "format", "json") == "table":
+        _print_key_values(
+            "SweetSpot job",
+            {
+                "checked_at": report["checked_at"],
+                "jobId": report["jobId"],
+                "jobName": report["jobName"],
+                "jobQueue": report["jobQueue"],
+                "status": report["status"],
+                "statusReason": report["statusReason"],
+                "containerReason": report["containerReason"],
+                "exitCode": report["exitCode"],
+                "logStreamName": report["logStreamName"],
+                "attempts": len(report["attempts"]),
+            },
+        )
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -1655,21 +1715,25 @@ def cmd_logs(args: argparse.Namespace) -> int:
         if args.filter_regex and not re.search(args.filter_regex, msg):
             continue
         events.append({"timestamp": ev.get("timestamp"), "message": msg})
-    print(
-        json.dumps(
-            {
-                "schema": "sweetspot.logs.v1",
-                "checked_at": iso_now(),
-                "log_group": log_group,
-                "log_stream": stream,
-                "count": len(events),
-                "nextForwardToken": resp.get("nextForwardToken"),
-                "events": events[-args.tail :] if args.tail else events,
-            },
-            indent=2,
-            sort_keys=True,
+    visible_events = events[-args.tail :] if args.tail else events
+    report = {
+        "schema": "sweetspot.logs.v1",
+        "checked_at": iso_now(),
+        "log_group": log_group,
+        "log_stream": stream,
+        "count": len(events),
+        "nextForwardToken": resp.get("nextForwardToken"),
+        "events": visible_events,
+    }
+    if getattr(args, "format", "json") == "table":
+        _print_key_values(
+            "SweetSpot logs", {"checked_at": report["checked_at"], "log_group": log_group, "log_stream": stream, "count": report["count"], "returned": len(visible_events), "nextForwardToken": report["nextForwardToken"]}
         )
-    )
+        if visible_events:
+            print()
+            _print_table("events", ["timestamp", "message"], visible_events)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -1678,6 +1742,7 @@ def cmd_watch_job(args: argparse.Namespace) -> int:
     batch = session.client("batch", region_name=args.region)
     deadline = time.time() + args.max_seconds if args.max_seconds else None
     last_report = None
+    printed_table_header = False
     while True:
         job = _describe_one_job(batch, args.job_id)
         status = str(job.get("status"))
@@ -1690,7 +1755,14 @@ def cmd_watch_job(args: argparse.Namespace) -> int:
             "statusReason": job.get("statusReason"),
             "logStreamName": _job_log_stream(job),
         }
-        print(json.dumps(last_report, indent=2, sort_keys=True))
+        if getattr(args, "format", "json") == "table":
+            if not printed_table_header:
+                print("SweetSpot watch-job")
+                print("checked_at\tjobId\tjobName\tstatus\tstatusReason\tlogStreamName")
+                printed_table_header = True
+            print("\t".join(_format_table_value(last_report.get(key)) for key in ["checked_at", "jobId", "jobName", "status", "statusReason", "logStreamName"]))
+        else:
+            print(json.dumps(last_report, indent=2, sort_keys=True))
         if status in {"SUCCEEDED", "FAILED"}:
             return 0 if status == "SUCCEEDED" else 2
         if deadline and time.time() >= deadline:
@@ -1844,21 +1916,19 @@ def cmd_dlq(args: argparse.Namespace) -> int:
         if getattr(args, "max_messages_per_second", None):
             kwargs["MaxNumberOfMessagesPerSecond"] = args.max_messages_per_second
         resp = sqs.start_message_move_task(**kwargs)
-        print(
-            json.dumps(
-                {
-                    "schema": "sweetspot.dlq_redrive_summary.v1",
-                    "checked_at": iso_now(),
-                    "native_redrive": True,
-                    "source_arn": kwargs["SourceArn"],
-                    "destination_arn": kwargs.get("DestinationArn"),
-                    "task_handle": resp.get("TaskHandle"),
-                    "max_messages_per_second": kwargs.get("MaxNumberOfMessagesPerSecond"),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        report = {
+            "schema": "sweetspot.dlq_redrive_summary.v1",
+            "checked_at": iso_now(),
+            "native_redrive": True,
+            "source_arn": kwargs["SourceArn"],
+            "destination_arn": kwargs.get("DestinationArn"),
+            "task_handle": resp.get("TaskHandle"),
+            "max_messages_per_second": kwargs.get("MaxNumberOfMessagesPerSecond"),
+        }
+        if getattr(args, "format", "json") == "table":
+            _print_key_values("SweetSpot DLQ redrive", report)
+        else:
+            print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     scanned = matched = moved = 0
     by_run: Counter[str] = Counter()
@@ -1893,23 +1963,24 @@ def cmd_dlq(args: argparse.Namespace) -> int:
                     sqs.send_message(QueueUrl=args.queue_url, MessageBody=msg.get("Body", ""))
                     sqs.delete_message(QueueUrl=args.dlq_url, ReceiptHandle=msg["ReceiptHandle"])
                     moved += 1
-    print(
-        json.dumps(
-            {
-                "schema": "sweetspot.dlq_summary.v1",
-                "checked_at": iso_now(),
-                "apply": bool(args.apply),
-                "scanned": scanned,
-                "matched": matched,
-                "moved": moved,
-                "by_run": dict(by_run.most_common()),
-                "by_schema": dict(by_schema.most_common()),
-                "examples": examples,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    report = {
+        "schema": "sweetspot.dlq_summary.v1",
+        "checked_at": iso_now(),
+        "apply": bool(args.apply),
+        "scanned": scanned,
+        "matched": matched,
+        "moved": moved,
+        "by_run": dict(by_run.most_common()),
+        "by_schema": dict(by_schema.most_common()),
+        "examples": examples,
+    }
+    if getattr(args, "format", "json") == "table":
+        _print_key_values("SweetSpot DLQ", {key: report[key] for key in ["checked_at", "apply", "scanned", "matched", "moved", "by_run", "by_schema"]})
+        if examples:
+            print()
+            _print_table("examples", ["task_id", "run_id", "receive_count"], examples)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -2051,15 +2122,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         {"name": "service_quotas", "ok": None, "details": {"status": "not_checked", "reason": "AWS Batch quota codes vary by account/Region; verify max vCPUs and queue limits in Service Quotas for production runs."}}
     )
     ok = all(c.get("ok") is not False for c in checks)
-    print(json.dumps({"schema": "sweetspot.doctor.v1", "checked_at": iso_now(), "ok": ok, "region": args.region, "checks": checks}, indent=2, sort_keys=True))
+    report = {"schema": "sweetspot.doctor.v1", "checked_at": iso_now(), "ok": ok, "region": args.region, "checks": checks}
+    if getattr(args, "format", "json") == "table":
+        _print_key_values("SweetSpot doctor", {"checked_at": report["checked_at"], "ok": ok, "region": args.region})
+        print()
+        _print_table("checks", ["name", "ok", "elapsed_sec", "error_type", "error", "details"], checks)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if ok else 2
 
 
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
-    "dlq": {"apply", "dlq_url", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
-    "doctor": {"dlq_url", "heartbeat_seconds", "job_definition", "job_queue", "profile", "queue_url", "region", "s3_prefix", "task_timeout_seconds", "visibility_timeout"},
+    "dlq": {"apply", "dlq_url", "format", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
+    "doctor": {"dlq_url", "format", "heartbeat_seconds", "job_definition", "job_queue", "profile", "queue_url", "region", "s3_prefix", "task_timeout_seconds", "visibility_timeout"},
     "enqueue-and-submit": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -2086,8 +2163,9 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     },
     "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "submit", "tasks_jsonl"},
     "finalize": {"allow_legacy_done_markers", "artifact_dir", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
-    "jobs": {"job_name_regex", "job_queue", "max_jobs", "profile", "region"},
-    "logs": {"job_id", "log_group", "log_stream", "profile", "region"},
+    "describe-job": {"format", "job_id", "profile", "region"},
+    "jobs": {"format", "job_name_regex", "job_queue", "max_jobs", "profile", "region"},
+    "logs": {"format", "job_id", "log_group", "log_stream", "profile", "region"},
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
     "status": {"dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
@@ -2137,7 +2215,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "vcpus",
         "visibility_timeout",
     },
-    "watch-job": {"job_id", "profile", "region"},
+    "watch-job": {"format", "job_id", "profile", "region"},
     "worker": {"allow_legacy_done_markers", "allowed_s3_prefix", "heartbeat_seconds", "profile", "queue_url", "region", "task_timeout_seconds", "visibility_timeout"},
 }
 
@@ -2541,6 +2619,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--status", action="append", choices=list(ACTIVE_STATUSES) + ["SUCCEEDED", "FAILED"], help="repeatable; default active statuses")
     p.add_argument("--name-regex")
     p.add_argument("--max-jobs", type=int, default=1000)
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_jobs)
 
     p = _add_parser_with_examples(
@@ -2607,6 +2686,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--job-id", required=True)
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_describe_job)
 
     p = sub.add_parser("logs")
@@ -2620,6 +2700,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--filter-regex")
     p.add_argument("--next-token")
     p.add_argument("--start-from-head", action="store_true")
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_logs)
 
     p = sub.add_parser("watch-job")
@@ -2628,6 +2709,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job-id", required=True)
     p.add_argument("--interval-seconds", type=float, default=30.0)
     p.add_argument("--max-seconds", type=float, default=0.0)
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_watch_job)
 
     p = sub.add_parser("s3-delete-prefix")
@@ -2663,6 +2745,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--heartbeat-seconds", type=int, default=300)
     p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS)
     p.add_argument("--redact-regex", action="append", default=[], help="Validate worker log redaction regexes")
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("dlq")
@@ -2678,6 +2761,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--visibility-timeout", type=int, default=10)
     p.add_argument("--wait-time", type=int, default=1)
     p.add_argument("--apply", action="store_true")
+    p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_dlq)
 
     args = ap.parse_args(raw_argv)

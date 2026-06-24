@@ -55,10 +55,12 @@ from sweetspot.cli import (
     cmd_enqueue_jsonl,
     cmd_estimate_runtime,
     cmd_finalize,
+    cmd_jobs,
     cmd_logs,
     cmd_repair_plan,
     cmd_s3_delete_prefix,
     cmd_status,
+    cmd_describe_job,
     cmd_supervise_workers,
     cmd_version,
     main,
@@ -973,12 +975,13 @@ class RepairPlanTests(unittest.TestCase):
 
 
 class FakeLogsClient:
-    def __init__(self) -> None:
+    def __init__(self, events: list[dict[str, object]] | None = None) -> None:
         self.kwargs: dict[str, object] | None = None
+        self.events = events or []
 
     def get_log_events(self, **kwargs):
         self.kwargs = kwargs
-        return {"events": [], "nextForwardToken": "next"}
+        return {"events": self.events, "nextForwardToken": "next"}
 
 
 class FakeBatchClient:
@@ -1061,6 +1064,106 @@ class DoctorTests(unittest.TestCase):
         names = [c["name"] for c in report["checks"]]
         self.assertIn("cloudwatch_log_group", names)
         self.assertIn("batch_metrics", names)
+
+
+class ReadCommandTableTests(unittest.TestCase):
+    def test_jobs_table_output(self) -> None:
+        class Paginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": [{"jobId": "job-1", "jobName": "run-worker", "createdAt": 1, "startedAt": 2, "stoppedAt": None}]}]
+
+        class Batch:
+            def get_paginator(self, name):
+                return Paginator()
+
+        class Session:
+            def client(self, service: str, region_name=None):
+                if service == "batch":
+                    return Batch()
+                raise AssertionError(service)
+
+        args = types.SimpleNamespace(profile=None, region=None, job_queue="jq", status=["RUNNING"], name_regex=None, max_jobs=10, format="table")
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=Session()), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_jobs(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot jobs", table)
+        self.assertIn("jobId\tjobName\tstatus", table)
+        self.assertIn("job-1\trun-worker\tRUNNING", table)
+
+    def test_describe_job_table_output(self) -> None:
+        job = {"jobId": "job-1", "jobName": "run-worker", "jobQueue": "jq", "status": "SUCCEEDED", "container": {"logStreamName": "stream-1", "exitCode": 0}}
+        args = types.SimpleNamespace(profile=None, region=None, job_id="job-1", format="table")
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeLogSession(FakeLogsClient(), FakeBatchClient(job))), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_describe_job(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot job", table)
+        self.assertIn("status\tSUCCEEDED", table)
+        self.assertIn("logStreamName\tstream-1", table)
+
+    def test_logs_table_output_escapes_control_characters(self) -> None:
+        logs = FakeLogsClient(events=[{"timestamp": 10, "message": "hello\x1b[2J\rnext"}])
+        args = types.SimpleNamespace(profile=None, region=None, log_stream="stream", job_id=None, log_group="/aws/batch/job", limit=10, start_from_head=False, next_token=None, filter_regex=None, tail=0, format="table")
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeLogSession(logs)), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_logs(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot logs", table)
+        self.assertIn("timestamp\tmessage", table)
+        self.assertIn("10\thello\\x1b[2J\\rnext", table)
+        self.assertNotIn("\x1b", table)
+
+    def test_doctor_table_output(self) -> None:
+        args = types.SimpleNamespace(
+            profile=None,
+            region="us-west-2",
+            queue_url="https://sqs.us-west-2.amazonaws.com/123/q",
+            dlq_url=None,
+            job_queue=None,
+            job_definition=None,
+            log_group=None,
+            validate_batch_metrics=False,
+            s3_prefix=[],
+            write_probe=False,
+            visibility_timeout=1800,
+            heartbeat_seconds=300,
+            task_timeout_seconds=3600,
+            redact_regex=[],
+            format="table",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeDoctorSession()), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_doctor(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot doctor", table)
+        self.assertIn("sqs_work_queue", table)
+
+    def test_dlq_table_output(self) -> None:
+        class SQS:
+            def receive_message(self, **kwargs):
+                return {"Messages": []}
+
+        args = types.SimpleNamespace(
+            profile=None,
+            region=None,
+            apply=False,
+            dlq_url="dlq",
+            queue_url=None,
+            native_redrive=False,
+            run_id=None,
+            task_id_regex=None,
+            max_messages=10,
+            wait_time=0,
+            visibility_timeout=1,
+            format="table",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.client", return_value=SQS()), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_dlq(args), 0)
+        table = out.getvalue()
+        self.assertIn("SweetSpot DLQ", table)
+        self.assertIn("scanned\t0", table)
 
 
 class BatchOperatorTests(unittest.TestCase):
