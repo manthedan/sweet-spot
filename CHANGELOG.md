@@ -41,7 +41,8 @@ All notable changes to this project are documented here. This project uses human
 - `sweetspot repair RUN_ID` high-level wrapper that builds run-scoped repair plans by default and can enqueue repair tasks with guarded `--apply`.
 - `sweetspot plan --out-production-tasks-jsonl` for explicitly writing calibrated production `sweetspot.task.v1` shards as a local review/enqueue artifact.
 - Adaptive canary decisions now block production shard generation with `canary_validation_failed` when canaries fail framework/output validation.
-- Initial `sweetspot run JOB_SPEC` dry-run controller report that nests the planner output, can write local run-state/task artifacts, and refuses `--apply` until AWS orchestration is implemented.
+- Initial `sweetspot run JOB_SPEC` dry-run controller report that nests the planner output and can write local run-state/task artifacts.
+- `sweetspot run JOB_SPEC --apply` kickoff/resume controller: with calibrated production tasks and an artifact directory, it persists `run_state.json`, enqueues tasks once, submits an initial run-scoped Batch worker wave once, and resumes without re-enqueueing completed phases.
 - High-level `sweetspot cancel RUN_ID` wrapper for run-scoped Batch job cancellation with dry-run default and guarded `--apply`.
 - Run-centric `sweetspot status RUN_ID` summaries for local run/finalizer/repair artifacts, with Batch worker filtering scoped to the run by default.
 

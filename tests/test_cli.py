@@ -62,7 +62,6 @@ from sweetspot.cli import (
     cmd_logs,
     cmd_repair,
     cmd_repair_plan,
-    cmd_run,
     cmd_s3_delete_prefix,
     cmd_status,
     cmd_describe_job,
@@ -248,9 +247,499 @@ class RunCommandTests(unittest.TestCase):
             tasks = [json.loads(line) for line in tasks_path.read_text().splitlines()]
         self.assertEqual([task["task_id"] for task in tasks], ["shard-000000", "shard-000001", "shard-000002"])
 
-    def test_run_apply_is_guarded_until_controller_mutation_is_implemented(self) -> None:
-        with self.assertRaisesRegex(SystemExit, "run --apply is not implemented"):
-            cmd_run(types.SimpleNamespace(job_spec=Path("examples/job.x86.example.json"), apply=True))
+    def test_run_apply_requires_artifact_dir_for_resume_state(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires --artifact-dir"):
+            main(["run", "examples/job.x86.example.json", "--apply", "--queue-url", "https://sqs.example/q", "--batch-job-queue", "jq", "--job-definition", "jd"])
+
+    def test_run_apply_enqueues_and_submits_workers_once(self) -> None:
+        sqs = FakeQueueDepthSQS()
+        batch = FakeSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--messages-per-worker",
+                "2",
+                "--max-workers",
+                "5",
+                "--apply",
+            ]
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["mode"], "apply")
+            self.assertTrue(report["applied"])
+            self.assertEqual(report["status"], "workers_submitted")
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            self.assertEqual(phases["enqueue_tasks"]["sent"], 3)
+            self.assertEqual(phases["submit_workers"]["submitted_count"], 2)
+            self.assertEqual(sqs.sent, 3)
+            self.assertEqual(len(batch.submitted), 2)
+            self.assertTrue(str(batch.submitted[0]["jobName"]).startswith("example-x86-run-worker-"))
+            self.assertEqual(batch.submitted[0]["jobQueue"], "jq")
+            self.assertEqual(batch.submitted[0]["jobDefinition"], "jd")
+            state = json.loads((artifact_dir / "run_state.json").read_text())
+            self.assertEqual(state["status"], "workers_submitted")
+            tasks_path = artifact_dir / "production_tasks.jsonl"
+            original_tasks_text = tasks_path.read_text()
+
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            resumed = json.loads(out.getvalue())
+            resumed_phases = {phase["name"]: phase for phase in resumed["phases"]}
+            self.assertTrue(resumed_phases["enqueue_tasks"]["resumed"])
+            self.assertTrue(resumed_phases["submit_workers"]["resumed"])
+            self.assertEqual(sqs.sent, 3)
+            self.assertEqual(len(batch.submitted), 2)
+
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(9000)))
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            resumed_with_changed_inputs = json.loads(out.getvalue())
+            changed_phases = {phase["name"]: phase for phase in resumed_with_changed_inputs["phases"]}
+            self.assertEqual(changed_phases["materialize_production_tasks"]["task_count"], 3)
+            self.assertEqual(tasks_path.read_text(), original_tasks_text)
+            self.assertEqual(sqs.sent, 3)
+            self.assertEqual(len(batch.submitted), 2)
+
+    def test_run_apply_rejects_hashless_legacy_run_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            artifact_dir.mkdir()
+            tasks_path = artifact_dir / "production_tasks.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text(json.dumps({"unit": 0}) + "\n")
+            tasks_path.write_text(json.dumps({"run_id": "example-x86-run", "task_id": "old"}) + "\n")
+            (artifact_dir / "run_state.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "sweetspot.run.v1",
+                        "run_id": "example-x86-run",
+                        "mode": "dry_run",
+                        "applied": False,
+                        "artifacts": {"production_tasks_jsonl": str(tasks_path)},
+                    }
+                )
+            )
+            with self.assertRaisesRegex(SystemExit, "does not record job_spec_sha256"):
+                main(
+                    [
+                        "run",
+                        "examples/job.x86.example.json",
+                        "--canary-summary-jsonl",
+                        str(summaries),
+                        "--input-manifest-jsonl",
+                        str(manifest),
+                        "--artifact-dir",
+                        str(artifact_dir),
+                        "--queue-url",
+                        "https://sqs.example/q",
+                        "--batch-job-queue",
+                        "jq",
+                        "--job-definition",
+                        "jd",
+                        "--apply",
+                    ]
+                )
+
+    def test_run_dry_run_refuses_to_clobber_apply_state(self) -> None:
+        sqs = FakeQueueDepthSQS()
+        batch = FakeSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            base_argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+            ]
+            apply_argv = base_argv + ["--queue-url", "https://sqs.example/q", "--batch-job-queue", "jq", "--job-definition", "jd", "--apply"]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(apply_argv), 0)
+            state_path = artifact_dir / "run_state.json"
+            tasks_path = artifact_dir / "production_tasks.jsonl"
+            state_text = state_path.read_text()
+            tasks_text = tasks_path.read_text()
+
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(9000)))
+            with self.assertRaisesRegex(SystemExit, "refuses to overwrite"):
+                main(base_argv)
+            self.assertEqual(state_path.read_text(), state_text)
+            self.assertEqual(tasks_path.read_text(), tasks_text)
+
+    def test_run_apply_reuses_reviewed_dry_run_task_artifact(self) -> None:
+        sqs = FakeQueueDepthSQS()
+        batch = FakeSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            base_argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+            ]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(base_argv), 0)
+            tasks_path = artifact_dir / "production_tasks.jsonl"
+            reviewed_tasks_text = tasks_path.read_text()
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(9500)))
+
+            apply_argv = base_argv + ["--queue-url", "https://sqs.example/q", "--batch-job-queue", "jq", "--job-definition", "jd", "--apply"]
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(apply_argv), 0)
+            report = json.loads(out.getvalue())
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            self.assertEqual(report["plan"]["canaries"][0]["production_shards"]["logical_unit_count"], 6500)
+            self.assertEqual(report["plan"]["canaries"][0]["production_shards"]["task_count"], 3)
+            self.assertEqual(phases["materialize_production_tasks"]["task_count"], 3)
+            self.assertEqual(phases["enqueue_tasks"]["sent"], 3)
+            self.assertEqual(tasks_path.read_text(), reviewed_tasks_text)
+
+    def test_run_apply_sizes_workers_from_run_tasks_not_global_queue_depth(self) -> None:
+        class DirtyQueueSQS(FakeQueueDepthSQS):
+            def get_queue_attributes(self, **kwargs):
+                self.depth_calls += 1
+                return {"Attributes": {"ApproximateNumberOfMessages": "100", "ApproximateNumberOfMessagesNotVisible": "50", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        sqs = DirtyQueueSQS()
+        batch = FakeSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text(json.dumps({"unit": 0}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "run",
+                            "examples/job.x86.example.json",
+                            "--canary-summary-jsonl",
+                            str(summaries),
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--artifact-dir",
+                            str(artifact_dir),
+                            "--queue-url",
+                            "https://sqs.example/q",
+                            "--batch-job-queue",
+                            "jq",
+                            "--job-definition",
+                            "jd",
+                            "--messages-per-worker",
+                            "1",
+                            "--max-workers",
+                            "10",
+                            "--include-not-visible",
+                            "--apply",
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            submit_phase = {phase["name"]: phase for phase in report["phases"]}["submit_workers"]
+            self.assertEqual(sqs.sent, 1)
+            self.assertEqual(submit_phase["backlog_used_for_sizing"], 1)
+            self.assertEqual(submit_phase["submitted_count"], 1)
+            self.assertEqual(len(batch.submitted), 1)
+
+    def test_run_apply_persists_enqueue_before_later_aws_calls(self) -> None:
+        class CrashingAfterSendSQS:
+            def __init__(self) -> None:
+                self.sent = 0
+
+            def send_message_batch(self, *, QueueUrl, Entries):
+                self.sent += len(Entries)
+                return {"Successful": [{"Id": e["Id"]} for e in Entries]}
+
+            def get_queue_attributes(self, **kwargs):
+                raise RuntimeError("queue depth unavailable after send")
+
+        first_sqs = CrashingAfterSendSQS()
+        batch = FakeSubmitBatch()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--apply",
+            ]
+
+            def crashing_client(service):
+                if service == "sqs":
+                    return first_sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            with patch("sweetspot.cli.boto3.client", side_effect=crashing_client), self.assertRaisesRegex(RuntimeError, "queue depth unavailable"):
+                main(argv)
+            self.assertEqual(first_sqs.sent, 3)
+            state = json.loads((artifact_dir / "run_state.json").read_text())
+            enqueue_phase = {phase["name"]: phase for phase in state["phases"]}["enqueue_tasks"]
+            self.assertEqual(enqueue_phase["status"], "completed")
+            self.assertEqual(enqueue_phase["sent"], 3)
+
+            second_sqs = FakeQueueDepthSQS()
+
+            def resume_client(service):
+                if service == "sqs":
+                    return second_sqs
+                if service == "batch":
+                    return batch
+                raise AssertionError(service)
+
+            changed_queue_argv = ["https://sqs.example/other" if item == "https://sqs.example/q" else item for item in argv]
+            with patch("sweetspot.cli.boto3.client", side_effect=resume_client), self.assertRaisesRegex(SystemExit, "different queue_url"):
+                main(changed_queue_argv)
+
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=resume_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            resumed = json.loads(out.getvalue())
+            resumed_phases = {phase["name"]: phase for phase in resumed["phases"]}
+            self.assertTrue(resumed_phases["enqueue_tasks"]["resumed"])
+            self.assertEqual(second_sqs.sent, 0)
+            self.assertEqual(resumed_phases["submit_workers"]["submitted_count"], 3)
+
+    def test_run_apply_rejects_worker_resume_config_drift(self) -> None:
+        sqs = FakeQueueDepthSQS()
+        batch = FakeSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        class FakeRunSession:
+            def client(self, service, region_name=None):
+                return fake_client(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--max-workers",
+                "2",
+                "--apply",
+            ]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(argv), 0)
+            state_path = artifact_dir / "run_state.json"
+            state = json.loads(state_path.read_text())
+            phases = {phase["name"]: phase for phase in state["phases"]}
+            submit_phase = phases["submit_workers"]
+            submit_phase["status"] = "in_progress"
+            submit_phase["to_submit"] = 2
+            submit_phase["submitted"] = submit_phase["submitted"][:1]
+            submit_phase["submitted_count"] = 1
+            state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRunSession()), self.assertRaisesRegex(SystemExit, "different enqueue settings"):
+                main(argv + ["--region", "us-east-1"])
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "different worker settings"):
+                main(argv + ["--allow-legacy-done-markers"])
+            self.assertEqual(len(batch.submitted), 2)
+
+    def test_run_apply_refuses_ambiguous_worker_submit_resume(self) -> None:
+        class FailingSecondSubmitBatch(FakeSubmitBatch):
+            def submit_job(self, **kwargs):
+                if len(self.submitted) >= 1:
+                    raise RuntimeError("batch submit failed after one worker")
+                return super().submit_job(**kwargs)
+
+        sqs = FakeQueueDepthSQS()
+        batch = FailingSecondSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--apply",
+            ]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(RuntimeError, "batch submit failed"):
+                main(argv)
+            self.assertEqual(len(batch.submitted), 1)
+            state = json.loads((artifact_dir / "run_state.json").read_text())
+            submit_phase = {phase["name"]: phase for phase in state["phases"]}["submit_workers"]
+            self.assertEqual(submit_phase["status"], "needs_review")
+            self.assertEqual(submit_phase["submitted_count"], 1)
+
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "ambiguous worker submission"):
+                main(argv)
+            self.assertEqual(len(batch.submitted), 1)
+
+    def test_run_apply_rejects_unscoped_worker_job_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text(json.dumps({"unit": 0}) + "\n")
+            with self.assertRaisesRegex(SystemExit, "must start with RUN_ID-"):
+                main(
+                    [
+                        "run",
+                        "examples/job.x86.example.json",
+                        "--canary-summary-jsonl",
+                        str(summaries),
+                        "--input-manifest-jsonl",
+                        str(manifest),
+                        "--artifact-dir",
+                        str(root / "artifacts"),
+                        "--queue-url",
+                        "https://sqs.example/q",
+                        "--batch-job-queue",
+                        "jq",
+                        "--job-definition",
+                        "jd",
+                        "--job-name-prefix",
+                        "other-run-worker",
+                        "--apply",
+                    ]
+                )
 
 
 class ConfigTests(unittest.TestCase):

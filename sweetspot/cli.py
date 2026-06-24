@@ -319,62 +319,584 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_run_state(path: Path, *, run_id: str, job_spec_sha256: str | None = None, require_job_spec_sha256: bool = False) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"existing run state at {path} is not valid JSON: {exc}") from exc
+    if not isinstance(state, dict):
+        raise SystemExit(f"existing run state at {path} is not a JSON object")
+    existing_run_id = state.get("run_id")
+    if existing_run_id and existing_run_id != run_id:
+        raise SystemExit(f"existing run state at {path} is for run_id={existing_run_id!r}, not {run_id!r}")
+    existing_hash = state.get("job_spec_sha256")
+    if require_job_spec_sha256 and job_spec_sha256 and not existing_hash:
+        raise SystemExit(f"existing run state at {path} does not record job_spec_sha256; rerun dry-run in a new artifact directory before applying")
+    if job_spec_sha256 and existing_hash and existing_hash != job_spec_sha256:
+        raise SystemExit(f"existing run state at {path} was created for a different JobSpec")
+    return state
+
+
+def _phase_by_name(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    phases = state.get("phases")
+    if not isinstance(phases, list):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for phase in phases:
+        if isinstance(phase, dict) and phase.get("name"):
+            out[str(phase["name"])] = phase
+    return out
+
+
+def _phase_completed(state: dict[str, Any], name: str) -> bool:
+    return _phase_by_name(state).get(name, {}).get("status") == "completed"
+
+
+def _run_state_has_apply_progress(state: dict[str, Any]) -> bool:
+    if not state:
+        return False
+    controller_obj = state.get("controller")
+    controller: dict[str, Any] = controller_obj if isinstance(controller_obj, dict) else {}
+    if state.get("applied") is True or state.get("mode") == "apply" or controller.get("mutations_allowed") is True:
+        return True
+    phases = _phase_by_name(state)
+    for name in ("enqueue_tasks", "submit_workers"):
+        status = phases.get(name, {}).get("status")
+        if status and status != "not_started":
+            return True
+    return False
+
+
+def _write_run_state(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _sha256_json_obj(obj: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _default_run_allowed_s3_prefixes(args: argparse.Namespace, spec: dict[str, Any]) -> list[str]:
+    explicit = getattr(args, "allowed_s3_prefix", None) or _env_allowed_s3_prefixes()
+    if explicit:
+        return list(parse_allowed_s3_prefixes(explicit))
+    input_bucket, input_key = parse_s3_uri(str(spec["input_manifest"]))
+    input_parent = input_key.rsplit("/", 1)[0] if "/" in input_key else ""
+    input_prefix = f"s3://{input_bucket}/{input_parent}" if input_parent else f"s3://{input_bucket}/"
+    return list(parse_allowed_s3_prefixes([input_prefix, str(spec["output_prefix"])]))
+
+
+def _build_run_report(
+    *,
+    spec: dict[str, Any],
+    plan: dict[str, Any],
+    mode: str,
+    applied: bool,
+    status: str,
+    artifacts: dict[str, Any],
+    phases: list[dict[str, Any]],
+    job_spec_sha256: str,
+    controller: dict[str, Any],
+    next_actions: list[str],
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "schema": "sweetspot.run.v1",
+        "run_id": spec["run_id"],
+        "job_spec_sha256": job_spec_sha256,
+        "mode": mode,
+        "applied": applied,
+        "status": status,
+        "controller": controller,
+        "plan": plan,
+        "phases": phases,
+        "next_actions": next_actions,
+    }
+    if artifacts:
+        report["artifacts"] = artifacts
+    return report
+
+
+def _materialize_run_tasks(args: argparse.Namespace, spec: dict[str, Any], plan: dict[str, Any], logical_unit_count: int | None) -> tuple[dict[str, Any], Path | None]:
+    artifacts: dict[str, Any] = {}
+    tasks_path = args.out_production_tasks_jsonl
+    if tasks_path is None and args.artifact_dir and logical_unit_count is not None:
+        decision = plan.get("canaries", [{}])[0].get("decision", {})
+        if isinstance(decision, dict) and isinstance(decision.get("selected_units_per_task"), int):
+            tasks_path = args.artifact_dir / "production_tasks.jsonl"
+    if tasks_path:
+        if not (args.canary_summary_jsonl and args.input_manifest_jsonl):
+            raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
+        _write_production_tasks_from_plan(spec, plan, logical_unit_count, tasks_path)
+        artifacts["production_tasks_jsonl"] = str(tasks_path)
+        artifacts["production_task_count"] = plan.get("artifacts", {}).get("production_task_count")
+        artifacts["production_tasks_sha256"] = _sha256_file(tasks_path)
+    return artifacts, tasks_path
+
+
+def _enqueue_phase_started(previous_state: dict[str, Any]) -> bool:
+    phase = _phase_by_name(previous_state).get("enqueue_tasks", {})
+    status = phase.get("status")
+    sent = int(phase.get("sent", 0) or 0)
+    return bool(status in {"in_progress", "batch_in_flight", "needs_review", "completed"} or sent > 0)
+
+
+def _recorded_run_tasks_artifact(previous_state: dict[str, Any], artifact_dir: Path) -> tuple[dict[str, Any], Path] | None:
+    previous_artifacts = previous_state.get("artifacts") if isinstance(previous_state.get("artifacts"), dict) else {}
+    raw_path = previous_artifacts.get("production_tasks_jsonl") if isinstance(previous_artifacts, dict) else None
+    if not raw_path and not (_enqueue_phase_started(previous_state) or _phase_completed(previous_state, "submit_workers")):
+        return None
+    path = Path(str(raw_path)) if raw_path else artifact_dir / "production_tasks.jsonl"
+    if not path.exists():
+        raise SystemExit(f"existing run state recorded production tasks, but the task artifact is missing: {path}")
+    artifacts: dict[str, Any] = {"production_tasks_jsonl": str(path), "production_task_count": _count_jsonl_objects(path), "production_tasks_sha256": _sha256_file(path)}
+    previous_sha = previous_artifacts.get("production_tasks_sha256") if isinstance(previous_artifacts, dict) else None
+    if previous_sha and previous_sha != artifacts["production_tasks_sha256"]:
+        raise SystemExit(f"production task artifact at {path} no longer matches the SHA256 recorded in run_state.json")
+    return artifacts, path
+
+
+def _cmd_run_apply(
+    args: argparse.Namespace,
+    *,
+    spec: dict[str, Any],
+    plan: dict[str, Any],
+    logical_unit_count: int | None,
+    job_spec_sha256: str,
+) -> dict[str, Any]:
+    if args.artifact_dir is None:
+        raise SystemExit("sweetspot run --apply requires --artifact-dir so run_state.json can make retries/resume safe")
+    if not args.queue_url:
+        raise SystemExit("sweetspot run --apply requires --queue-url or SWEETSPOT_SQS_QUEUE_URL")
+    if not args.batch_job_queue or not args.job_definition:
+        raise SystemExit("sweetspot run --apply requires --batch-job-queue and --job-definition")
+    try:
+        validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    args.artifact_dir.mkdir(parents=True, exist_ok=True)
+    state_path = args.artifact_dir / "run_state.json"
+    previous_state = _load_run_state(state_path, run_id=str(spec["run_id"]), job_spec_sha256=job_spec_sha256, require_job_spec_sha256=True)
+    recorded_tasks = _recorded_run_tasks_artifact(previous_state, args.artifact_dir)
+    if recorded_tasks is not None:
+        previous_plan = previous_state.get("plan")
+        if not isinstance(previous_plan, dict):
+            raise SystemExit("existing run_state.json records production tasks but no reviewed plan; use a new artifact directory")
+        plan = previous_plan
+        artifacts, tasks_path = recorded_tasks
+    else:
+        artifacts, materialized_tasks_path = _materialize_run_tasks(args, spec, plan, logical_unit_count)
+        if materialized_tasks_path is None:
+            raise SystemExit("sweetspot run --apply requires calibrated production tasks; pass --canary-summary-jsonl and --input-manifest-jsonl")
+        tasks_path = materialized_tasks_path
+    artifacts["run_state_json"] = str(state_path)
+    tasks = _read_jsonl(tasks_path)
+    run_id = str(spec["run_id"])
+    job_name_prefix = args.job_name_prefix or f"{run_id}-worker"
+    if not job_name_prefix.startswith(f"{run_id}-"):
+        raise SystemExit("sweetspot run --job-name-prefix must start with RUN_ID- for run-scoped worker management")
+    allowed_s3_prefixes = _default_run_allowed_s3_prefixes(args, spec)
+    _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=allowed_s3_prefixes)
+    enqueue_config_sha256 = _sha256_json_obj(
+        {
+            "allowed_s3_prefixes": allowed_s3_prefixes,
+            "profile": args.profile,
+            "queue_url": args.queue_url,
+            "region": args.region,
+        }
+    )
+    worker_config_sha256 = _sha256_json_obj(
+        {
+            "allow_legacy_done_markers": bool(getattr(args, "allow_legacy_done_markers", False)),
+            "allowed_s3_prefixes": allowed_s3_prefixes,
+            "batch_job_queue": args.batch_job_queue,
+            "env": args.env or [],
+            "heartbeat_seconds": args.heartbeat_seconds,
+            "include_not_visible": args.include_not_visible,
+            "job_definition": args.job_definition,
+            "job_name_prefix": job_name_prefix,
+            "log_tail_bytes": args.log_tail_bytes,
+            "max_log_bytes": args.max_log_bytes,
+            "max_workers": args.max_workers,
+            "memory": args.memory,
+            "messages_per_worker": args.messages_per_worker,
+            "min_workers": args.min_workers,
+            "profile": args.profile,
+            "queue_url": args.queue_url,
+            "redact_regex": args.redact_regex or [],
+            "region": args.region,
+            "retry_attempts": args.retry_attempts,
+            "subtract_active": args.subtract_active,
+            "task_timeout_seconds": args.task_timeout_seconds,
+            "vcpus": args.vcpus,
+            "visibility_timeout": args.visibility_timeout,
+            "wait_for_visible_min": args.wait_for_visible_min,
+            "wait_for_visible_seconds": args.wait_for_visible_seconds,
+            "wait_interval_seconds": args.wait_interval_seconds,
+        }
+    )
+
+    previous_phases = _phase_by_name(previous_state)
+    phases: list[dict[str, Any]] = [
+        {"name": "plan", "status": "completed"},
+        {
+            "name": "materialize_production_tasks",
+            "status": "completed",
+            "artifact": str(tasks_path),
+            "task_count": len(tasks),
+        },
+        previous_phases.get("enqueue_tasks", {"name": "enqueue_tasks", "status": "not_started"}),
+        previous_phases.get("submit_workers", {"name": "submit_workers", "status": "not_started"}),
+        previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
+    ]
+    report = _build_run_report(
+        spec=spec,
+        plan=plan,
+        mode="apply",
+        applied=True,
+        status="apply_started",
+        artifacts=artifacts,
+        phases=phases,
+        job_spec_sha256=job_spec_sha256,
+        controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+        next_actions=["Persisted run_state.json before mutation; rerun the same command to resume without re-enqueueing completed phases."],
+    )
+    _write_run_state(state_path, report)
+
+    sqs = _aws_client(args, "sqs")
+    batch = _aws_client(args, "batch")
+    previous_enqueue_phase = previous_phases.get("enqueue_tasks", {})
+    previous_enqueue_status = previous_enqueue_phase.get("status")
+    if _enqueue_phase_started(previous_state):
+        if previous_enqueue_phase.get("queue_url") and previous_enqueue_phase.get("queue_url") != args.queue_url:
+            raise SystemExit("existing run_state.json enqueue progress uses a different queue_url; use the original queue or a new artifact directory")
+        if previous_enqueue_phase.get("enqueue_config_sha256") and previous_enqueue_phase.get("enqueue_config_sha256") != enqueue_config_sha256:
+            raise SystemExit("existing run_state.json enqueue progress uses different enqueue settings; use the original settings or a new artifact directory")
+    if previous_enqueue_status in {"batch_in_flight", "needs_review"}:
+        raise SystemExit("existing run_state.json has ambiguous enqueue progress; review SQS/task state before retrying to avoid duplicate messages")
+    sent = int(previous_enqueue_phase.get("sent", 0) or 0)
+    if sent < 0 or sent > len(tasks):
+        raise SystemExit("existing run_state.json has invalid enqueue sent count")
+
+    def persist_enqueue_phase(phase: dict[str, Any], *, report_status: str, next_actions: list[str]) -> None:
+        progress_report = _build_run_report(
+            spec=spec,
+            plan=plan,
+            mode="apply",
+            applied=True,
+            status=report_status,
+            artifacts=artifacts,
+            phases=[
+                {"name": "plan", "status": "completed"},
+                {"name": "materialize_production_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks)},
+                phase,
+                previous_phases.get("submit_workers", {"name": "submit_workers", "status": "not_started"}),
+                previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
+            ],
+            job_spec_sha256=job_spec_sha256,
+            controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+            next_actions=next_actions,
+        )
+        _write_run_state(state_path, progress_report)
+
+    enqueue_phase: dict[str, Any]
+    if _phase_completed(previous_state, "enqueue_tasks"):
+        enqueue_phase = dict(previous_phases["enqueue_tasks"])
+        enqueue_phase["resumed"] = True
+    else:
+        enqueue_phase = {
+            "name": "enqueue_tasks",
+            "status": "in_progress" if sent < len(tasks) else "completed",
+            "queue_url": args.queue_url,
+            "task_count": len(tasks),
+            "sent": sent,
+            "next_task_index": sent,
+            "remaining": len(tasks) - sent,
+            "allowed_s3_prefixes": allowed_s3_prefixes,
+            "enqueue_config_sha256": enqueue_config_sha256,
+        }
+        persist_enqueue_phase(enqueue_phase, report_status="enqueue_in_progress", next_actions=["Task enqueue is in progress; rerun the same command to resume from the recorded sent index if this controller stops."])
+        while sent < len(tasks):
+            batch_start = sent
+            task_batch = tasks[batch_start : batch_start + 10]
+            in_flight_phase = {
+                **enqueue_phase,
+                "status": "batch_in_flight",
+                "sent": sent,
+                "next_task_index": sent,
+                "remaining": len(tasks) - sent,
+                "in_flight_start_index": batch_start,
+                "in_flight_count": len(task_batch),
+            }
+            persist_enqueue_phase(
+                in_flight_phase,
+                report_status="enqueue_batch_in_flight",
+                next_actions=["A task-message batch may have reached SQS; if this controller stops here, review SQS/task state before retrying."],
+            )
+            entries = [{"Id": str(batch_start + i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(task_batch)]
+            resp = sqs.send_message_batch(QueueUrl=args.queue_url, Entries=entries)
+            if resp.get("Failed"):
+                review_phase = {
+                    **in_flight_phase,
+                    "status": "needs_review",
+                    "failed": resp.get("Failed"),
+                    "successful": resp.get("Successful", []),
+                }
+                persist_enqueue_phase(review_phase, report_status="enqueue_needs_review", next_actions=["SQS accepted only part of a task-message batch; review queue/task state before retrying."])
+                raise SystemExit(f"send_message_batch failed: {resp['Failed']}")
+            sent += len(resp.get("Successful", []))
+            enqueue_phase = {
+                "name": "enqueue_tasks",
+                "status": "in_progress" if sent < len(tasks) else "completed",
+                "queue_url": args.queue_url,
+                "task_count": len(tasks),
+                "sent": sent,
+                "next_task_index": sent,
+                "remaining": len(tasks) - sent,
+                "allowed_s3_prefixes": allowed_s3_prefixes,
+                "enqueue_config_sha256": enqueue_config_sha256,
+            }
+            persist_enqueue_phase(
+                enqueue_phase,
+                report_status="tasks_enqueued" if sent == len(tasks) else "enqueue_in_progress",
+                next_actions=["Tasks have been enqueued; rerun the same command to resume worker submission if this controller stops."]
+                if sent == len(tasks)
+                else ["Task enqueue is in progress; rerun the same command to resume from the recorded sent index if this controller stops."],
+            )
+
+    depth = queue_depth(sqs, args.queue_url)
+    wait_history: list[dict[str, Any]] = []
+    if sent and not _phase_completed(previous_state, "enqueue_tasks"):
+        min_visible = args.wait_for_visible_min if args.wait_for_visible_min is not None else depth["visible"]
+        depth, wait_history = _wait_for_visible_backlog(
+            sqs,
+            queue_url=args.queue_url,
+            min_visible=min_visible,
+            max_seconds=args.wait_for_visible_seconds,
+            interval_seconds=args.wait_interval_seconds,
+        )
+
+    def persist_submit_phase(phase: dict[str, Any], *, report_status: str, next_actions: list[str]) -> None:
+        progress_report = _build_run_report(
+            spec=spec,
+            plan=plan,
+            mode="apply",
+            applied=True,
+            status=report_status,
+            artifacts=artifacts,
+            phases=[
+                {"name": "plan", "status": "completed"},
+                {"name": "materialize_production_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks)},
+                enqueue_phase,
+                phase,
+                previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
+            ],
+            job_spec_sha256=job_spec_sha256,
+            controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+            next_actions=next_actions,
+        )
+        _write_run_state(state_path, progress_report)
+
+    submit_phase: dict[str, Any]
+    previous_submit_phase = previous_phases.get("submit_workers", {})
+    previous_submit_status = previous_submit_phase.get("status")
+    if previous_submit_status in {"in_progress", "job_in_flight", "needs_review", "completed"}:
+        if previous_submit_phase.get("worker_config_sha256") and previous_submit_phase.get("worker_config_sha256") != worker_config_sha256:
+            raise SystemExit("existing run_state.json worker submission progress uses different worker settings; use the original settings or a new artifact directory")
+        if previous_submit_phase.get("queue_url") and previous_submit_phase.get("queue_url") != args.queue_url:
+            raise SystemExit("existing run_state.json worker submission progress uses a different queue_url; use the original queue or a new artifact directory")
+        if previous_submit_phase.get("batch_job_queue") and previous_submit_phase.get("batch_job_queue") != args.batch_job_queue:
+            raise SystemExit("existing run_state.json worker submission progress uses a different Batch job queue; use the original queue or a new artifact directory")
+        if previous_submit_phase.get("job_definition") and previous_submit_phase.get("job_definition") != args.job_definition:
+            raise SystemExit("existing run_state.json worker submission progress uses a different job definition; use the original job definition or a new artifact directory")
+    if previous_submit_status in {"job_in_flight", "needs_review"}:
+        raise SystemExit("existing run_state.json has ambiguous worker submission progress; review Batch jobs before retrying to avoid duplicate workers")
+    if _phase_completed(previous_state, "submit_workers"):
+        submit_phase = dict(previous_phases["submit_workers"])
+        submit_phase["resumed"] = True
+    else:
+        if previous_submit_status == "in_progress":
+            submitted = list(previous_submit_phase.get("submitted", []))
+            to_submit = int(previous_submit_phase.get("to_submit", len(submitted)) or 0)
+            raw_desired = int(previous_submit_phase.get("raw_desired_workers", to_submit) or 0)
+            active_count = int(previous_submit_phase.get("active_matching_workers", 0) or 0)
+            active_examples = previous_submit_phase.get("active_examples", []) if isinstance(previous_submit_phase.get("active_examples"), list) else []
+            backlog = int(previous_submit_phase.get("backlog_used_for_sizing", 0) or 0)
+            submission_stamp = str(previous_submit_phase.get("submission_stamp") or utc_stamp())
+        else:
+            submitted = []
+            # SQS depth is queue-global and may include other runs. The high-level
+            # run controller only owns messages it just enqueued (or recorded as
+            # enqueued), so size this initial wave from the run-scoped sent count.
+            backlog = sent
+            raw_desired = desired_worker_count(backlog, args.messages_per_worker, args.min_workers, args.max_workers)
+            active = active_jobs(batch, args.batch_job_queue, job_name_prefix) if args.subtract_active else []
+            active_count = len(active)
+            active_examples = active[:20]
+            to_submit = max(0, raw_desired - active_count) if args.subtract_active else raw_desired
+            to_submit = min(to_submit, args.max_workers)
+            submission_stamp = utc_stamp()
+        if len(submitted) > to_submit:
+            raise SystemExit("existing run_state.json has invalid worker submission progress")
+        overrides = _worker_overrides(
+            sqs_queue_url=args.queue_url,
+            messages_per_worker=args.messages_per_worker,
+            visibility_timeout=args.visibility_timeout,
+            heartbeat_seconds=args.heartbeat_seconds,
+            task_timeout_seconds=args.task_timeout_seconds,
+            env=args.env or [],
+            allowed_s3_prefixes=allowed_s3_prefixes,
+            log_tail_bytes=args.log_tail_bytes,
+            max_log_bytes=args.max_log_bytes,
+            redact_regexes=args.redact_regex or [],
+            allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+            vcpus=args.vcpus,
+            memory=args.memory,
+        )
+        submit_phase = {
+            "name": "submit_workers",
+            "status": "in_progress" if len(submitted) < to_submit else "completed",
+            "batch_job_queue": args.batch_job_queue,
+            "job_definition": args.job_definition,
+            "job_name_prefix": job_name_prefix,
+            "queue_url": args.queue_url,
+            "worker_config_sha256": worker_config_sha256,
+            "submission_stamp": submission_stamp,
+            "queue_depth": depth,
+            "wait_history": wait_history,
+            "backlog_used_for_sizing": backlog,
+            "messages_per_worker": args.messages_per_worker,
+            "raw_desired_workers": raw_desired,
+            "active_matching_workers": active_count,
+            "to_submit": to_submit,
+            "submitted_count": len(submitted),
+            "submitted": submitted,
+            "active_examples": active_examples,
+        }
+        persist_submit_phase(
+            submit_phase, report_status="worker_submit_in_progress", next_actions=["Worker submission is in progress; rerun the same command to resume from the recorded submitted count if this controller stops."]
+        )
+        while len(submitted) < to_submit:
+            worker_index = len(submitted)
+            job_name = f"{job_name_prefix}-{submission_stamp}-{worker_index:04d}"
+            in_flight_phase = {
+                **submit_phase,
+                "status": "job_in_flight",
+                "submitted_count": len(submitted),
+                "submitted": submitted,
+                "in_flight_worker_index": worker_index,
+                "in_flight_job_name": job_name,
+            }
+            persist_submit_phase(
+                in_flight_phase,
+                report_status="worker_submit_job_in_flight",
+                next_actions=["A worker submit_job call may have reached Batch; if this controller stops here, review Batch jobs before retrying."],
+            )
+            kwargs: dict[str, Any] = {
+                "jobName": job_name,
+                "jobQueue": args.batch_job_queue,
+                "jobDefinition": args.job_definition,
+                "containerOverrides": overrides,
+            }
+            if args.retry_attempts is not None:
+                kwargs["retryStrategy"] = {"attempts": args.retry_attempts}
+            try:
+                resp = batch.submit_job(**kwargs)
+            except Exception as exc:
+                review_phase = {**in_flight_phase, "status": "needs_review", "submit_error": str(exc)}
+                persist_submit_phase(review_phase, report_status="worker_submit_needs_review", next_actions=["A Batch submit_job call failed or is ambiguous; review Batch jobs before retrying."])
+                raise
+            submitted.append({"jobName": job_name, "jobId": resp.get("jobId"), "jobArn": resp.get("jobArn")})
+            submit_phase = {
+                **submit_phase,
+                "status": "in_progress" if len(submitted) < to_submit else "completed",
+                "submitted_count": len(submitted),
+                "submitted": submitted,
+            }
+            persist_submit_phase(
+                submit_phase,
+                report_status="workers_submitted" if len(submitted) == to_submit else "worker_submit_in_progress",
+                next_actions=["Workers have been submitted; use status/finalize/repair commands to continue the run lifecycle."]
+                if len(submitted) == to_submit
+                else ["Worker submission is in progress; rerun the same command to resume from the recorded submitted count if this controller stops."],
+            )
+
+    phases = [
+        {"name": "plan", "status": "completed"},
+        {"name": "materialize_production_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks)},
+        enqueue_phase,
+        submit_phase,
+        previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
+    ]
+    report = _build_run_report(
+        spec=spec,
+        plan=plan,
+        mode="apply",
+        applied=True,
+        status="workers_submitted",
+        artifacts=artifacts,
+        phases=phases,
+        job_spec_sha256=job_spec_sha256,
+        controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+        next_actions=[
+            f"Use `sweetspot status {run_id} --artifact-dir {args.artifact_dir}` to watch local/run-scoped state.",
+            "After workers finish, run `sweetspot finalize` or `sweetspot repair` with the persisted production_tasks.jsonl if repair is needed.",
+        ],
+    )
+    _write_run_state(state_path, report)
+    return report
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.apply:
-        raise SystemExit("sweetspot run --apply is not implemented yet; run without --apply to produce a reviewable dry-run plan")
     try:
         spec = load_job_spec(args.job_spec)
+        job_spec_sha256 = _sha256_file(args.job_spec)
         plan, logical_unit_count = _plan_from_optional_adaptive_inputs(
             spec,
             canary_summary_jsonl=args.canary_summary_jsonl,
             input_manifest_jsonl=args.input_manifest_jsonl,
         )
-        artifacts: dict[str, Any] = {}
-        tasks_path = args.out_production_tasks_jsonl
-        if tasks_path is None and args.artifact_dir and logical_unit_count is not None:
-            decision = plan.get("canaries", [{}])[0].get("decision", {})
-            if isinstance(decision, dict) and isinstance(decision.get("selected_units_per_task"), int):
-                tasks_path = args.artifact_dir / "production_tasks.jsonl"
-        if tasks_path:
-            if not (args.canary_summary_jsonl and args.input_manifest_jsonl):
-                raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
-            _write_production_tasks_from_plan(spec, plan, logical_unit_count, tasks_path)
-            artifacts["production_tasks_jsonl"] = str(tasks_path)
-            artifacts["production_task_count"] = plan.get("artifacts", {}).get("production_task_count")
-        report: dict[str, Any] = {
-            "schema": "sweetspot.run.v1",
-            "run_id": spec["run_id"],
-            "mode": "dry_run",
-            "applied": False,
-            "status": "dry_run_complete",
-            "controller": {
-                "apply_supported": False,
-                "mutations_allowed": False,
-            },
-            "plan": plan,
-            "phases": [
-                {"name": "plan", "status": "completed"},
-                {
-                    "name": "materialize_production_tasks",
-                    "status": "completed" if "production_tasks_jsonl" in artifacts else "skipped",
-                    "artifact": artifacts.get("production_tasks_jsonl"),
-                },
-                {"name": "enqueue_tasks", "status": "not_started", "requires_apply": True},
-                {"name": "submit_workers", "status": "not_started", "requires_apply": True},
-                {"name": "finalize", "status": "not_started", "requires_apply": True},
-            ],
-            "next_actions": [
-                "Review the JSON plan and any local production task artifact before mutation.",
-                "Use advanced enqueue/finalize commands for execution until sweetspot run --apply is implemented.",
-            ],
-        }
-        if artifacts:
-            report["artifacts"] = artifacts
-        if args.artifact_dir:
-            args.artifact_dir.mkdir(parents=True, exist_ok=True)
-            state_path = args.artifact_dir / "run_state.json"
-            report.setdefault("artifacts", {})["run_state_json"] = str(state_path)
-            state_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if args.apply:
+            report = _cmd_run_apply(args, spec=spec, plan=plan, logical_unit_count=logical_unit_count, job_spec_sha256=job_spec_sha256)
+        else:
+            if args.artifact_dir:
+                state_path = args.artifact_dir / "run_state.json"
+                previous_state = _load_run_state(state_path, run_id=str(spec["run_id"]), job_spec_sha256=job_spec_sha256)
+                if _run_state_has_apply_progress(previous_state):
+                    raise SystemExit("sweetspot run dry-run refuses to overwrite existing apply/resume state; use a new --artifact-dir")
+            artifacts, _tasks_path = _materialize_run_tasks(args, spec, plan, logical_unit_count)
+            report = _build_run_report(
+                spec=spec,
+                plan=plan,
+                mode="dry_run",
+                applied=False,
+                status="dry_run_complete",
+                artifacts=artifacts,
+                phases=[
+                    {"name": "plan", "status": "completed"},
+                    {
+                        "name": "materialize_production_tasks",
+                        "status": "completed" if "production_tasks_jsonl" in artifacts else "skipped",
+                        "artifact": artifacts.get("production_tasks_jsonl"),
+                    },
+                    {"name": "enqueue_tasks", "status": "not_started", "requires_apply": True},
+                    {"name": "submit_workers", "status": "not_started", "requires_apply": True},
+                    {"name": "finalize", "status": "not_started", "requires_apply": True},
+                ],
+                job_spec_sha256=job_spec_sha256,
+                controller={"apply_supported": False, "mutations_allowed": False},
+                next_actions=[
+                    "Review the JSON plan and any local production task artifact before mutation.",
+                    "Rerun with --apply plus queue and Batch worker settings to enqueue tasks and submit workers.",
+                ],
+            )
+            if args.artifact_dir:
+                args.artifact_dir.mkdir(parents=True, exist_ok=True)
+                state_path = args.artifact_dir / "run_state.json"
+                report.setdefault("artifacts", {})["run_state_json"] = str(state_path)
+                _write_run_state(state_path, report)
     except PlannerSpecError as exc:
         raise SystemExit(str(exc)) from exc
     except ValueError as exc:
@@ -2800,7 +3322,39 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "worker_job_name_prefix",
     },
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
-    "run": {"apply", "artifact_dir", "canary_summary_jsonl", "input_manifest_jsonl", "out_production_tasks_jsonl"},
+    "run": {
+        "allowed_s3_prefix",
+        "apply",
+        "artifact_dir",
+        "batch_job_queue",
+        "canary_summary_jsonl",
+        "env",
+        "heartbeat_seconds",
+        "include_not_visible",
+        "input_manifest_jsonl",
+        "job_definition",
+        "job_name_prefix",
+        "log_tail_bytes",
+        "max_log_bytes",
+        "max_workers",
+        "memory",
+        "messages_per_worker",
+        "min_workers",
+        "out_production_tasks_jsonl",
+        "profile",
+        "queue_url",
+        "redact_regex",
+        "region",
+        "retry_attempts",
+        "sqs_queue_url",
+        "subtract_active",
+        "task_timeout_seconds",
+        "vcpus",
+        "visibility_timeout",
+        "wait_for_visible_min",
+        "wait_for_visible_seconds",
+        "wait_interval_seconds",
+    },
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
     "status": {"artifact_dir", "dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
     "submit-workers": {
@@ -3049,15 +3603,26 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "run",
-        help="Build a dry-run controller report for a SweetSpot JobSpec without mutating AWS resources",
-        examples="  sweetspot run examples/job.x86.example.json\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1",
+        help="Dry-run or apply a run controller for a SweetSpot JobSpec",
+        examples="  sweetspot run examples/job.x86.example.json\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1 --queue-url https://sqs... --batch-job-queue jq --job-definition jd --apply",
     )
     p.add_argument("job_spec", type=Path, help="Path to a sweetspot.job.v1 JSON JobSpec")
+    p.add_argument("--profile")
+    p.add_argument("--region")
     p.add_argument("--canary-summary-jsonl", type=Path, help="Optional local JSONL of canary worker summaries or normalized observations for adaptive shard sizing")
     p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units for calibrated task materialization")
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL")
     p.add_argument("--artifact-dir", type=Path, help="Optional local directory for run_state.json and default production task artifacts")
-    p.add_argument("--apply", action="store_true", help="Reserved for future AWS orchestration; currently rejected so dry-run remains safe")
+    p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL"), help="SQS queue URL for --apply")
+    p.add_argument("--batch-job-queue", help="AWS Batch job queue for worker submissions during --apply")
+    p.add_argument("--job-definition", help="AWS Batch job definition for worker submissions during --apply")
+    p.add_argument("--job-name-prefix", help="Run-scoped Batch worker name prefix; defaults to RUN_ID-worker and must start with RUN_ID-")
+    _add_worker_sizing_args(p)
+    _add_worker_runtime_args(p, legacy_done_markers_help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to submitted workers")
+    p.add_argument("--wait-for-visible-min", type=int, help="minimum visible messages before submitting workers; default uses observed queue depth")
+    p.add_argument("--wait-for-visible-seconds", type=float, default=0.0)
+    p.add_argument("--wait-interval-seconds", type=float, default=1.0)
+    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit workers once, and persist run_state.json")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)
