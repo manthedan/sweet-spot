@@ -25,6 +25,7 @@ All notable changes to this project are documented here. This project uses human
 - Opt-in `--format table` output for read-oriented operator commands: `jobs`, `describe-job`, `logs`, `watch-job`, `doctor`, and `dlq`.
 - `sweetspot finalize --dry-run` for previewing upload/READY targets while skipping S3 mutations.
 - Guarded `sweetspot cancel-jobs` command with dry-run default, `--apply`, and explicit `--terminate-running` for active Batch jobs.
+- Mixed-architecture cost guidance, including opt-in ARM/Graviton scouting docs, per-lane lane-manager instance type overrides, and a mixed x86/ARM lane example.
 
 ### Fixed
 

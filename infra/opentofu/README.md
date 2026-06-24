@@ -40,6 +40,7 @@ tofu apply -var-file=example.tfvars
 ## Notes
 
 - Default Spot allocation strategy is `SPOT_PRICE_CAPACITY_OPTIMIZED`.
+- Default Spot instance types are x86-only for workload compatibility. To evaluate ARM/Graviton savings, run `sweetspot scout --preset mixed --observed-summaries ...`, then opt into ARM only after a canary proves the worker image and native dependencies are compatible.
 - The committed `.terraform.lock.hcl` is part of the reproducibility contract; CI runs `tofu init -lockfile=readonly`, `tofu fmt`, and `tofu validate`.
 - For production, pass explicit private `subnet_ids` and set `require_explicit_subnets = true` so the module does not silently use every subnet in the selected/default VPC.
 - If `security_group_ids` is empty, the module creates a dedicated no-ingress security group. Set `create_no_ingress_security_group = false` only when intentionally falling back to the VPC default security group.
@@ -54,3 +55,16 @@ tofu apply -var-file=example.tfvars
 - Attempt-scoped outputs/logs/summaries make duplicate attempts safe but can grow quickly under interruptions. Add bucket lifecycle rules for run prefixes (for example, retain canonical manifests/done markers longer than `*.attempts/*` objects) and document the retention window for reproducibility.
 - For S3 buckets with versioning enabled, pair run prefixes with lifecycle rules that expire noncurrent versions/delete markers, or use `sweetspot s3-delete-prefix --include-versions` for explicit teardown. Deleting current objects only is not a complete cost cleanup on versioned buckets.
 - Automatic teardown guidance: set low `max_vcpus_*` for tests, keep `monthly_budget_limit_usd` nonzero, tag every run prefix, finalize/repair before deleting SQS messages, run version-aware S3 cleanup, then `tofu destroy` idle stacks rather than leaving Batch queues and log/storage resources behind.
+
+## Opt-in ARM / Graviton lanes
+
+ARM is not the module default because many user workloads or container images are x86-only. When a canary proves ARM compatibility, deploy a separate ARM-oriented stack or queue by overriding `spot_instance_types`:
+
+```hcl
+spot_instance_types = [
+  "c7g.large", "c7g.xlarge", "c7g.2xlarge",
+  "m7g.large", "m7g.xlarge", "m7g.2xlarge",
+]
+```
+
+For mixed x86/ARM operations, prefer separate Batch queues and job definitions per architecture, then model them as separate `sweetspot lane-manager` lanes with per-lane `instance_types`. Only place x86 and ARM types in the same Batch compute environment when the worker image is verified multi-arch and all native dependencies work on both architectures.

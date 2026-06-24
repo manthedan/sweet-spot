@@ -54,7 +54,7 @@ Read-only Spot pool ranking tool. Does not submit jobs or mutate resources. Pref
 
 ```bash
 sweetspot scout \
-  --preset x86 \
+  --preset mixed \
   --regions us-west-2 us-east-2 eu-north-1 \
   --target-vcpus 256 512 \
   --bucket my-data-bucket \
@@ -66,7 +66,7 @@ sweetspot scout \
 ```
 
 Key arguments:
-- `--preset x86|arm|mixed`: Instance type preset to evaluate
+- `--preset x86|arm|mixed`: Instance type preset to evaluate. The CLI default remains `x86` for compatibility safety; use `mixed` during scouting to surface ARM/Graviton savings before deciding whether to opt in.
   - `x86`: c5/c5a/c6i/c6a/c7i/c7a/c8i/c8a/m5/m5a/m6i/m6a/m7i/m7a/m8i/m8a families
   - `arm`: c6g/c7g/c8g/m6g/m7g/m8g families (Graviton)
 - `--regions`: AWS regions to evaluate, repeatable
@@ -104,16 +104,33 @@ Lane config format:
       "memory": 4096,
       "min_placement_score": 7,
       "expected_total_cost_per_1m_units": 0.42
+    },
+    {
+      "name": "us-west-2-arm",
+      "region": "us-west-2",
+      "instance_types": ["c7g.large", "m7g.large"],
+      "batch_job_queue": "arn:aws:batch:us-west-2:123456789012:job-queue/sweetspot-arm-spot-queue",
+      "job_definition": "arn:aws:batch:us-west-2:123456789012:job-definition/sweetspot-worker-arm64:1",
+      "job_name_prefix": "my-run-arm-worker",
+      "max_workers": 64,
+      "messages_per_worker": 4,
+      "vcpus": 2,
+      "memory": 4096,
+      "min_placement_score": 7,
+      "expected_total_cost_per_1m_units": 0.32
     }
   ]
 }
 ```
+
+Use top-level `instance_types` for homogeneous lane files. In mixed-architecture configs, set per-lane `instance_types` so placement-score checks match each Batch queue's real x86 or ARM capacity pool.
 
 Lane fields:
 - `name`: Lane identifier for reporting
 - `region`: AWS region for this lane
 - `batch_job_queue`: Batch job queue ARN
 - `job_definition`: Batch job definition ARN (with revision)
+- `instance_types`: Optional per-lane placement-score instance list; use this for separate x86/ARM lanes
 - `job_name_prefix`: Prefix for submitted job names
 - `max_workers`: Maximum concurrent workers in this lane
 - `messages_per_worker`: SQS messages per worker (optional)
@@ -159,17 +176,20 @@ Use for workloads that require x86-compatible binaries or have not been tested o
 
 ### arm preset (Graviton)
 Use for workloads that are ARM-compatible or container-based:
-- Graviton instances are typically 20-40% cheaper than equivalent x86
+- Graviton instances are often materially cheaper than equivalent x86 for CPU-heavy retryable work
 - c6g/c7g/c8g, m6g/m7g/m8g families
 - Test with a canary first; some libraries have ARM-specific issues
+- Keep ARM opt-in: if compatibility is unknown, scout with `mixed` but deploy x86 until an ARM canary passes
+- Prefer separate x86 and ARM lanes/Batch queues unless the image is verified multi-arch and dependencies are architecture-neutral
 
 ## Cost optimization tips
 
 1. **Use observed telemetry**: Pass `--observed-summaries` from prior runs. Without telemetry, scout falls back to price-only ranking which overvalues cheap-but-unreliable pools.
 2. **Cross-region is viable**: Multi-region lanes can dramatically reduce cost if transfer costs are low relative to compute savings.
-3. **Placement scores matter**: A cheap pool with placement score 2 will waste time on `STARTING`/`RUNNABLE` stalls. Use `min_placement_score` of 6-7 in production.
-4. **Startup overhead dominates short tasks**: For tasks under 5 minutes, startup overhead (container pull, SQS poll) is a significant fraction of total cost. Batch more work per task.
-5. **Replay fraction from Spot interruptions**: If 10% of tasks are interrupted and fully replayed, effective cost is 11% higher than Spot price alone suggests.
+3. **Check ARM explicitly**: Run `--preset mixed` to see whether Graviton pools are cheaper for your telemetry, then promote ARM lanes only after a compatibility canary.
+4. **Placement scores matter**: A cheap pool with placement score 2 will waste time on `STARTING`/`RUNNABLE` stalls. Use `min_placement_score` of 6-7 in production.
+5. **Startup overhead dominates short tasks**: For tasks under 5 minutes, startup overhead (container pull, SQS poll) is a significant fraction of total cost. Batch more work per task.
+6. **Replay fraction from Spot interruptions**: If 10% of tasks are interrupted and fully replayed, effective cost is 11% higher than Spot price alone suggests.
 
 ## Common pitfalls
 
