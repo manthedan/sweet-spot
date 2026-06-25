@@ -10,6 +10,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(choose_worker_top_up(backlog=100, active_workers=0, target_workers=8), 8)
         self.assertEqual(choose_worker_top_up(backlog=100, active_workers=5, target_workers=8), 3)
         self.assertEqual(choose_worker_top_up(backlog=100, active_workers=9, target_workers=8), 0)
+        self.assertEqual(choose_worker_top_up(backlog=1, active_workers=0, target_workers=8), 1)
+        self.assertEqual(choose_worker_top_up(backlog=1, active_workers=1, target_workers=8), 0)
         self.assertEqual(choose_worker_top_up(backlog=0, active_workers=0, target_workers=8), 0)
 
     def test_group_canary_tasks_by_candidate_requires_routing_metadata(self) -> None:

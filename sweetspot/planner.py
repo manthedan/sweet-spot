@@ -228,17 +228,22 @@ def _populate_ready_plan_from_selection(
             }
         ]
         return
-    # Conservative portable fallback for EC2 Batch Spot planning. Account-specific
-    # prices can refine this later, but the formula is shared with Scout so Plan
-    # and Scout reason about the same replay/startup/non-compute components.
-    assumed_vcpu_hour_usd = 0.05
+    telemetry_vcpu_hour_usd = selected.get("vcpu_hour_usd")
+    telemetry_vcpu_hour_value = float(telemetry_vcpu_hour_usd) if isinstance(telemetry_vcpu_hour_usd, int | float) and not isinstance(telemetry_vcpu_hour_usd, bool) else None
+    has_pricing_evidence = telemetry_vcpu_hour_value is not None and math.isfinite(telemetry_vcpu_hour_value) and telemetry_vcpu_hour_value > 0
+    assumed_vcpu_hour_usd = telemetry_vcpu_hour_value if has_pricing_evidence and telemetry_vcpu_hour_value is not None else 0.05
+    replay_fraction = float(selected.get("replay_fraction") or 0.0)
+    startup_overhead_seconds = float(selected.get("startup_overhead_seconds") or 0.0)
+    cost_confidence = "telemetry_price_replay_placement" if has_pricing_evidence else "price_defaulted"
     cost_estimate = estimate_worker_shape_cost(
         total_units=target_units,
         units_per_second_per_worker=rate,
         worker_vcpus=vcpus,
         vcpu_hour_usd=assumed_vcpu_hour_usd,
+        replay_fraction=replay_fraction,
+        startup_overhead_seconds=startup_overhead_seconds,
         useful_task_seconds=target_task_seconds,
-        confidence="price_defaulted",
+        confidence=cost_confidence,
     )
     expected_cost_usd = cost_estimate.expected_cost_usd
     if expected_cost_usd > float(constraints["max_cost_usd"]):
@@ -256,13 +261,24 @@ def _populate_ready_plan_from_selection(
             "code": "resource_shape_selected",
             "severity": "info",
             "message": PLAN_REASON_CODES["resource_shape_selected"],
-        },
-        {
-            "code": "using_conservative_defaults",
-            "severity": "info",
-            "message": "Expected cost uses a conservative default vCPU-hour price until account-specific price telemetry is wired into the planner.",
-        },
+        }
     ]
+    if has_pricing_evidence:
+        plan["reasons"].append(
+            {
+                "code": "resource_shape_selected",
+                "severity": "info",
+                "message": "Expected cost uses canary telemetry for price, replay, startup, and placement evidence.",
+            }
+        )
+    else:
+        plan["reasons"].append(
+            {
+                "code": "using_conservative_defaults",
+                "severity": "info",
+                "message": "Expected cost uses a conservative default vCPU-hour price until account-specific price telemetry is wired into the planner.",
+            }
+        )
     task_timeout_seconds = max(1.0, min(39600.0, math.ceil(target_task_seconds * 2.0)))
     visibility_timeout_seconds = max(task_timeout_seconds + 60.0, min(43200.0, math.ceil(task_timeout_seconds * 1.5)))
     heartbeat_seconds = max(1.0, min(300.0, math.floor(visibility_timeout_seconds / 3.0)))
@@ -285,11 +301,14 @@ def _populate_ready_plan_from_selection(
         "vcpu_seconds_per_unit": selected["vcpu_seconds_per_unit"],
         "cost_model": {
             "schema": "sweetspot.cost_model.v1",
-            "source": "shared_scout_planner_model",
+            "source": "canary_telemetry" if has_pricing_evidence else "shared_scout_planner_model",
             "assumed_vcpu_hour_usd": assumed_vcpu_hour_usd,
             "expected_cost_per_1m_units": cost_estimate.expected_cost_per_1m_units,
             "estimated_compute_cost_per_1m_units": cost_estimate.compute_cost_per_1m_units,
             "confidence": cost_estimate.confidence,
+            "pricing_observations": selected.get("pricing_observations", 0),
+            "placement_score": selected.get("placement_score"),
+            "placement_observations": selected.get("placement_observations", 0),
             "assumptions": cost_estimate.assumptions,
         },
     }

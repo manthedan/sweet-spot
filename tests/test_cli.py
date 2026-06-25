@@ -71,6 +71,7 @@ from sweetspot.cli import (
     cmd_version,
     main,
 )
+from sweetspot.canary_service import collect_canary_summaries
 from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
 
@@ -379,7 +380,7 @@ class RunCommandTests(unittest.TestCase):
                     0,
                 )
             report = json.loads(out.getvalue())
-            canary_tasks_path = artifact_dir / "canary_tasks.jsonl"
+            canary_tasks_path = artifact_dir / "canary_generation_000" / "canary_tasks.jsonl"
             phases = {phase["name"]: phase for phase in report["phases"]}
             self.assertEqual(report["artifacts"]["canary_tasks_jsonl"], str(canary_tasks_path))
             self.assertEqual(report["artifacts"]["canary_task_count"], 9)
@@ -394,13 +395,29 @@ class RunCommandTests(unittest.TestCase):
         class FakeCanarySQS:
             def __init__(self) -> None:
                 self.sent_by_queue: dict[str, int] = {}
+                self.depth_by_queue: dict[str, dict[str, int]] = {}
+                self.created_queues: list[dict[str, object]] = []
+
+            def create_queue(self, **kwargs):
+                queue_url = f"https://sqs.us-west-2.amazonaws.com/123456789012/{kwargs['QueueName']}"
+                self.created_queues.append(kwargs)
+                return {"QueueUrl": queue_url}
 
             def send_message_batch(self, *, QueueUrl, Entries):
                 self.sent_by_queue[QueueUrl] = self.sent_by_queue.get(QueueUrl, 0) + len(Entries)
                 return {"Successful": [{"Id": e["Id"]} for e in Entries]}
 
             def get_queue_attributes(self, **kwargs):
-                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+                depth = self.depth_by_queue.get(kwargs["QueueUrl"], {})
+                queue_name = kwargs["QueueUrl"].rstrip("/").rsplit("/", 1)[-1]
+                return {
+                    "Attributes": {
+                        "QueueArn": f"arn:aws:sqs:us-west-2:123456789012:{queue_name}",
+                        "ApproximateNumberOfMessages": str(depth.get("visible", 0)),
+                        "ApproximateNumberOfMessagesNotVisible": str(depth.get("not_visible", 0)),
+                        "ApproximateNumberOfMessagesDelayed": str(depth.get("delayed", 0)),
+                    }
+                }
 
         class FakeCanaryBatch(FakeSubmitBatch):
             def __init__(self, image: str) -> None:
@@ -409,6 +426,13 @@ class RunCommandTests(unittest.TestCase):
 
             def describe_job_definitions(self, **kwargs):
                 return {"jobDefinitions": [{"containerProperties": {"image": self.image}}]}
+
+            def get_paginator(self, name):
+                class EmptyPaginator:
+                    def paginate(self, **kwargs):
+                        return [{"jobSummaryList": []}]
+
+                return EmptyPaginator()
 
         class FakeCanaryS3:
             def __init__(self, body: bytes) -> None:
@@ -422,6 +446,10 @@ class RunCommandTests(unittest.TestCase):
                 if (Bucket, Key) not in self.objects:
                     raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
                 return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+
+            def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+                contents = [{"Key": key} for (bucket, key), _body in sorted(self.objects.items()) if bucket == Bucket and key.startswith(Prefix)]
+                return {"Contents": contents, "IsTruncated": False}
 
         class FakeCanarySession:
             def __init__(self, *, sqs: FakeCanarySQS, batch: FakeCanaryBatch, s3: FakeCanaryS3) -> None:
@@ -499,11 +527,31 @@ class RunCommandTests(unittest.TestCase):
             self.assertEqual(sorted(sqs.sent_by_queue.values()), [3, 3, 3])
             self.assertEqual(len(batch.submitted), 3)
 
-            canary_tasks = [json.loads(line) for line in (artifact_dir / "canary_tasks.jsonl").read_text().splitlines()]
-            for task in canary_tasks:
-                bucket, key = task["summary_s3"].removeprefix("s3://").split("/", 1)
+            stalled_queue = "https://sqs.us-west-2.amazonaws.com/123456789012/canary-x86-1"
+            sqs.depth_by_queue[stalled_queue] = {"visible": 1}
+            reconcile_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(reconcile_out):
+                self.assertEqual(main(argv), 0)
+            reconciled = json.loads(reconcile_out.getvalue())
+            reconciled_phases = {phase["name"]: phase for phase in reconciled["phases"]}
+            self.assertEqual(reconciled_phases["reconcile_canary_workers"]["submitted_count"], 1)
+            self.assertEqual(reconciled_phases["reconcile_canary_workers"]["submitted"][0]["candidate"], "x86_64-1vcpu-2048mib-u1")
+            self.assertEqual(len(batch.submitted), 4)
+            sqs.depth_by_queue[stalled_queue] = {"visible": 0}
+
+            canary_tasks = [json.loads(line) for line in (artifact_dir / "canary_generation_000" / "canary_tasks.jsonl").read_text().splitlines()]
+            for index, task in enumerate(canary_tasks):
+                summary_bucket, summary_key = task["summary_s3"].removeprefix("s3://").split("/", 1)
+                done_bucket, done_key = task["done_s3"].removeprefix("s3://").split("/", 1)
+                attempt_summary_s3 = f"{task['summary_s3']}.attempts/attempt-{index}/summary.json"
+                attempt_bucket, attempt_key = attempt_summary_s3.removeprefix("s3://").split("/", 1)
+                self.assertEqual(summary_bucket, attempt_bucket)
                 candidate = task["input"]
                 summary = {
+                    "schema": "sweetspot.task_summary.v2",
+                    "run_id": task["run_id"],
+                    "task_id": task["task_id"],
+                    "attempt_summary_s3": attempt_summary_s3,
                     "returncode": 0,
                     "completed_units": candidate["canary_units_per_task"],
                     "elapsed_sec": 100,
@@ -516,7 +564,17 @@ class RunCommandTests(unittest.TestCase):
                         "useful_compute_seconds": 100,
                     },
                 }
-                session.s3.objects[(bucket, key)] = json.dumps(summary).encode()
+                done_marker = {
+                    "schema": "sweetspot.done_marker.v2",
+                    "run_id": task["run_id"],
+                    "task_id": task["task_id"],
+                    "done_s3": task["done_s3"],
+                    "summary_s3": task["summary_s3"],
+                    "attempt_summary_s3": attempt_summary_s3,
+                }
+                session.s3.objects[(attempt_bucket, attempt_key)] = json.dumps(summary).encode()
+                session.s3.objects[(done_bucket, done_key)] = json.dumps(done_marker).encode()
+            self.assertNotIn((summary_bucket, summary_key), session.s3.objects)
             collect_out = io.StringIO()
             with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(collect_out):
                 self.assertEqual(main([*argv, "--collect-canary-summaries"]), 0)
@@ -524,9 +582,26 @@ class RunCommandTests(unittest.TestCase):
             collected_phases = {phase["name"]: phase for phase in collected["phases"]}
             self.assertEqual(collected["status"], "production_plan_ready")
             self.assertEqual(collected_phases["collect_canary_summaries"]["collected_count"], len(canary_tasks))
+            self.assertEqual(collected_phases["collect_canary_summaries"]["collected_summary_count"], len(canary_tasks))
+            self.assertEqual(collected_phases["collect_canary_summaries"]["summary_sources"], {"done_marker_attempt_summary_s3": len(canary_tasks)})
             self.assertTrue((artifact_dir / "canary_summaries.jsonl").exists())
             self.assertTrue((artifact_dir / "production_plan.json").exists())
             self.assertTrue((artifact_dir / "production_tasks.jsonl").exists())
+
+            production_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(production_out):
+                self.assertEqual(main([*argv, "--canary-summary-jsonl", str(artifact_dir / "canary_summaries.jsonl"), "--dedicated-run-queue", "--create-run-queue"]), 0)
+            production = json.loads(production_out.getvalue())
+            production_phases = {phase["name"]: phase for phase in production["phases"]}
+            self.assertEqual(production["status"], "workers_submitted")
+            self.assertEqual(production["controller"]["binding_kind"], "production")
+            self.assertIn("promoted_from_canary", production["controller"])
+            self.assertEqual(production_phases["enqueue_tasks"]["status"], "completed")
+            self.assertEqual(production_phases["submit_workers"]["status"], "completed")
+            self.assertEqual(len(sqs.created_queues), 1)
+            self.assertEqual(production["controller"]["run_queue"]["created_or_existing"], "created")
+            self.assertIn(production["controller"]["run_queue"]["queue_url"], sqs.sent_by_queue)
+            self.assertNotIn("https://sqs.us-west-2.amazonaws.com/123456789012/prod", sqs.sent_by_queue)
 
     def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2236,6 +2311,109 @@ class QueueAliasTests(unittest.TestCase):
 
 
 class CanaryTests(unittest.TestCase):
+    def test_collect_canary_summaries_lists_failed_attempt_summaries_without_done_marker(self) -> None:
+        class FakeS3:
+            def __init__(self) -> None:
+                self.objects: dict[tuple[str, str], bytes] = {}
+
+            def get_object(self, *, Bucket, Key):
+                if (Bucket, Key) not in self.objects:
+                    raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+
+            def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+                return {
+                    "Contents": [{"Key": key} for (bucket, key), _body in sorted(self.objects.items()) if bucket == Bucket and key.startswith(Prefix)],
+                    "IsTruncated": False,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            s3 = FakeS3()
+            task = {
+                "run_id": "r",
+                "task_id": "failed-canary",
+                "summary_s3": "s3://bucket/r/summaries/failed-canary.summary.json",
+                "done_s3": "s3://bucket/r/done/failed-canary.done.json",
+            }
+            attempt_summary_s3 = task["summary_s3"] + ".attempts/attempt-1/summary.json"
+            bucket, key = attempt_summary_s3.removeprefix("s3://").split("/", 1)
+            s3.objects[(bucket, key)] = json.dumps({"task_id": "failed-canary", "returncode": 137, "stderr_tail": "OOMKilled", "retry_exhausted": True}).encode()
+            out_path = Path(tmp) / "canary_summaries.jsonl"
+            report = collect_canary_summaries(s3, tasks=[task], out_jsonl=out_path)
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["collected_count"], 1)
+            self.assertEqual(report["collected_summary_count"], 1)
+            self.assertEqual(report["summary_sources"], {"attempt_summary_listing_latest": 1})
+            self.assertEqual(json.loads(out_path.read_text()), {"task_id": "failed-canary", "returncode": 137, "retry_exhausted": True, "stderr_tail": "OOMKilled"})
+
+    def test_collect_canary_summaries_waits_for_terminal_marker_for_failed_attempt(self) -> None:
+        class FakeS3:
+            def __init__(self) -> None:
+                self.objects: dict[tuple[str, str], bytes] = {}
+
+            def get_object(self, *, Bucket, Key):
+                if (Bucket, Key) not in self.objects:
+                    raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+
+            def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+                return {
+                    "Contents": [{"Key": key} for (bucket, key), _body in sorted(self.objects.items()) if bucket == Bucket and key.startswith(Prefix)],
+                    "IsTruncated": False,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            s3 = FakeS3()
+            task = {
+                "run_id": "r",
+                "task_id": "retryable-failed-canary",
+                "summary_s3": "s3://bucket/r/summaries/retryable-failed-canary.summary.json",
+                "done_s3": "s3://bucket/r/done/retryable-failed-canary.done.json",
+            }
+            attempt_summary_s3 = task["summary_s3"] + ".attempts/attempt-1/summary.json"
+            bucket, key = attempt_summary_s3.removeprefix("s3://").split("/", 1)
+            s3.objects[(bucket, key)] = json.dumps({"task_id": "retryable-failed-canary", "returncode": 137, "stderr_tail": "OOMKilled"}).encode()
+            out_path = Path(tmp) / "canary_summaries.jsonl"
+            report = collect_canary_summaries(s3, tasks=[task], out_jsonl=out_path)
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["collected_count"], 0)
+            self.assertEqual(report["summary_sources"], {})
+            self.assertEqual(out_path.read_text(), "")
+
+    def test_collect_canary_summaries_waits_for_done_marker_for_successful_attempt(self) -> None:
+        class FakeS3:
+            def __init__(self) -> None:
+                self.objects: dict[tuple[str, str], bytes] = {}
+
+            def get_object(self, *, Bucket, Key):
+                if (Bucket, Key) not in self.objects:
+                    raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+
+            def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
+                return {
+                    "Contents": [{"Key": key} for (bucket, key), _body in sorted(self.objects.items()) if bucket == Bucket and key.startswith(Prefix)],
+                    "IsTruncated": False,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            s3 = FakeS3()
+            task = {
+                "run_id": "r",
+                "task_id": "successful-canary",
+                "summary_s3": "s3://bucket/r/summaries/successful-canary.summary.json",
+                "done_s3": "s3://bucket/r/done/successful-canary.done.json",
+            }
+            attempt_summary_s3 = task["summary_s3"] + ".attempts/attempt-1/summary.json"
+            bucket, key = attempt_summary_s3.removeprefix("s3://").split("/", 1)
+            s3.objects[(bucket, key)] = json.dumps({"task_id": "successful-canary", "returncode": 0, "completed_units": 10, "elapsed_sec": 1}).encode()
+            out_path = Path(tmp) / "canary_summaries.jsonl"
+            report = collect_canary_summaries(s3, tasks=[task], out_jsonl=out_path)
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["collected_count"], 0)
+            self.assertEqual(report["summary_sources"], {})
+            self.assertEqual(out_path.read_text(), "")
+
     def test_explicit_descending_canary_range_is_rejected(self) -> None:
         with self.assertRaisesRegex(SystemExit, "descending"):
             _parse_index_selection("5-3", 10)

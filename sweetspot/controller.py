@@ -14,7 +14,8 @@ def choose_worker_top_up(*, backlog: int, active_workers: int, target_workers: i
 
     if backlog <= 0 or target_workers <= 0:
         return 0
-    return max(0, min(target_workers, target_workers - max(0, active_workers)))
+    desired_active = min(max(0, backlog), target_workers)
+    return max(0, desired_active - max(0, active_workers))
 
 
 def canary_candidate_key(task: dict[str, Any]) -> str | None:
