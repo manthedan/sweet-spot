@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
 from .planner import PLAN_SCHEMA_V1, PlannerSpecError, validate_plan
 from .s3util import parse_s3_uri
 
@@ -16,6 +17,7 @@ DEPLOYMENT_SCHEMA_V1 = "sweetspot.deployment.v1"
 _ARCHITECTURES = {"x86_64", "arm64"}
 _SQS_RE = re.compile(r"^https://sqs[.]([a-z0-9-]+)[.]amazonaws[.]com(?:[.]cn)?/(\d{12})/[^/]+$")
 _ECR_RE = re.compile(r"^(?P<account>\d{12})[.]dkr[.]ecr[.](?P<region>[a-z0-9-]+)[.]amazonaws[.]com(?:[.]cn)?/(?P<repo>[^@:]+)(?P<suffix>[:@].+)?$")
+_CANARY_ROUTE_RE = re.compile(r"^(?P<arch>x86_64|arm64)-(?P<vcpus>[1-9][0-9]*)vcpu-(?P<memory>[1-9][0-9]*)mib$")
 
 
 def _job_definition_revision_pinned(value: str) -> bool:
@@ -89,6 +91,38 @@ def load_deployment(path: Path) -> dict[str, Any]:
     return validate_deployment(data)
 
 
+def _validate_execution_route(raw_route: Any, *, context: str, require_queue: bool = False, region: str | None = None, production_queue_url: str | None = None) -> None:
+    if not isinstance(raw_route, dict):
+        raise PlannerSpecError(f"{context} must be an object")
+    if require_queue:
+        queue_url = raw_route.get("sqs_queue_url")
+        if not isinstance(queue_url, str) or not queue_url:
+            raise PlannerSpecError(f"{context} must include sqs_queue_url")
+        queue_region = sqs_queue_region(queue_url)
+        if region and queue_region and queue_region != region:
+            raise PlannerSpecError(f"{context} has sqs_queue_url in region {queue_region!r}")
+        if production_queue_url and queue_url == production_queue_url:
+            raise PlannerSpecError(f"{context} sqs_queue_url must be isolated from the production queue")
+        dlq_url = raw_route.get("dlq_url")
+        if dlq_url is not None:
+            if not isinstance(dlq_url, str) or not dlq_url:
+                raise PlannerSpecError(f"{context} dlq_url must be a non-empty string")
+            dlq_region = sqs_queue_region(dlq_url)
+            if region and dlq_region and dlq_region != region:
+                raise PlannerSpecError(f"{context} has dlq_url in region {dlq_region!r}")
+    for key in ("batch_job_queue", "job_definition"):
+        if not isinstance(raw_route.get(key), str) or not raw_route.get(key):
+            raise PlannerSpecError(f"{context} must include {key}")
+    job_definition = str(raw_route["job_definition"])
+    if not _job_definition_revision_pinned(job_definition):
+        raise PlannerSpecError(f"{context} job_definition must pin an explicit numeric revision")
+    image = raw_route.get("image")
+    if not isinstance(image, str) or not image:
+        raise PlannerSpecError(f"{context} must include digest-pinned image")
+    if image_digest(image) is None:
+        raise PlannerSpecError(f"{context} image must be digest-pinned")
+
+
 def validate_deployment(registry: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(registry, dict):
         raise PlannerSpecError("deployment registry must be a JSON object")
@@ -121,19 +155,23 @@ def validate_deployment(registry: dict[str, Any]) -> dict[str, Any]:
         for arch, raw_arch in architectures.items():
             if arch not in _ARCHITECTURES:
                 raise PlannerSpecError(f"unsupported deployment architecture {arch!r}")
-            if not isinstance(raw_arch, dict):
-                raise PlannerSpecError(f"deployment target {region}/{arch} must be an object")
-            for key in ("batch_job_queue", "job_definition"):
-                if not isinstance(raw_arch.get(key), str) or not raw_arch.get(key):
-                    raise PlannerSpecError(f"deployment target {region}/{arch} must include {key}")
-            job_definition = str(raw_arch["job_definition"])
-            if not _job_definition_revision_pinned(job_definition):
-                raise PlannerSpecError(f"deployment target {region}/{arch} job_definition must pin an explicit numeric revision")
-            image = raw_arch.get("image")
-            if not isinstance(image, str) or not image:
-                raise PlannerSpecError(f"deployment target {region}/{arch} must include digest-pinned image")
-            if image_digest(image) is None:
-                raise PlannerSpecError(f"deployment target {region}/{arch} image must be digest-pinned")
+            _validate_execution_route(raw_arch, context=f"deployment target {region}/{arch}")
+        canary_routes = raw_region.get("canary_routes")
+        if canary_routes is not None:
+            if not isinstance(canary_routes, dict) or not canary_routes:
+                raise PlannerSpecError(f"deployment region {region!r} canary_routes must be a non-empty object when present")
+            seen_canary_queues: dict[str, str] = {}
+            for route_key, raw_route in canary_routes.items():
+                match = _CANARY_ROUTE_RE.fullmatch(str(route_key))
+                if not match:
+                    raise PlannerSpecError(f"deployment canary route {region}/{route_key!r} must be keyed as ARCH-Nvcpu-Nmib")
+                if match.group("arch") not in architectures:
+                    raise PlannerSpecError(f"deployment canary route {region}/{route_key!r} references an architecture without a deployment target")
+                _validate_execution_route(raw_route, context=f"deployment canary route {region}/{route_key}", require_queue=True, region=region, production_queue_url=queue_url)
+                route_queue = str(raw_route["sqs_queue_url"])
+                if route_queue in seen_canary_queues:
+                    raise PlannerSpecError(f"deployment canary routes {seen_canary_queues[route_queue]!r} and {route_key!r} share sqs_queue_url; each candidate needs an isolated queue")
+                seen_canary_queues[route_queue] = str(route_key)
     return registry
 
 
@@ -171,6 +209,59 @@ def select_deployment_target(plan: dict[str, Any], registry: dict[str, Any]) -> 
     if not region or not architecture:
         raise PlannerSpecError("ready Plan selected settings must include region and architecture")
     return deployment_target_for(registry, region=region, architecture=architecture)
+
+
+def canary_route_key(*, architecture: str, vcpus: int, memory_mib: int) -> str:
+    return f"{architecture}-{int(vcpus)}vcpu-{int(memory_mib)}mib"
+
+
+def select_canary_deployment_region(job_spec: dict[str, Any], registry: dict[str, Any]) -> str:
+    registry = validate_deployment(registry)
+    regions = registry["regions"]
+    constraints = job_spec.get("constraints") if isinstance(job_spec.get("constraints"), dict) else {}
+    allowed_regions = constraints.get("regions") if isinstance(constraints, dict) else None
+    candidates = list(regions.keys())
+    if isinstance(allowed_regions, list) and allowed_regions:
+        allowed = {str(region) for region in allowed_regions}
+        candidates = [region for region in candidates if region in allowed]
+    if len(candidates) != 1:
+        raise PlannerSpecError("controller canary apply requires exactly one deployment region via constraints.regions or a single-region deployment registry")
+    return str(candidates[0])
+
+
+def canary_deployment_target_for(registry: dict[str, Any], *, region: str, task: dict[str, Any]) -> DeploymentTarget:
+    registry = validate_deployment(registry)
+    raw_input = task.get("input")
+    input_obj: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+    architecture = str(input_obj.get("candidate_architecture") or "")
+    raw_vcpus = input_obj.get("candidate_vcpus")
+    raw_memory_mib = input_obj.get("candidate_memory_mib")
+    try:
+        if raw_vcpus is None or raw_memory_mib is None:
+            raise TypeError("missing candidate vCPU/memory")
+        vcpus = int(raw_vcpus)
+        memory_mib = int(raw_memory_mib)
+    except (TypeError, ValueError) as exc:
+        raise PlannerSpecError(f"canary task {task.get('task_id')!r} is missing candidate vCPU/memory metadata") from exc
+    route_key = canary_route_key(architecture=architecture, vcpus=vcpus, memory_mib=memory_mib)
+    raw_region = registry["regions"].get(region)
+    if not isinstance(raw_region, dict):
+        raise PlannerSpecError(f"deployment registry has no target for region {region!r}")
+    routes = raw_region.get("canary_routes")
+    if not isinstance(routes, dict):
+        raise PlannerSpecError(f"deployment registry region {region!r} has no safe canary_routes")
+    raw_route = routes.get(route_key)
+    if not isinstance(raw_route, dict):
+        raise PlannerSpecError(f"deployment registry has no canary route for {region}/{route_key}")
+    return DeploymentTarget(
+        region=region,
+        architecture=architecture,
+        sqs_queue_url=str(raw_route["sqs_queue_url"]),
+        dlq_url=str(raw_route["dlq_url"]) if raw_route.get("dlq_url") else None,
+        batch_job_queue=str(raw_route["batch_job_queue"]),
+        job_definition=str(raw_route["job_definition"]),
+        image=str(raw_route["image"]),
+    )
 
 
 def sqs_queue_region(queue_url: str) -> str | None:

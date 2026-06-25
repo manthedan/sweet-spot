@@ -18,8 +18,18 @@ import boto3
 
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
-from .controller import choose_worker_top_up
-from .deployment import DeploymentTarget, load_deployment, local_manifest_identity, manifest_identity_from_head, select_deployment_target, validate_local_manifest_matches_head, validate_target_matches_job
+from .controller import choose_worker_top_up, group_canary_tasks_by_candidate
+from .deployment import (
+    DeploymentTarget,
+    canary_deployment_target_for,
+    load_deployment,
+    local_manifest_identity,
+    manifest_identity_from_head,
+    select_canary_deployment_region,
+    select_deployment_target,
+    validate_local_manifest_matches_head,
+    validate_target_matches_job,
+)
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .planner import PlannerSpecError, initial_blocked_plan, iter_canary_tasks_from_logical_unit_count, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
@@ -704,6 +714,22 @@ def _recorded_run_tasks_artifact(previous_state: dict[str, Any], artifact_dir: P
     return artifacts, path
 
 
+def _recorded_canary_tasks_artifact(previous_state: dict[str, Any], artifact_dir: Path) -> tuple[dict[str, Any], Path] | None:
+    previous_artifacts = previous_state.get("artifacts") if isinstance(previous_state.get("artifacts"), dict) else {}
+    raw_path = previous_artifacts.get("canary_tasks_jsonl") if isinstance(previous_artifacts, dict) else None
+    previous_phases = _phase_by_name(previous_state)
+    if not raw_path and not any(previous_phases.get(name, {}).get("status") not in {None, "not_started"} for name in ("enqueue_canary_tasks", "submit_canary_workers")):
+        return None
+    path = Path(str(raw_path)) if raw_path else artifact_dir / "canary_tasks.jsonl"
+    if not path.exists():
+        raise SystemExit(f"existing run state recorded canary tasks, but the task artifact is missing: {path}")
+    artifacts: dict[str, Any] = {"canary_tasks_jsonl": str(path), "canary_task_count": _count_jsonl_objects(path), "canary_tasks_sha256": _sha256_file(path)}
+    previous_sha = previous_artifacts.get("canary_tasks_sha256") if isinstance(previous_artifacts, dict) else None
+    if previous_sha and previous_sha != artifacts["canary_tasks_sha256"]:
+        raise SystemExit(f"canary task artifact at {path} no longer matches the SHA256 recorded in run_state.json")
+    return artifacts, path
+
+
 def _plan_requests_controller_canaries(plan: dict[str, Any]) -> bool:
     canaries = plan.get("canaries")
     if not isinstance(canaries, list) or not canaries:
@@ -720,6 +746,372 @@ def _safe_active_worker_count(batch: Any, *, job_queue: str, job_name_prefix: st
         return fallback, [], {"code": "active_worker_observation_unavailable", "severity": "warning", "message": str(exc)}
 
 
+def _canary_runtime_settings(plan: dict[str, Any], task: dict[str, Any]) -> dict[str, int | float]:
+    raw_input = task.get("input")
+    input_obj: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+    try:
+        vcpus = _ceil_positive_int(input_obj.get("candidate_vcpus"), "candidate_vcpus")
+        memory_mib = _ceil_positive_int(input_obj.get("candidate_memory_mib"), "candidate_memory_mib")
+    except SystemExit as exc:
+        raise SystemExit(f"canary task {task.get('task_id')!r} is missing candidate runtime metadata: {exc}") from exc
+    task_timeout_seconds = float(task.get("timeout_seconds") or _plan_task_timeout_seconds(plan) or SAFE_TASK_TIMEOUT_SECONDS)
+    visibility_timeout = max(task_timeout_seconds + 60.0, min(43200.0, math.ceil(task_timeout_seconds * 1.5)))
+    heartbeat_seconds = max(1.0, min(300.0, math.floor(visibility_timeout / 3.0)))
+    return {
+        "vcpus": vcpus,
+        "memory_mib": memory_mib,
+        "task_timeout_seconds": task_timeout_seconds,
+        "visibility_timeout": int(math.ceil(visibility_timeout)),
+        "heartbeat_seconds": int(math.ceil(heartbeat_seconds)),
+    }
+
+
+def _cmd_run_canary_apply(
+    args: argparse.Namespace,
+    *,
+    spec: dict[str, Any],
+    plan: dict[str, Any],
+    logical_unit_count: int | None,
+    job_spec_sha256: str,
+) -> dict[str, Any]:
+    if args.artifact_dir is None:
+        raise SystemExit("sweetspot run --apply for canary Plans requires --artifact-dir so run_state.json can make retries/resume safe")
+    if not getattr(args, "deployment", None):
+        raise SystemExit("sweetspot run --apply for canary Plans requires --deployment with isolated per-candidate canary_routes")
+    if logical_unit_count is None:
+        raise SystemExit("sweetspot run --apply for canary Plans requires --input-manifest-jsonl to materialize controller-owned canary tasks")
+    _reject_legacy_run_sizing_overrides(args)
+
+    deployment_sha256 = _sha256_file(args.deployment)
+    try:
+        registry = load_deployment(args.deployment)
+        canary_region = select_canary_deployment_region(spec, registry)
+    except PlannerSpecError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    args.artifact_dir.mkdir(parents=True, exist_ok=True)
+    state_path = args.artifact_dir / "run_state.json"
+    previous_state = _load_run_state(state_path, run_id=str(spec["run_id"]), job_spec_sha256=job_spec_sha256, require_job_spec_sha256=True)
+    previous_phases = _phase_by_name(previous_state)
+    recorded_tasks = _recorded_canary_tasks_artifact(previous_state, args.artifact_dir)
+    if recorded_tasks is not None:
+        previous_plan = previous_state.get("plan")
+        if not isinstance(previous_plan, dict):
+            raise SystemExit("existing run_state.json records canary tasks but no reviewed plan; use a new artifact directory")
+        plan = previous_plan
+        artifacts, tasks_path = recorded_tasks
+    else:
+        tasks_path = args.artifact_dir / "canary_tasks.jsonl"
+        _write_canary_tasks_from_plan(spec, plan, logical_unit_count, tasks_path)
+        artifacts = {
+            "canary_tasks_jsonl": str(tasks_path),
+            "canary_task_count": plan.get("artifacts", {}).get("canary_task_count"),
+            "canary_tasks_sha256": _sha256_file(tasks_path),
+        }
+    artifacts["run_state_json"] = str(state_path)
+    tasks = _read_jsonl(tasks_path)
+    _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=_default_run_allowed_s3_prefixes(args, spec))
+    try:
+        grouped = group_canary_tasks_by_candidate(tasks)
+        targets = {key: canary_deployment_target_for(registry, region=canary_region, task=group[0]) for key, group in grouped.items()}
+    except (PlannerSpecError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    target_warnings: list[dict[str, Any]] = []
+    for key, target in sorted(targets.items()):
+        try:
+            target_warnings.extend({**warning, "candidate": key} for warning in validate_target_matches_job(job_spec=spec, target=target))
+        except PlannerSpecError as exc:
+            raise SystemExit(str(exc)) from exc
+    first_target = next(iter(targets.values()))
+    manifest_identity = _manifest_identity_for_run(args, spec, first_target)
+    route_bindings = {key: target.as_dict() for key, target in sorted(targets.items())}
+    plan_binding = {
+        "deployment_sha256": deployment_sha256,
+        "manifest_identity": manifest_identity,
+        "canary_region": canary_region,
+        "canary_routes": route_bindings,
+        "canary_tasks_sha256": artifacts["canary_tasks_sha256"],
+    }
+    previous_binding = previous_state.get("controller", {}).get("plan_binding") if isinstance(previous_state.get("controller"), dict) else None
+    if previous_binding and _sha256_json_obj(previous_binding) != _sha256_json_obj(plan_binding):
+        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs; use the original inputs or a new artifact directory")
+
+    allowed_s3_prefixes = _default_run_allowed_s3_prefixes(args, spec)
+    enqueue_config_sha256 = _sha256_json_obj({"allowed_s3_prefixes": allowed_s3_prefixes, "profile": args.profile, "region": canary_region, "routes": route_bindings})
+    worker_config_sha256 = _sha256_json_obj(
+        {
+            "allow_legacy_done_markers": bool(getattr(args, "allow_legacy_done_markers", False)),
+            "allowed_s3_prefixes": allowed_s3_prefixes,
+            "env": args.env or [],
+            "log_tail_bytes": args.log_tail_bytes,
+            "max_log_bytes": args.max_log_bytes,
+            "profile": args.profile,
+            "redact_regex": args.redact_regex or [],
+            "region": canary_region,
+            "retry_attempts": args.retry_attempts,
+            "routes": route_bindings,
+        }
+    )
+    controller_base = {
+        "apply_supported": True,
+        "mutations_allowed": True,
+        "resume_state_loaded": bool(previous_state),
+        "plan_authoritative": True,
+        "canary_routing": "isolated_per_candidate_deployment_routes",
+        "plan_binding": plan_binding,
+        "deployment_warnings": target_warnings,
+    }
+    run_id = str(spec["run_id"])
+    phases_base: list[dict[str, Any]] = [
+        {"name": "plan", "status": "completed"},
+        {"name": "materialize_canary_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks), "candidate_count": len(grouped)},
+    ]
+    report = _build_run_report(
+        spec=spec,
+        plan=plan,
+        mode="apply",
+        applied=True,
+        status="canary_apply_started",
+        artifacts=artifacts,
+        phases=phases_base
+        + [
+            previous_phases.get("enqueue_canary_tasks", {"name": "enqueue_canary_tasks", "status": "not_started"}),
+            previous_phases.get("submit_canary_workers", {"name": "submit_canary_workers", "status": "not_started"}),
+            {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True},
+        ],
+        job_spec_sha256=job_spec_sha256,
+        controller=controller_base,
+        next_actions=["Persisted run_state.json before canary mutation; rerun the same command to resume without re-enqueueing completed candidate routes."],
+    )
+    _write_run_state(state_path, report)
+
+    sqs = _aws_client_for_target(args, "sqs", first_target)
+    batch = _aws_client_for_target(args, "batch", first_target)
+    for key, target in sorted(targets.items()):
+        for warning in _preflight_deployment_target(batch, target=target, spec=spec):
+            target_warnings.append({**warning, "candidate": key})
+
+    previous_enqueue_phase = previous_phases.get("enqueue_canary_tasks", {})
+    previous_enqueue_status = previous_enqueue_phase.get("status")
+    if previous_enqueue_status in {"batch_in_flight", "needs_review"}:
+        raise SystemExit("existing run_state.json has ambiguous canary enqueue progress; review SQS/task state before retrying to avoid duplicate messages")
+    if previous_enqueue_phase.get("enqueue_config_sha256") and previous_enqueue_phase.get("enqueue_config_sha256") != enqueue_config_sha256:
+        raise SystemExit("existing run_state.json canary enqueue progress uses different enqueue settings; use the original settings or a new artifact directory")
+
+    def route_records_from_phase(phase: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        raw_routes = phase.get("routes") if isinstance(phase, dict) else None
+        if isinstance(raw_routes, list):
+            return {str(route.get("candidate")): dict(route) for route in raw_routes if isinstance(route, dict) and route.get("candidate")}
+        return {}
+
+    route_records = route_records_from_phase(previous_enqueue_phase)
+    for key, group in grouped.items():
+        route_records.setdefault(
+            key,
+            {
+                "candidate": key,
+                "status": "not_started",
+                "queue_url": targets[key].sqs_queue_url,
+                "task_count": len(group),
+                "sent": 0,
+                "next_task_index": 0,
+            },
+        )
+    if previous_enqueue_status != "completed":
+        for key in sorted(grouped):
+            route = route_records[key]
+            if int(route.get("sent", 0) or 0) > 0:
+                continue
+            try:
+                preflight_depth = queue_depth(sqs, targets[key].sqs_queue_url)
+            except Exception as exc:  # noqa: BLE001 - stale canary queues must fail closed before mutation.
+                raise SystemExit(f"failed to verify canary route queue is empty for {key}: {exc}") from exc
+            route["preflight_queue_depth"] = preflight_depth
+            if int(preflight_depth.get("visible", 0)) or int(preflight_depth.get("not_visible", 0)) or int(preflight_depth.get("delayed", 0)):
+                raise SystemExit(f"canary route queue for {key} is not empty; use a fresh isolated canary queue or review/drain it before apply")
+    enqueue_phase: dict[str, Any] = {
+        "name": "enqueue_canary_tasks",
+        "status": "completed" if previous_enqueue_status == "completed" else "in_progress",
+        "enqueue_config_sha256": enqueue_config_sha256,
+        "routes": [route_records[key] for key in sorted(route_records)],
+    }
+
+    def persist_canary_enqueue(phase: dict[str, Any], *, report_status: str, next_actions: list[str]) -> None:
+        _write_run_state(
+            state_path,
+            _build_run_report(
+                spec=spec,
+                plan=plan,
+                mode="apply",
+                applied=True,
+                status=report_status,
+                artifacts=artifacts,
+                phases=phases_base
+                + [
+                    phase,
+                    previous_phases.get("submit_canary_workers", {"name": "submit_canary_workers", "status": "not_started"}),
+                    {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True},
+                ],
+                job_spec_sha256=job_spec_sha256,
+                controller=controller_base,
+                next_actions=next_actions,
+            ),
+        )
+
+    if previous_enqueue_status == "completed":
+        enqueue_phase = dict(previous_enqueue_phase)
+        enqueue_phase["resumed"] = True
+    else:
+        persist_canary_enqueue(enqueue_phase, report_status="canary_enqueue_in_progress", next_actions=["Canary task enqueue is in progress; rerun the same command to resume from recorded candidate route offsets."])
+        for key in sorted(grouped):
+            group = grouped[key]
+            route = route_records[key]
+            sent = int(route.get("sent", 0) or 0)
+            if sent < 0 or sent > len(group):
+                raise SystemExit("existing run_state.json has invalid canary enqueue sent count")
+            while sent < len(group):
+                task_batch = group[sent : sent + 10]
+                route_in_flight = {**route, "status": "batch_in_flight", "sent": sent, "next_task_index": sent, "in_flight_count": len(task_batch)}
+                route_records[key] = route_in_flight
+                enqueue_phase = {**enqueue_phase, "status": "batch_in_flight", "routes": [route_records[candidate] for candidate in sorted(route_records)]}
+                persist_canary_enqueue(
+                    enqueue_phase, report_status="canary_enqueue_batch_in_flight", next_actions=["A canary task batch may have reached SQS; review candidate queues before retrying if this controller stops here."]
+                )
+                entries = [{"Id": str(sent + i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(task_batch)]
+                resp = sqs.send_message_batch(QueueUrl=targets[key].sqs_queue_url, Entries=entries)
+                if resp.get("Failed"):
+                    route_records[key] = {**route_in_flight, "status": "needs_review", "failed": resp.get("Failed"), "successful": resp.get("Successful", [])}
+                    enqueue_phase = {**enqueue_phase, "status": "needs_review", "routes": [route_records[candidate] for candidate in sorted(route_records)]}
+                    persist_canary_enqueue(enqueue_phase, report_status="canary_enqueue_needs_review", next_actions=["SQS accepted only part of a canary task batch; review candidate queues before retrying."])
+                    raise SystemExit(f"send_message_batch failed: {resp['Failed']}")
+                sent += len(resp.get("Successful", []))
+                route = {**route, "status": "completed" if sent == len(group) else "in_progress", "sent": sent, "next_task_index": sent, "remaining": len(group) - sent}
+                route_records[key] = route
+                enqueue_phase = {
+                    **enqueue_phase,
+                    "status": "completed" if all(int(r.get("sent", 0) or 0) >= int(r.get("task_count", 0) or 0) for r in route_records.values()) else "in_progress",
+                    "routes": [route_records[candidate] for candidate in sorted(route_records)],
+                }
+                persist_canary_enqueue(
+                    enqueue_phase,
+                    report_status="canary_tasks_enqueued" if enqueue_phase["status"] == "completed" else "canary_enqueue_in_progress",
+                    next_actions=["Canary tasks have been enqueued; rerun the same command to resume worker submission if this controller stops."],
+                )
+
+    previous_submit_phase = previous_phases.get("submit_canary_workers", {})
+    previous_submit_status = previous_submit_phase.get("status")
+    if previous_submit_status in {"job_in_flight", "needs_review"}:
+        raise SystemExit("existing run_state.json has ambiguous canary worker submission progress; review Batch jobs before retrying to avoid duplicate workers")
+    if previous_submit_phase.get("worker_config_sha256") and previous_submit_phase.get("worker_config_sha256") != worker_config_sha256:
+        raise SystemExit("existing run_state.json canary worker submission progress uses different worker settings; use the original settings or a new artifact directory")
+    submitted = list(previous_submit_phase.get("submitted", [])) if isinstance(previous_submit_phase.get("submitted"), list) else []
+    submitted_candidates = {str(item.get("candidate")) for item in submitted if isinstance(item, dict) and item.get("candidate")}
+    submission_stamp = str(previous_submit_phase.get("submission_stamp") or utc_stamp())
+    submit_phase: dict[str, Any] = {
+        "name": "submit_canary_workers",
+        "status": "completed" if previous_submit_status == "completed" else "in_progress",
+        "worker_config_sha256": worker_config_sha256,
+        "submission_stamp": submission_stamp,
+        "submitted_count": len(submitted),
+        "submitted": submitted,
+        "worker_count": len(grouped),
+    }
+
+    def persist_canary_submit(phase: dict[str, Any], *, report_status: str, next_actions: list[str]) -> None:
+        _write_run_state(
+            state_path,
+            _build_run_report(
+                spec=spec,
+                plan=plan,
+                mode="apply",
+                applied=True,
+                status=report_status,
+                artifacts=artifacts,
+                phases=phases_base + [enqueue_phase, phase, {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}],
+                job_spec_sha256=job_spec_sha256,
+                controller=controller_base,
+                next_actions=next_actions,
+            ),
+        )
+
+    if previous_submit_status == "completed":
+        submit_phase = dict(previous_submit_phase)
+        submit_phase["resumed"] = True
+    else:
+        persist_canary_submit(
+            submit_phase, report_status="canary_worker_submit_in_progress", next_actions=["Canary worker submission is in progress; rerun the same command to resume from recorded candidate submissions."]
+        )
+        for key in sorted(grouped):
+            if key in submitted_candidates:
+                continue
+            target = targets[key]
+            group = grouped[key]
+            runtime = _canary_runtime_settings(plan, group[0])
+            try:
+                validate_worker_timing(
+                    visibility_timeout=int(runtime["visibility_timeout"]),
+                    heartbeat_seconds=int(runtime["heartbeat_seconds"]),
+                    task_timeout_seconds=float(runtime["task_timeout_seconds"]),
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            overrides = _worker_overrides(
+                sqs_queue_url=target.sqs_queue_url,
+                messages_per_worker=len(group),
+                visibility_timeout=int(runtime["visibility_timeout"]),
+                heartbeat_seconds=int(runtime["heartbeat_seconds"]),
+                task_timeout_seconds=float(runtime["task_timeout_seconds"]),
+                env=args.env or [],
+                allowed_s3_prefixes=allowed_s3_prefixes,
+                log_tail_bytes=args.log_tail_bytes,
+                max_log_bytes=args.max_log_bytes,
+                redact_regexes=args.redact_regex or [],
+                allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+                vcpus=int(runtime["vcpus"]),
+                memory=int(runtime["memory_mib"]),
+            )
+            job_name = f"{run_id}-canary-{key}-{submission_stamp}"
+            in_flight_phase = {**submit_phase, "status": "job_in_flight", "in_flight_candidate": key, "in_flight_job_name": job_name}
+            persist_canary_submit(
+                in_flight_phase,
+                report_status="canary_worker_submit_job_in_flight",
+                next_actions=["A canary worker submit_job call may have reached Batch; review Batch jobs before retrying if this controller stops here."],
+            )
+            kwargs: dict[str, Any] = {"jobName": job_name, "jobQueue": target.batch_job_queue, "jobDefinition": target.job_definition, "containerOverrides": overrides}
+            if args.retry_attempts is not None:
+                kwargs["retryStrategy"] = {"attempts": args.retry_attempts}
+            try:
+                resp = batch.submit_job(**kwargs)
+            except Exception as exc:
+                review_phase = {**in_flight_phase, "status": "needs_review", "submit_error": str(exc)}
+                persist_canary_submit(review_phase, report_status="canary_worker_submit_needs_review", next_actions=["A canary Batch submit_job call failed or is ambiguous; review Batch jobs before retrying."])
+                raise
+            submitted.append({"candidate": key, "jobName": job_name, "jobId": resp.get("jobId"), "jobArn": resp.get("jobArn"), "task_count": len(group), "queue_url": target.sqs_queue_url})
+            submitted_candidates.add(key)
+            submit_phase = {**submit_phase, "status": "completed" if len(submitted) == len(grouped) else "in_progress", "submitted_count": len(submitted), "submitted": submitted}
+            persist_canary_submit(
+                submit_phase,
+                report_status="canary_workers_submitted" if submit_phase["status"] == "completed" else "canary_worker_submit_in_progress",
+                next_actions=["Canary workers have been submitted; collect summary JSONL and rerun plan/run with --canary-summary-jsonl."],
+            )
+
+    phases = phases_base + [enqueue_phase, submit_phase, {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}]
+    report = _build_run_report(
+        spec=spec,
+        plan=plan,
+        mode="apply",
+        applied=True,
+        status="canary_workers_submitted",
+        artifacts=artifacts,
+        phases=phases,
+        job_spec_sha256=job_spec_sha256,
+        controller=controller_base,
+        next_actions=["Collect canary summary JSONL from each candidate output prefix, then rerun `sweetspot plan`/`sweetspot run` with --canary-summary-jsonl to select production settings."],
+    )
+    _write_run_state(state_path, report)
+    return report
+
+
 def _cmd_run_apply(
     args: argparse.Namespace,
     *,
@@ -729,10 +1121,7 @@ def _cmd_run_apply(
     job_spec_sha256: str,
 ) -> dict[str, Any]:
     if _plan_requests_controller_canaries(plan):
-        raise SystemExit(
-            "sweetspot run --apply for canary Plans is not yet safe to mutate automatically; "
-            "run without --apply to materialize canary_tasks.jsonl, then launch reviewed canaries on dedicated per-candidate queues/job definitions"
-        )
+        return _cmd_run_canary_apply(args, spec=spec, plan=plan, logical_unit_count=logical_unit_count, job_spec_sha256=job_spec_sha256)
     if args.artifact_dir is None:
         raise SystemExit("sweetspot run --apply requires --artifact-dir so run_state.json can make retries/resume safe")
     _reject_legacy_run_sizing_overrides(args)
@@ -4094,7 +4483,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units for calibrated task materialization")
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL")
     p.add_argument("--artifact-dir", type=Path, help="Optional local directory for run_state.json and default production task artifacts")
-    p.add_argument("--deployment", type=Path, help="sweetspot.deployment.v1 registry; normal --apply selects queue/job definition from the ready Plan")
+    p.add_argument("--deployment", type=Path, help="sweetspot.deployment.v1 registry; normal --apply selects queue/job definition from the ready Plan, and canary apply requires isolated canary_routes")
     p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL"), help="Legacy fallback SQS queue URL when --deployment is omitted")
     p.add_argument("--batch-job-queue", help="Legacy fallback AWS Batch job queue when --deployment is omitted")
     p.add_argument("--job-definition", help="Legacy fallback AWS Batch job definition when --deployment is omitted")

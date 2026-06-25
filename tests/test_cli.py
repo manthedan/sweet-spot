@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -344,6 +345,109 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual({task["job_type"] for task in tasks}, {"canary"})
         self.assertEqual([task["logical_unit_start"] for task in tasks[:3]], [0, 4, 8])
         self.assertEqual({task["input"]["candidate_vcpus"] for task in tasks}, {1, 2, 4})
+
+    def test_run_apply_can_launch_controller_canaries_on_isolated_routes(self) -> None:
+        class FakeCanarySQS:
+            def __init__(self) -> None:
+                self.sent_by_queue: dict[str, int] = {}
+
+            def send_message_batch(self, *, QueueUrl, Entries):
+                self.sent_by_queue[QueueUrl] = self.sent_by_queue.get(QueueUrl, 0) + len(Entries)
+                return {"Successful": [{"Id": e["Id"]} for e in Entries]}
+
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakeCanaryBatch(FakeSubmitBatch):
+            def __init__(self, image: str) -> None:
+                super().__init__()
+                self.image = image
+
+            def describe_job_definitions(self, **kwargs):
+                return {"jobDefinitions": [{"containerProperties": {"image": self.image}}]}
+
+        class FakeCanaryS3:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def head_object(self, **kwargs):
+                return {"ContentLength": len(self.body), "Metadata": {"sha256": hashlib.sha256(self.body).hexdigest()}, "ETag": '"etag"'}
+
+        class FakeCanarySession:
+            def __init__(self, *, sqs: FakeCanarySQS, batch: FakeCanaryBatch, s3: FakeCanaryS3) -> None:
+                self.sqs = sqs
+                self.batch = batch
+                self.s3 = s3
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return self.sqs
+                if service == "batch":
+                    return self.batch
+                if service == "s3":
+                    return self.s3
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            manifest_body = "".join(json.dumps({"unit": i}) + "\n" for i in range(9)).encode()
+            manifest.write_bytes(manifest_body)
+            spec = json.loads(Path("examples/job.x86.example.json").read_text())
+            image = spec["image"]
+            deployment = {
+                "schema": "sweetspot.deployment.v1",
+                "regions": {
+                    "us-west-2": {
+                        "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/prod",
+                        "architectures": {"x86_64": {"batch_job_queue": "prod-jq", "job_definition": "prod-jd:1", "image": image}},
+                        "canary_routes": {
+                            "x86_64-1vcpu-2048mib": {"sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/canary-x86-1", "batch_job_queue": "jq-1", "job_definition": "jd-1:1", "image": image},
+                            "x86_64-2vcpu-4096mib": {"sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/canary-x86-2", "batch_job_queue": "jq-2", "job_definition": "jd-2:1", "image": image},
+                            "x86_64-4vcpu-8192mib": {"sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/canary-x86-4", "batch_job_queue": "jq-4", "job_definition": "jd-4:1", "image": image},
+                        },
+                    }
+                },
+            }
+            deployment_path = root / "deployment.json"
+            deployment_path.write_text(json.dumps(deployment))
+            sqs = FakeCanarySQS()
+            batch = FakeCanaryBatch(image)
+            session = FakeCanarySession(sqs=sqs, batch=batch, s3=FakeCanaryS3(manifest_body))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--deployment",
+                str(deployment_path),
+                "--apply",
+            ]
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            report = json.loads(out.getvalue())
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            self.assertEqual(report["status"], "canary_workers_submitted")
+            self.assertEqual(phases["enqueue_canary_tasks"]["status"], "completed")
+            self.assertEqual(phases["submit_canary_workers"]["submitted_count"], 3)
+            self.assertEqual(sorted(sqs.sent_by_queue.values()), [3, 3, 3])
+            self.assertEqual(len(batch.submitted), 3)
+            submitted_vcpus = sorted(job["containerOverrides"]["vcpus"] for job in batch.submitted)
+            self.assertEqual(submitted_vcpus, [1, 2, 4])
+
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            resumed = json.loads(out.getvalue())
+            resumed_phases = {phase["name"]: phase for phase in resumed["phases"]}
+            self.assertTrue(resumed_phases["enqueue_canary_tasks"]["resumed"])
+            self.assertTrue(resumed_phases["submit_canary_workers"]["resumed"])
+            self.assertEqual(sorted(sqs.sent_by_queue.values()), [3, 3, 3])
+            self.assertEqual(len(batch.submitted), 3)
 
     def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

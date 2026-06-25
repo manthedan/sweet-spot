@@ -15,6 +15,44 @@
           "job_definition": "sweetspot-worker-arm:1",
           "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         }
+      },
+      "canary_routes": {
+        "x86_64-1vcpu-2048mib": {
+          "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-x86-1vcpu",
+          "batch_job_queue": "sweetspot-x86-spot-queue",
+          "job_definition": "sweetspot-worker-x86:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "x86_64-2vcpu-4096mib": {
+          "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-x86-2vcpu",
+          "batch_job_queue": "sweetspot-x86-spot-queue",
+          "job_definition": "sweetspot-worker-x86:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "x86_64-4vcpu-8192mib": {
+          "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-x86-4vcpu",
+          "batch_job_queue": "sweetspot-x86-spot-queue",
+          "job_definition": "sweetspot-worker-x86:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "arm64-1vcpu-2048mib": {
+          "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-arm-1vcpu",
+          "batch_job_queue": "sweetspot-arm-spot-queue",
+          "job_definition": "sweetspot-worker-arm:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "arm64-2vcpu-4096mib": {
+          "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-arm-2vcpu",
+          "batch_job_queue": "sweetspot-arm-spot-queue",
+          "job_definition": "sweetspot-worker-arm:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "arm64-4vcpu-8192mib": {
+          "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-arm-4vcpu",
+          "batch_job_queue": "sweetspot-arm-spot-queue",
+          "job_definition": "sweetspot-worker-arm:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
       }
     }
   }

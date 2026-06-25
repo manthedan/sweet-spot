@@ -60,7 +60,17 @@ sweetspot run job.json \
   --artifact-dir artifacts/RUN_ID
 ```
 
-This dry-run materializes `artifacts/RUN_ID/canary_tasks.jsonl` from tiny controller-owned shards. The artifact includes the built-in 1/2/4 vCPU resource lattice and, when `arm64` is allowed in the JobSpec, paired x86/ARM candidates. Review/run those canaries through the normal SweetSpot worker path using separate architecture queues/job definitions as needed, collect worker summaries, then rerun with measured telemetry:
+This dry-run materializes `artifacts/RUN_ID/canary_tasks.jsonl` from tiny controller-owned shards. The artifact includes the built-in 1/2/4 vCPU resource lattice and, when `arm64` is allowed in the JobSpec, paired x86/ARM candidates. If `deployment.json` declares isolated per-candidate `canary_routes` (for example `x86_64-1vcpu-2048mib`), the controller can launch those canaries safely:
+
+```bash
+sweetspot run job.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --deployment deployment.json \
+  --apply
+```
+
+Canary apply fails closed when any candidate route is missing or shares the production queue. Collect worker summaries, then rerun with measured telemetry:
 
 ```bash
 sweetspot run job.json \

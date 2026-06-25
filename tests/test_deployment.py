@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sweetspot.deployment import load_deployment, select_deployment_target, validate_local_manifest_matches_head, validate_target_matches_job
+from sweetspot.deployment import canary_deployment_target_for, load_deployment, select_canary_deployment_region, select_deployment_target, validate_local_manifest_matches_head, validate_target_matches_job
 from sweetspot.planner import load_plan
 
 
@@ -60,6 +60,28 @@ class DeploymentRegistryTests(unittest.TestCase):
         job_spec["image"] = job_spec["image"].replace("a" * 64, "b" * 64)
         with self.assertRaisesRegex(ValueError, "image digest"):
             validate_target_matches_job(job_spec=job_spec, target=target)
+
+    def test_canary_routes_are_isolated_per_candidate(self) -> None:
+        registry = json.loads((ROOT / "examples" / "deployment.example.json").read_text())
+        registry["regions"]["us-west-2"]["canary_routes"] = {
+            "x86_64-1vcpu-2048mib": {
+                "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-x86-1vcpu",
+                "batch_job_queue": "sweetspot-x86-spot-queue",
+                "job_definition": "sweetspot-worker-x86:1",
+                "image": registry["regions"]["us-west-2"]["architectures"]["x86_64"]["image"],
+            }
+        }
+        job_spec = json.loads((ROOT / "examples" / "job.x86.example.json").read_text())
+        region = select_canary_deployment_region(job_spec, registry)
+        task = {"task_id": "c", "input": {"candidate_architecture": "x86_64", "candidate_vcpus": 1, "candidate_memory_mib": 2048}}
+        target = canary_deployment_target_for(registry, region=region, task=task)
+        self.assertEqual(target.sqs_queue_url, "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-x86-1vcpu")
+        registry["regions"]["us-west-2"]["canary_routes"]["x86_64-1vcpu-2048mib"]["sqs_queue_url"] = registry["regions"]["us-west-2"]["sqs_queue_url"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deployment.json"
+            path.write_text(json.dumps(registry))
+            with self.assertRaisesRegex(ValueError, "isolated from the production queue"):
+                load_deployment(path)
 
     def test_manifest_binding_requires_local_remote_checksum_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
