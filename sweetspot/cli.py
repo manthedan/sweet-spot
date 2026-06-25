@@ -4202,6 +4202,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "plan", "repair", "run", "status", "version"})
+
+
+def _print_primary_help() -> None:
+    print("usage: sweetspot [--config CONFIG] {version,plan,run,status,repair,cancel,admin} ...")
+    print()
+    print("Primary controller workflow:")
+    print("  version   Print the installed SweetSpot package version")
+    print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
+    print("  run       Dry-run or apply the Plan-authoritative run controller")
+    print("  status    Show run artifacts, queue depth, DLQ depth, and active workers")
+    print("  repair    Dry-run/apply run-scoped repair planning")
+    print("  cancel    Dry-run/apply run-scoped Batch job cancellation")
+    print("  admin     List and run advanced/operator commands")
+    print()
+    print("Use `sweetspot admin --help` for lower-level enqueue, worker, finalize, scout, diagnostics, and cleanup commands.")
+
+
 ADMIN_COMMANDS = frozenset(
     {
         "cancel-jobs",
@@ -4579,20 +4597,27 @@ def main(argv: list[str] | None = None) -> int:
     config_path, raw_argv = _extract_config_arg(raw_argv)
     config = _load_config(config_path)
     raw_argv = _apply_config_defaults(raw_argv, config, _command_name(raw_argv))
+    if raw_argv and raw_argv[0] in {"-h", "--help"}:
+        _print_primary_help()
+        return 0
+    prog = "sweetspot"
     if raw_argv and raw_argv[0] == "admin":
         if len(raw_argv) == 1 or raw_argv[1] in {"-h", "--help"}:
+            print("primary workflow commands: " + ", ".join(sorted(PRIMARY_COMMANDS - {"admin"})))
             print("advanced/admin commands: " + ", ".join(sorted(ADMIN_COMMANDS)))
+            print("use: sweetspot admin <command> [args]")
             return 0
         admin_command = raw_argv[1]
         if admin_command not in ADMIN_COMMANDS:
             raise SystemExit(f"sweetspot admin supports advanced commands only; use top-level `{admin_command}` if it is part of the primary controller workflow")
         raw_argv = raw_argv[1:]
+        prog = "sweetspot admin"
     if raw_argv and raw_argv[0] == "scout":
-        return int(scout.main(raw_argv[1:], prog="sweetspot scout"))
+        return int(scout.main(raw_argv[1:], prog=f"{prog} scout"))
     if raw_argv and raw_argv[0] == "lane-manager":
-        return int(lane_manager.main(raw_argv[1:], prog="sweetspot lane-manager"))
+        return int(lane_manager.main(raw_argv[1:], prog=f"{prog} lane-manager"))
 
-    ap = argparse.ArgumentParser(prog="sweetspot")
+    ap = argparse.ArgumentParser(prog=prog)
     ap.add_argument("--config", type=Path, help="JSON config file with 'defaults' and per-command sections")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -4613,6 +4638,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL; requires --canary-summary-jsonl and --input-manifest-jsonl")
     p.add_argument("--out-canary-tasks-jsonl", type=Path, help="Optional local output path for controller-owned adaptive canary sweetspot.task.v1 JSONL; requires --input-manifest-jsonl")
     p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("admin", help="List and run advanced/admin commands")
+    p.add_argument("admin_args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=lambda _args: 0)
 
     p = _add_parser_with_examples(
         sub,
@@ -4650,11 +4679,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit Plan-sized workers, reconcile bounded dedicated-queue top-ups, optionally finalize, and persist run_state.json")
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)
+    p = sub.add_parser("scout", help=argparse.SUPPRESS, add_help=False)
     p.add_argument("scout_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_scout)
 
-    p = sub.add_parser("lane-manager", help="Dry-run/apply multi-region Spot worker lane submissions; forwards args to sweetspot-lane-manager", add_help=False)
+    p = sub.add_parser("lane-manager", help=argparse.SUPPRESS, add_help=False)
     p.add_argument("lane_manager_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_lane_manager)
 
@@ -4728,7 +4757,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("worker", help="Run an SQS worker inside AWS Batch")
+    p = sub.add_parser("worker", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
@@ -4767,7 +4796,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "enqueue-jsonl",
-        examples="  sweetspot enqueue-jsonl --tasks-jsonl tasks.jsonl --allowed-s3-prefix s3://bucket/run --submit --queue-url https://sqs...",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin enqueue-jsonl --tasks-jsonl tasks.jsonl --allowed-s3-prefix s3://bucket/run --submit --queue-url https://sqs...",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4782,8 +4812,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "enqueue-and-submit",
-        help="Atomically enqueue tasks, wait for SQS visibility, then submit Batch workers",
-        examples="  sweetspot enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url https://sqs... --batch-job-queue jq --job-definition jd --allowed-s3-prefix s3://bucket/run --submit",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url https://sqs... --batch-job-queue jq --job-definition jd --allowed-s3-prefix s3://bucket/run --submit",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4803,7 +4833,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "derive-canary",
-        examples="  sweetspot derive-canary --tasks-jsonl tasks.jsonl --out-dir artifacts/canary --task-count 4 --rewrite-run-id",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin derive-canary --tasks-jsonl tasks.jsonl --out-dir artifacts/canary --task-count 4 --rewrite-run-id",
     )
     p.add_argument("--tasks-jsonl", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
@@ -4818,7 +4849,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "submit-workers",
-        examples="  sweetspot submit-workers --queue-url https://sqs... --batch-job-queue jq --job-definition jd --messages-per-worker 1 --submit",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin submit-workers --queue-url https://sqs... --batch-job-queue jq --job-definition jd --messages-per-worker 1 --submit",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4832,7 +4864,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "supervise-workers",
-        examples="  sweetspot supervise-workers --queue-url https://sqs... --batch-job-queue jq --job-definition jd --target-active-workers 16 --loops 10 --submit",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin supervise-workers --queue-url https://sqs... --batch-job-queue jq --job-definition jd --target-active-workers 16 --loops 10 --submit",
     )
     p.add_argument("--run-id")
     p.add_argument("--profile")
@@ -4859,7 +4892,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "finalize",
-        examples="  sweetspot finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4883,7 +4917,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--require-complete", action="store_true")
     p.set_defaults(func=cmd_finalize)
 
-    p = sub.add_parser("jobs")
+    p = sub.add_parser("jobs", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--job-queue", required=True)
@@ -4896,8 +4930,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "cancel-jobs",
-        help="Dry-run/apply cancellation of matching AWS Batch jobs",
-        examples="  sweetspot cancel-jobs --job-queue jq --job-name-regex '^sweetspot-worker-.*'\n  sweetspot cancel-jobs --job-queue jq --job-name-regex '^sweetspot-worker-.*' --apply",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin cancel-jobs --job-queue jq --job-name-regex '^sweetspot-worker-.*'\n  sweetspot admin cancel-jobs --job-queue jq --job-name-regex '^sweetspot-worker-.*' --apply",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4914,8 +4948,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "repair-plan",
-        help="Build a repair JSONL from finalizer status while excluding tasks already owned by active jobs",
-        examples="  sweetspot repair-plan --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --out-jsonl repair.jsonl --job-queue jq --job-name-regex run-1",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin repair-plan --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --out-jsonl repair.jsonl --job-queue jq --job-name-regex run-1",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4936,8 +4970,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "cleanup-stale-messages",
-        help="Dry-run/apply deletion of visible SQS messages whose S3 done marker already exists",
-        examples="  sweetspot cleanup-stale-messages --queue-url https://sqs... --run-id run-1 --max-messages 100\n  sweetspot cleanup-stale-messages --queue-url https://sqs... --run-id run-1 --apply",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin cleanup-stale-messages --queue-url https://sqs... --run-id run-1 --max-messages 100\n  sweetspot admin cleanup-stale-messages --queue-url https://sqs... --run-id run-1 --apply",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -4953,8 +4987,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "estimate-runtime",
-        help="Estimate wall time/cost from canary or task summary telemetry",
-        examples="  sweetspot estimate-runtime --sample-jsonl canary_summaries.jsonl --target-units 10000000 --active-workers 32 --price-per-vcpu-hour 0.02",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin estimate-runtime --sample-jsonl canary_summaries.jsonl --target-units 10000000 --active-workers 32 --price-per-vcpu-hour 0.02",
     )
     p.add_argument("--sample-jsonl", action="append", type=Path, default=[], help="JSONL with task summaries/metrics containing completed_units+seconds; repeatable")
     p.add_argument("--completed-units", type=float)
@@ -4971,14 +5005,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-spot-task-seconds", type=float, default=1800.0)
     p.set_defaults(func=cmd_estimate_runtime)
 
-    p = sub.add_parser("describe-job")
+    p = sub.add_parser("describe-job", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--job-id", required=True)
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_describe_job)
 
-    p = sub.add_parser("logs")
+    p = sub.add_parser("logs", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--job-id")
@@ -4992,7 +5026,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_logs)
 
-    p = sub.add_parser("watch-job")
+    p = sub.add_parser("watch-job", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--job-id", required=True)
@@ -5001,7 +5035,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_watch_job)
 
-    p = sub.add_parser("s3-delete-prefix")
+    p = sub.add_parser("s3-delete-prefix", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--prefix", required=True, help="s3://bucket/prefix/ to inspect or delete")
@@ -5017,8 +5051,8 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "doctor",
-        help="Validate common AWS/SQS/S3/Batch/CloudWatch operator prerequisites",
-        examples="  sweetspot doctor --profile prod --region us-west-2 --queue-url https://sqs... --job-queue jq --job-definition jd --s3-prefix s3://bucket/run",
+        help=argparse.SUPPRESS,
+        examples="  sweetspot admin doctor --profile prod --region us-west-2 --queue-url https://sqs... --job-queue jq --job-definition jd --s3-prefix s3://bucket/run",
     )
     p.add_argument("--profile")
     p.add_argument("--region")
@@ -5037,7 +5071,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("dlq")
+    p = sub.add_parser("dlq", help=argparse.SUPPRESS)
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--dlq-url", required=True)

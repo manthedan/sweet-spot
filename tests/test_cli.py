@@ -108,6 +108,17 @@ class VersionTests(unittest.TestCase):
 
 
 class AdminCommandAliasTests(unittest.TestCase):
+    def test_top_level_help_stays_primary_workflow_focused(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["--help"]), 0)
+        text = out.getvalue()
+        self.assertIn("Primary controller workflow", text)
+        self.assertIn("{version,plan,run,status,repair,cancel,admin}", text)
+        self.assertIn("sweetspot admin --help", text)
+        self.assertNotIn("enqueue-jsonl", text)
+        self.assertNotIn("==SUPPRESS==", text)
+
     def test_admin_alias_dispatches_advanced_command(self) -> None:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -124,8 +135,19 @@ class AdminCommandAliasTests(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(main(["admin", "--help"]), 0)
-        self.assertIn("enqueue-jsonl", out.getvalue())
-        self.assertIn("finalize", out.getvalue())
+        text = out.getvalue()
+        self.assertIn("primary workflow commands", text)
+        self.assertIn("advanced/admin commands", text)
+        self.assertIn("enqueue-jsonl", text)
+        self.assertIn("finalize", text)
+        self.assertIn("use: sweetspot admin <command> [args]", text)
+
+    def test_admin_subcommand_help_uses_admin_prog(self) -> None:
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as raised, contextlib.redirect_stdout(out):
+            main(["admin", "enqueue-jsonl", "--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("usage: sweetspot admin enqueue-jsonl", out.getvalue())
 
 
 class PlanCommandTests(unittest.TestCase):
@@ -1690,6 +1712,45 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(report["messages_per_worker"], 2)
         self.assertEqual(report["raw_desired_workers"], 2)
 
+    def test_config_prepopulates_admin_alias_command_flags(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                self.queue_url = kwargs["QueueUrl"]
+                return {
+                    "Attributes": {
+                        "ApproximateNumberOfMessages": "4",
+                        "ApproximateNumberOfMessagesNotVisible": "0",
+                        "ApproximateNumberOfMessagesDelayed": "0",
+                    }
+                }
+
+        sqs = FakeSQS()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return object()
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "sweetspot.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "defaults": {"queue_url": "configured-queue"},
+                        "submit-workers": {"batch_job_queue": "jq", "job_definition": "jd", "messages_per_worker": 2},
+                    }
+                )
+            )
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--config", str(config_path), "admin", "submit-workers"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(sqs.queue_url, "configured-queue")
+        self.assertEqual(report["messages_per_worker"], 2)
+        self.assertEqual(report["raw_desired_workers"], 2)
+
     def test_config_after_regular_subcommand_still_applies(self) -> None:
         class FakeSQS:
             def get_queue_attributes(self, **kwargs):
@@ -1747,7 +1808,7 @@ class NestedToolCommandTests(unittest.TestCase):
     def test_admin_lane_manager_keeps_its_config_argument(self) -> None:
         with patch("sweetspot.cli.lane_manager.main", return_value=0) as fake:
             self.assertEqual(main(["admin", "lane-manager", "--config", "lanes.json", "--submit"]), 0)
-        fake.assert_called_once_with(["--config", "lanes.json", "--submit"], prog="sweetspot lane-manager")
+        fake.assert_called_once_with(["--config", "lanes.json", "--submit"], prog="sweetspot admin lane-manager")
 
 
 class StatusTests(unittest.TestCase):
