@@ -53,6 +53,7 @@ All notable changes to this project are documented here. This project uses human
 - Bounded production worker reconciliation rounds after initial Plan-sized submission, with shared-queue-safe backlog accounting and durable pre-submit persistence for any dedicated-queue top-up workers.
 - Integrated production finalization for `sweetspot run --apply --finalize`, which streams done-marker validation over persisted production tasks, writes finalizer artifacts, and records complete/incomplete finalizer state in `run_state.json`.
 - Safe controller-owned canary apply: canary Plans can enqueue/submit workers only through deployment-registry `canary_routes` that isolate every resource candidate on its own SQS queue/job definition; missing routes fail closed.
+- `sweetspot run --apply --collect-canary-summaries` to gather controller canary summaries from S3, persist the measured summary JSONL, and write production Plan/task artifacts when calibration is ready.
 - Shared Scout/Planner expected-cost model plus a Tiny Leela Stockfish 18 case study documenting the production lessons behind the controller workflow.
 - `sweetspot admin ...` aliases for advanced/operator commands such as enqueueing, worker submission, finalization, scouting, diagnostics, and cleanup.
 

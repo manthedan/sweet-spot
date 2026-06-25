@@ -70,7 +70,18 @@ sweetspot run job.json \
   --apply
 ```
 
-Canary apply fails closed when any candidate route is missing or shares the production queue. Collect worker summaries, then rerun with measured telemetry:
+Canary apply fails closed when any candidate route is missing or shares the production queue. After canary workers finish, the controller can collect each task's S3 summary and write `canary_summaries.jsonl`, `production_plan.json`, and (when calibration is ready) `production_tasks.jsonl`:
+
+```bash
+sweetspot run job.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --deployment deployment.json \
+  --apply \
+  --collect-canary-summaries
+```
+
+You can also collect worker summaries externally, then rerun with measured telemetry:
 
 ```bash
 sweetspot run job.json \

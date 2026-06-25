@@ -390,9 +390,15 @@ class RunCommandTests(unittest.TestCase):
         class FakeCanaryS3:
             def __init__(self, body: bytes) -> None:
                 self.body = body
+                self.objects: dict[tuple[str, str], bytes] = {}
 
             def head_object(self, **kwargs):
                 return {"ContentLength": len(self.body), "Metadata": {"sha256": hashlib.sha256(self.body).hexdigest()}, "ETag": '"etag"'}
+
+            def get_object(self, *, Bucket, Key):
+                if (Bucket, Key) not in self.objects:
+                    raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+                return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
 
         class FakeCanarySession:
             def __init__(self, *, sqs: FakeCanarySQS, batch: FakeCanaryBatch, s3: FakeCanaryS3) -> None:
@@ -469,6 +475,35 @@ class RunCommandTests(unittest.TestCase):
             self.assertTrue(resumed_phases["submit_canary_workers"]["resumed"])
             self.assertEqual(sorted(sqs.sent_by_queue.values()), [3, 3, 3])
             self.assertEqual(len(batch.submitted), 3)
+
+            canary_tasks = [json.loads(line) for line in (artifact_dir / "canary_tasks.jsonl").read_text().splitlines()]
+            for task in canary_tasks:
+                bucket, key = task["summary_s3"].removeprefix("s3://").split("/", 1)
+                candidate = task["input"]
+                summary = {
+                    "returncode": 0,
+                    "completed_units": candidate["canary_units_per_task"],
+                    "elapsed_sec": 100,
+                    "telemetry": {
+                        "architecture": candidate["candidate_architecture"],
+                        "region": "us-west-2",
+                        "worker_vcpus": candidate["candidate_vcpus"],
+                        "worker_memory_mib": candidate["candidate_memory_mib"],
+                        "completed_units": candidate["canary_units_per_task"],
+                        "useful_compute_seconds": 100,
+                    },
+                }
+                session.s3.objects[(bucket, key)] = json.dumps(summary).encode()
+            collect_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=session), contextlib.redirect_stdout(collect_out):
+                self.assertEqual(main([*argv, "--collect-canary-summaries"]), 0)
+            collected = json.loads(collect_out.getvalue())
+            collected_phases = {phase["name"]: phase for phase in collected["phases"]}
+            self.assertEqual(collected["status"], "production_plan_ready")
+            self.assertEqual(collected_phases["collect_canary_summaries"]["collected_count"], len(canary_tasks))
+            self.assertTrue((artifact_dir / "canary_summaries.jsonl").exists())
+            self.assertTrue((artifact_dir / "production_plan.json").exists())
+            self.assertTrue((artifact_dir / "production_tasks.jsonl").exists())
 
     def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

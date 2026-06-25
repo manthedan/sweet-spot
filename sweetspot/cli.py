@@ -670,6 +670,52 @@ def _canary_runtime_settings(plan: dict[str, Any], task: dict[str, Any]) -> dict
     }
 
 
+def _s3_missing_exception(exc: Exception) -> bool:
+    response = getattr(exc, "response", {})
+    code = str(response.get("Error", {}).get("Code", "")) if isinstance(response, dict) else ""
+    return code in {"404", "NoSuchKey", "NotFound"}
+
+
+def _collect_canary_summaries(s3, *, tasks: list[dict[str, Any]], out_jsonl: Path) -> dict[str, Any]:
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    collected = 0
+    missing_task_ids: list[str] = []
+    missing_summary_s3: list[str] = []
+    with out_jsonl.open("w", encoding="utf-8") as f:
+        for task in tasks:
+            task_id = str(task.get("task_id") or "")
+            summary_s3 = str(task.get("summary_s3") or "")
+            if not summary_s3:
+                missing_task_ids.append(task_id or "<missing-task-id>")
+                continue
+            try:
+                raw = s3_download_text(s3, summary_s3)
+            except Exception as exc:  # noqa: BLE001 - missing summaries are expected while canaries are still running
+                if _s3_missing_exception(exc):
+                    missing_task_ids.append(task_id or "<missing-task-id>")
+                    missing_summary_s3.append(summary_s3)
+                    continue
+                raise SystemExit(f"failed to download canary summary for task {task_id or '<missing-task-id>'}: {exc}") from exc
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"canary summary for task {task_id or '<missing-task-id>'} is not valid JSON: {summary_s3}") from exc
+            if not isinstance(obj, dict):
+                raise SystemExit(f"canary summary for task {task_id or '<missing-task-id>'} is not a JSON object: {summary_s3}")
+            f.write(json.dumps(obj, sort_keys=True) + "\n")
+            collected += 1
+    return {
+        "summary_jsonl": str(out_jsonl),
+        "task_count": len(tasks),
+        "collected_count": collected,
+        "missing_count": len(tasks) - collected,
+        "missing_task_ids": missing_task_ids[:1000],
+        "missing_task_ids_truncated": len(missing_task_ids) > 1000,
+        "missing_summary_s3": missing_summary_s3[:1000],
+        "complete": collected == len(tasks),
+    }
+
+
 def _run_integrated_finalizer(args: argparse.Namespace, *, spec: dict[str, Any], tasks_path: Path, artifact_dir: Path) -> tuple[int, dict[str, Any]]:
     finalizer_args = argparse.Namespace(
         allow_incomplete_ready=bool(getattr(args, "finalize_allow_incomplete_ready", False)),
@@ -751,6 +797,8 @@ def _cmd_run_canary_apply(
         }
     artifacts["run_state_json"] = str(state_path)
     tasks = _read_jsonl(tasks_path)
+    if getattr(args, "collect_canary_summaries", False) and previous_phases.get("submit_canary_workers", {}).get("status") != "completed":
+        raise SystemExit("--collect-canary-summaries requires an existing completed canary worker submission in run_state.json; first launch canaries without --collect-canary-summaries")
     _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=_default_run_allowed_s3_prefixes(args, spec))
     try:
         grouped = group_canary_tasks_by_candidate(tasks)
@@ -1036,7 +1084,55 @@ def _cmd_run_canary_apply(
                 next_actions=["Canary workers have been submitted; collect summary JSONL and rerun plan/run with --canary-summary-jsonl."],
             )
 
-    phases = phases_base + [enqueue_phase, submit_phase, {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}]
+    collect_phase: dict[str, Any] = {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}
+    if getattr(args, "collect_canary_summaries", False):
+        summary_path = args.artifact_dir / "canary_summaries.jsonl"
+        s3_for_summaries = _aws_client_for_target(args, "s3", first_target)
+        collection = _collect_canary_summaries(s3_for_summaries, tasks=tasks, out_jsonl=summary_path)
+        artifacts["canary_summary_jsonl"] = str(summary_path)
+        collect_phase = {**collect_phase, **collection, "status": "completed" if collection["complete"] else "incomplete"}
+        phases = phases_base + [enqueue_phase, submit_phase, collect_phase]
+        next_actions = ["Canary summaries are still incomplete; rerun with --collect-canary-summaries after canary workers finish."]
+        report_status = "canary_summaries_incomplete"
+        production_plan = plan
+        if collection["complete"]:
+            summaries = _read_jsonl(summary_path)
+            try:
+                production_plan = plan_with_adaptive_canaries(spec, summaries, logical_unit_count=logical_unit_count)
+            except PlannerSpecError as exc:
+                raise SystemExit(str(exc)) from exc
+            production_plan_path = args.artifact_dir / "production_plan.json"
+            production_plan_path.write_text(json.dumps(production_plan, indent=2, sort_keys=True) + "\n")
+            artifacts["production_plan_json"] = str(production_plan_path)
+            if production_plan.get("status") == "ready":
+                production_tasks_path = args.artifact_dir / "production_tasks.jsonl"
+                _write_production_tasks_from_plan(spec, production_plan, logical_unit_count, production_tasks_path)
+                artifacts["production_tasks_jsonl"] = str(production_tasks_path)
+                artifacts["production_task_count"] = production_plan.get("artifacts", {}).get("production_task_count")
+                artifacts["production_tasks_sha256"] = _sha256_file(production_tasks_path)
+                collect_phase = {**collect_phase, "status": "completed", "production_plan": str(production_plan_path), "production_tasks": str(production_tasks_path)}
+                phases = phases_base + [enqueue_phase, submit_phase, collect_phase]
+                report_status = "production_plan_ready"
+                next_actions = [f"Review {production_plan_path}, then run production apply with --canary-summary-jsonl {summary_path}."]
+            else:
+                report_status = "canary_summaries_collected"
+                next_actions = [f"Review {production_plan_path}; additional canaries may be required before production apply."]
+        report = _build_run_report(
+            spec=spec,
+            plan=production_plan,
+            mode="apply",
+            applied=True,
+            status=report_status,
+            artifacts=artifacts,
+            phases=phases,
+            job_spec_sha256=job_spec_sha256,
+            controller=controller_base,
+            next_actions=next_actions,
+        )
+        _write_run_state(state_path, report)
+        return report
+
+    phases = phases_base + [enqueue_phase, submit_phase, collect_phase]
     report = _build_run_report(
         spec=spec,
         plan=plan,
@@ -4159,6 +4255,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "artifact_dir",
         "batch_job_queue",
         "canary_summary_jsonl",
+        "collect_canary_summaries",
         "deployment",
         "dedicated_run_queue",
         "env",
@@ -4475,6 +4572,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--profile")
     p.add_argument("--region")
     p.add_argument("--canary-summary-jsonl", type=Path, help="Optional local JSONL of canary worker summaries or normalized observations for adaptive shard sizing")
+    p.add_argument("--collect-canary-summaries", action="store_true", help="After controller canary workers are submitted, collect canary task summaries from S3 and write production plan/task artifacts when ready")
     p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units for calibrated task materialization")
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL")
     p.add_argument("--artifact-dir", type=Path, help="Optional local directory for run_state.json and default production task artifacts")
