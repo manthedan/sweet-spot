@@ -32,6 +32,12 @@ from .deployment import (
     validate_local_manifest_matches_head,
     validate_target_matches_job,
 )
+from .enqueue_service import (
+    send_tasks_to_sqs as _send_tasks_to_sqs,
+    validate_tasks_for_enqueue as _validate_tasks_for_enqueue,
+    wait_for_visible_backlog as _wait_for_visible_backlog,
+    write_enqueue_artifacts as _write_enqueue_artifacts,
+)
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .planner import PlannerSpecError, initial_blocked_plan, iter_canary_tasks_from_logical_unit_count, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
 from .run_state import (
@@ -43,7 +49,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
-from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
+from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
 
 
@@ -74,11 +80,6 @@ def _count_jsonl_objects(path: Path) -> int:
     return sum(1 for _ in _iter_jsonl(path))
 
 
-def _chunks(xs: list[dict[str, Any]], n: int) -> Iterable[list[dict[str, Any]]]:
-    for i in range(0, len(xs), n):
-        yield xs[i : i + n]
-
-
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -104,57 +105,6 @@ def _aws_client(args: argparse.Namespace, service: str):
     if profile or region:
         return boto3.Session(profile_name=profile, region_name=region).client(service, region_name=region)
     return boto3.client(service)
-
-
-def _validate_unique_task_ids(tasks: list[dict[str, Any]], *, context: str) -> None:
-    seen: dict[str, int] = {}
-    duplicates: list[str] = []
-    for i, task in enumerate(tasks, start=1):
-        task_id = str(task.get("task_id") or "")
-        if task_id in seen:
-            duplicates.append(f"{task_id!r} at lines {seen[task_id]} and {i}")
-        elif task_id:
-            seen[task_id] = i
-    if duplicates:
-        raise SystemExit(f"duplicate task_id values in {context}: {', '.join(duplicates[:10])}")
-
-
-def _validate_tasks_for_enqueue(tasks: list[dict[str, Any]], *, allowed_s3_prefixes: list[str] | tuple[str, ...] | None) -> None:
-    _validate_unique_task_ids(tasks, context="enqueue JSONL")
-    for i, task in enumerate(tasks, start=1):
-        try:
-            validate_task_model(task, default_timeout_seconds=SAFE_TASK_TIMEOUT_SECONDS, max_timeout_seconds=SAFE_TASK_TIMEOUT_SECONDS, allowed_s3_prefixes=allowed_s3_prefixes)
-        except ValueError as exc:
-            raise SystemExit(f"invalid task at line {i}: {exc}") from exc
-
-
-def _write_enqueue_artifacts(tasks: list[dict[str, Any]], artifact_dir: Path) -> Path:
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    tasks_out = artifact_dir / "tasks.jsonl"
-    tasks_out.write_text("".join(json.dumps(t, sort_keys=True) + "\n" for t in tasks))
-    return tasks_out
-
-
-def _send_tasks_to_sqs(sqs, *, queue_url: str, tasks: list[dict[str, Any]]) -> int:
-    sent = 0
-    for batch in _chunks(tasks, 10):
-        entries = [{"Id": str(i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(batch)]
-        resp = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
-        if resp.get("Failed"):
-            raise SystemExit(f"send_message_batch failed: {resp['Failed']}")
-        sent += len(resp.get("Successful", []))
-    return sent
-
-
-def _wait_for_visible_backlog(sqs, *, queue_url: str, min_visible: int, max_seconds: float, interval_seconds: float) -> tuple[dict[str, int], list[dict[str, Any]]]:
-    deadline = time.time() + max(0.0, max_seconds)
-    history: list[dict[str, Any]] = []
-    while True:
-        depth = queue_depth(sqs, queue_url)
-        history.append({"checked_at": iso_now(), **depth})
-        if depth["visible"] >= min_visible or max_seconds <= 0 or time.time() >= deadline:
-            return depth, history
-        time.sleep(max(0.1, interval_seconds))
 
 
 def _extract_task_id_from_log_message(message: str) -> str | None:
