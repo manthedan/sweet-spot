@@ -16,3 +16,4 @@ artifacts/
 !infra/opentofu/.terraform.lock.hcl
 *.tfplan
 docs/expert_review_analysis.md
+.factory/
