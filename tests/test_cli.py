@@ -46,6 +46,7 @@ from sweetspot.cli import (
     _parse_index_selection,
     _redact_env,
     _sample_from_runtime_obj,
+    _sha256_json_obj,
     _supervisor_desired_workers,
     _validate_s3_delete_prefix,
     _worker_overrides,
@@ -1125,13 +1126,369 @@ class RunCommandTests(unittest.TestCase):
             state_reconcile["rounds_completed"] = 1
             state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
 
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "larger round limit"):
+                main(argv)
+            self.assertEqual(len(batch.submitted), 2)
+
+    def test_run_apply_reconcile_until_drained_stops_before_round_limit(self) -> None:
+        class EmptyPaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class ZeroActiveBatch(FakeSubmitBatch):
+            def get_paginator(self, name):
+                return EmptyPaginator()
+
+        class DrainingSQS(FakeQueueDepthSQS):
+            def get_queue_attributes(self, **kwargs):
+                self.depth_calls += 1
+                visible = self.sent if self.depth_calls <= 3 else 0
+                return {"Attributes": {"ApproximateNumberOfMessages": str(visible), "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        sqs = DrainingSQS()
+        batch = ZeroActiveBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--dedicated-run-queue",
+                "--reconcile-until-drained",
+                "--reconcile-rounds",
+                "3",
+                "--apply",
+            ]
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
                 self.assertEqual(main(argv), 0)
-            resumed = json.loads(out.getvalue())
-            resumed_reconcile = {phase["name"]: phase for phase in resumed["phases"]}["reconcile_workers"]
-            self.assertEqual(resumed_reconcile["status"], "completed")
+            report = json.loads(out.getvalue())
+            reconcile = {phase["name"]: phase for phase in report["phases"]}["reconcile_workers"]
+            self.assertEqual(reconcile["status"], "completed")
+            self.assertTrue(reconcile["drained"])
+            self.assertEqual(reconcile["stop_reason"], "drained")
+            self.assertEqual(reconcile["rounds_completed"], 2)
+            self.assertEqual(len(reconcile["decisions"]), 2)
             self.assertEqual(len(batch.submitted), 2)
+
+    def test_run_apply_reconcile_until_drained_counts_delayed_messages(self) -> None:
+        class EmptyPaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class ZeroActiveBatch(FakeSubmitBatch):
+            def get_paginator(self, name):
+                return EmptyPaginator()
+
+        class DelayedThenDrainedSQS(FakeQueueDepthSQS):
+            def get_queue_attributes(self, **kwargs):
+                self.depth_calls += 1
+                visible = self.sent if self.depth_calls <= 2 else 0
+                delayed = self.sent if self.depth_calls == 3 else 0
+                return {"Attributes": {"ApproximateNumberOfMessages": str(visible), "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": str(delayed)}}
+
+        sqs = DelayedThenDrainedSQS()
+        batch = ZeroActiveBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "run",
+                            "examples/job.x86.example.json",
+                            "--canary-summary-jsonl",
+                            str(summaries),
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--artifact-dir",
+                            str(artifact_dir),
+                            "--queue-url",
+                            "https://sqs.example/q",
+                            "--batch-job-queue",
+                            "jq",
+                            "--job-definition",
+                            "jd",
+                            "--dedicated-run-queue",
+                            "--reconcile-until-drained",
+                            "--reconcile-rounds",
+                            "3",
+                            "--apply",
+                        ]
+                    ),
+                    0,
+                )
+            reconcile = {phase["name"]: phase for phase in json.loads(out.getvalue())["phases"]}["reconcile_workers"]
+            self.assertEqual(reconcile["decisions"][0]["queue_depth"]["delayed"], 3)
+            self.assertEqual(reconcile["decisions"][0]["run_backlog_estimate"], 3)
+            self.assertFalse(reconcile["decisions"][0]["drained"])
+            self.assertTrue(reconcile["drained"])
+            self.assertEqual(reconcile["rounds_completed"], 2)
+
+    def test_run_apply_can_extend_completed_reconciliation_rounds(self) -> None:
+        class EmptyPaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class ZeroActiveBatch(FakeSubmitBatch):
+            def get_paginator(self, name):
+                return EmptyPaginator()
+
+        sqs = FakeQueueDepthSQS()
+        batch = ZeroActiveBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            base_argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--dedicated-run-queue",
+                "--apply",
+            ]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(base_argv + ["--reconcile-rounds", "1"]), 0)
+            state_path = artifact_dir / "run_state.json"
+            state = json.loads(state_path.read_text())
+            phases = {phase["name"]: phase for phase in state["phases"]}
+            first_reconcile = phases["reconcile_workers"]
+            self.assertEqual(first_reconcile["rounds_completed"], 1)
+            submit_phase = phases["submit_workers"]
+            enqueue_phase = phases["enqueue_tasks"]
+            selected = state["plan"]["selected"]
+            submit_phase["worker_config_sha256"] = _sha256_json_obj(
+                {
+                    "allow_legacy_done_markers": False,
+                    "allowed_s3_prefixes": enqueue_phase["allowed_s3_prefixes"],
+                    "batch_job_queue": "jq",
+                    "dedicated_run_queue": True,
+                    "env": [],
+                    "heartbeat_seconds": int(selected["heartbeat_seconds"]),
+                    "include_not_visible": False,
+                    "job_definition": "jd",
+                    "job_name_prefix": submit_phase["job_name_prefix"],
+                    "log_tail_bytes": 12000,
+                    "max_log_bytes": 5242880,
+                    "memory": int(selected["memory_mib"]),
+                    "messages_per_worker": submit_phase["messages_per_worker"],
+                    "plan_estimated_workers": selected["estimated_workers"],
+                    "profile": None,
+                    "queue_url": "https://sqs.example/q",
+                    "redact_regex": [],
+                    "region": "us-west-2",
+                    "retry_attempts": None,
+                    "task_timeout_seconds": float(selected["task_timeout_seconds"]),
+                    "vcpus": int(selected["vcpus"]),
+                    "visibility_timeout": int(selected["visibility_timeout_seconds"]),
+                    "wait_for_visible_min": None,
+                    "wait_for_visible_seconds": 0.0,
+                    "wait_interval_seconds": 1.0,
+                    "kickoff_only": False,
+                    "reconcile_interval_seconds": 0.0,
+                    "reconcile_rounds": 1,
+                }
+            )
+            state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(base_argv + ["--reconcile-rounds", "2"]), 0)
+            report = json.loads(out.getvalue())
+            reconcile = {phase["name"]: phase for phase in report["phases"]}["reconcile_workers"]
+            self.assertEqual(reconcile["rounds_completed"], 2)
+            self.assertEqual(len(reconcile["decisions"]), 2)
+            self.assertEqual(len(batch.submitted), 3)
+
+    def test_run_apply_rejects_dedicated_queue_resume_drift(self) -> None:
+        sqs = FakeQueueDepthSQS()
+        batch = FakeSubmitBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            base_argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--apply",
+            ]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(base_argv), 0)
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "different worker settings"):
+                main(base_argv + ["--dedicated-run-queue", "--reconcile-until-drained"])
+
+    def test_run_apply_rejects_dropping_in_progress_drain_watch(self) -> None:
+        class EmptyPaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class ZeroActiveBatch(FakeSubmitBatch):
+            def get_paginator(self, name):
+                return EmptyPaginator()
+
+        sqs = FakeQueueDepthSQS()
+        batch = ZeroActiveBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--dedicated-run-queue",
+                "--apply",
+            ]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(argv + ["--reconcile-until-drained", "--reconcile-rounds", "2"]), 0)
+            state_path = artifact_dir / "run_state.json"
+            state = json.loads(state_path.read_text())
+            phases = {phase["name"]: phase for phase in state["phases"]}
+            phases["reconcile_workers"]["status"] = "in_progress"
+            phases["reconcile_workers"]["until_drained"] = True
+            phases["reconcile_workers"]["drained"] = False
+            phases["reconcile_workers"]["rounds_completed"] = 1
+            state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "resume with --reconcile-until-drained"):
+                main(argv)
+            state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "larger round limit"):
+                main(argv + ["--reconcile-until-drained", "--reconcile-rounds", "1"])
+
+    def test_run_apply_reconcile_until_drained_requires_dedicated_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text(json.dumps({"unit": 0}) + "\n")
+            with self.assertRaisesRegex(SystemExit, "--reconcile-until-drained requires --dedicated-run-queue"):
+                main(
+                    [
+                        "run",
+                        "examples/job.x86.example.json",
+                        "--canary-summary-jsonl",
+                        str(summaries),
+                        "--input-manifest-jsonl",
+                        str(manifest),
+                        "--artifact-dir",
+                        str(root / "artifacts"),
+                        "--queue-url",
+                        "https://sqs.example/q",
+                        "--batch-job-queue",
+                        "jq",
+                        "--job-definition",
+                        "jd",
+                        "--reconcile-until-drained",
+                        "--apply",
+                    ]
+                )
 
     def test_run_apply_can_finalize_production_tasks(self) -> None:
         sqs = FakeQueueDepthSQS()
