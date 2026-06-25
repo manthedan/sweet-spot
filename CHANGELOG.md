@@ -60,6 +60,7 @@ All notable changes to this project are documented here. This project uses human
 
 ### Changed
 
+- Top-level `sweetspot --help` now presents the primary controller workflow (`plan`, `run`, `status`, `repair`, `cancel`) plus `admin`, while lower-level/operator commands are documented under `sweetspot admin ...`; direct legacy top-level forms remain accepted for compatibility.
 - README and bundled agent skills now demote lower-level enqueue/worker/finalize/scout/reference workflows as advanced/admin surfaces and point new runs to `sweetspot-run`.
 - Controller run-state, enqueue, and Batch worker helper logic moved into `sweetspot.run_state`, `sweetspot.enqueue_service`, and `sweetspot.batch_service` so CLI orchestration can continue thinning into services without changing JSON contracts.
 - `sweetspot scout` now emits JSON to stdout by default; human table output is opt-in with `--format table`.
