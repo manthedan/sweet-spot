@@ -6,6 +6,8 @@ Install the Python package and use the `sweetspot` CLI's primary controller work
 
 This project packages a reliability pattern for large retryable AWS Batch jobs:
 
+![SweetSpot architecture](docs/assets/sweetspot_architecture.webp)
+
 ```text
 SQS task message
 → worker checks deterministic S3 done marker
@@ -19,6 +21,52 @@ SQS task message
 If a Spot host dies before ack, SQS visibility timeout returns the task. If a task repeatedly fails, SQS redrives it to the DLQ.
 
 SweetSpot is an at-least-once runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent, or use `task_id` as their own idempotency key for external side effects. Do not expose the queue to untrusted producers.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Agent submits JobSpec]
+    B[SweetSpot plans and controls run]
+    C[SQS task queue]
+    D[AWS Batch Spot workers]
+    E[S3 outputs and completion markers]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> B
+```
+
+```mermaid
+flowchart TD
+    A[Agent provides JobSpec<br/>workload, budget, deadline]
+    B[SweetSpot planner]
+    C{Enough workload telemetry?}
+    D[Run small canaries<br/>x86 / ARM and resource shapes]
+    E[Create production plan<br/>shard size, CPU, memory, workers]
+    F[Enqueue tasks in SQS]
+    G[AWS Batch Spot workers]
+    H[S3 outputs, summaries<br/>and done markers]
+    I{Run complete?}
+    J[Retry, top up workers<br/>or create repair tasks]
+    K[Finalize run]
+
+    A --> B
+    B --> C
+    C -- No --> D
+    D --> H
+    H --> B
+    C -- Yes --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I -- No --> J
+    J --> F
+    I -- Yes --> K
+```
 
 ## What it is
 
