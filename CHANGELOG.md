@@ -54,10 +54,12 @@ All notable changes to this project are documented here. This project uses human
 - Integrated production finalization for `sweetspot run --apply --finalize`, which streams done-marker validation over persisted production tasks, writes finalizer artifacts, and records complete/incomplete finalizer state in `run_state.json`.
 - Safe controller-owned canary apply: canary Plans can enqueue/submit workers only through deployment-registry `canary_routes` that isolate every resource candidate on its own SQS queue/job definition; missing routes fail closed.
 - Shared Scout/Planner expected-cost model plus a Tiny Leela Stockfish 18 case study documenting the production lessons behind the controller workflow.
+- `sweetspot admin ...` aliases for advanced/operator commands such as enqueueing, worker submission, finalization, scouting, diagnostics, and cleanup.
 
 ### Changed
 
 - README and bundled agent skills now demote lower-level enqueue/worker/finalize/scout/reference workflows as advanced/admin surfaces and point new runs to `sweetspot-run`.
+- Controller run-state helpers moved into `sweetspot.run_state` so CLI orchestration can continue thinning into services without changing JSON contracts.
 - `sweetspot scout` now emits JSON to stdout by default; human table output is opt-in with `--format table`.
 
 ### Fixed
