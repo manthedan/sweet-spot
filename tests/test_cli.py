@@ -106,6 +106,27 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(report["version"], "1.2.3")
 
 
+class AdminCommandAliasTests(unittest.TestCase):
+    def test_admin_alias_dispatches_advanced_command(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["admin", "estimate-runtime", "--completed-units", "10", "--elapsed-seconds", "5", "--target-units", "100"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.runtime_estimate.v1")
+        self.assertEqual(report["target_units"], 100.0)
+
+    def test_admin_alias_rejects_primary_controller_command(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "advanced commands only"):
+            main(["admin", "run", "examples/job.x86.example.json"])
+
+    def test_admin_help_lists_advanced_commands(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["admin", "--help"]), 0)
+        self.assertIn("enqueue-jsonl", out.getvalue())
+        self.assertIn("finalize", out.getvalue())
+
+
 class PlanCommandTests(unittest.TestCase):
     def test_plan_emits_blocked_json_plan_for_valid_job_spec(self) -> None:
         out = io.StringIO()
@@ -1329,6 +1350,11 @@ class NestedToolCommandTests(unittest.TestCase):
     def test_lane_manager_keeps_its_config_argument(self) -> None:
         with patch("sweetspot.cli.lane_manager.main", return_value=0) as fake:
             self.assertEqual(main(["lane-manager", "--config", "lanes.json", "--submit"]), 0)
+        fake.assert_called_once_with(["--config", "lanes.json", "--submit"], prog="sweetspot lane-manager")
+
+    def test_admin_lane_manager_keeps_its_config_argument(self) -> None:
+        with patch("sweetspot.cli.lane_manager.main", return_value=0) as fake:
+            self.assertEqual(main(["admin", "lane-manager", "--config", "lanes.json", "--submit"]), 0)
         fake.assert_called_once_with(["--config", "lanes.json", "--submit"], prog="sweetspot lane-manager")
 
 

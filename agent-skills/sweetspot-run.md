@@ -106,4 +106,4 @@ Keep x86 as the safe default. Include `arm64` in `constraints.architectures` onl
 
 ## Advanced commands
 
-`enqueue-jsonl`, `submit-workers`, `finalize`, `repair-plan`, `cleanup-stale-messages`, `scout`, and `lane-manager` remain available for debugging/admin workflows, but they are not the primary interface for new agents.
+`enqueue-jsonl`, `submit-workers`, `finalize`, `repair-plan`, `cleanup-stale-messages`, `scout`, and `lane-manager` remain available for debugging/admin workflows, but they are not the primary interface for new agents. Prefer the explicit aliases such as `sweetspot admin enqueue-jsonl`, `sweetspot admin finalize`, and `sweetspot admin scout` when intentionally leaving the primary controller workflow.

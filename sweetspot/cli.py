@@ -34,6 +34,14 @@ from .deployment import (
 )
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .planner import PlannerSpecError, initial_blocked_plan, iter_canary_tasks_from_logical_unit_count, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
+from .run_state import (
+    load_run_state as _load_run_state,
+    phase_by_name as _phase_by_name,
+    phase_completed as _phase_completed,
+    replace_or_append_phase as _replace_or_append_phase,
+    run_state_has_apply_progress as _run_state_has_apply_progress,
+    write_run_state as _write_run_state,
+)
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
 from .task_model import default_done_s3, parse_allowed_s3_prefixes, task_hash, validate_task_model
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_done_marker, validate_worker_timing
@@ -422,61 +430,6 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_run_state(path: Path, *, run_id: str, job_spec_sha256: str | None = None, require_job_spec_sha256: bool = False) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"existing run state at {path} is not valid JSON: {exc}") from exc
-    if not isinstance(state, dict):
-        raise SystemExit(f"existing run state at {path} is not a JSON object")
-    existing_run_id = state.get("run_id")
-    if existing_run_id and existing_run_id != run_id:
-        raise SystemExit(f"existing run state at {path} is for run_id={existing_run_id!r}, not {run_id!r}")
-    existing_hash = state.get("job_spec_sha256")
-    if require_job_spec_sha256 and job_spec_sha256 and not existing_hash:
-        raise SystemExit(f"existing run state at {path} does not record job_spec_sha256; rerun dry-run in a new artifact directory before applying")
-    if job_spec_sha256 and existing_hash and existing_hash != job_spec_sha256:
-        raise SystemExit(f"existing run state at {path} was created for a different JobSpec")
-    return state
-
-
-def _phase_by_name(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    phases = state.get("phases")
-    if not isinstance(phases, list):
-        return {}
-    out: dict[str, dict[str, Any]] = {}
-    for phase in phases:
-        if isinstance(phase, dict) and phase.get("name"):
-            out[str(phase["name"])] = phase
-    return out
-
-
-def _phase_completed(state: dict[str, Any], name: str) -> bool:
-    return _phase_by_name(state).get(name, {}).get("status") == "completed"
-
-
-def _run_state_has_apply_progress(state: dict[str, Any]) -> bool:
-    if not state:
-        return False
-    controller_obj = state.get("controller")
-    controller: dict[str, Any] = controller_obj if isinstance(controller_obj, dict) else {}
-    if state.get("applied") is True or state.get("mode") == "apply" or controller.get("mutations_allowed") is True:
-        return True
-    phases = _phase_by_name(state)
-    for name in ("enqueue_tasks", "submit_workers"):
-        status = phases.get(name, {}).get("status")
-        if status and status != "not_started":
-            return True
-    return False
-
-
-def _write_run_state(path: Path, report: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
 def _sha256_json_obj(obj: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -766,21 +719,6 @@ def _canary_runtime_settings(plan: dict[str, Any], task: dict[str, Any]) -> dict
         "visibility_timeout": int(math.ceil(visibility_timeout)),
         "heartbeat_seconds": int(math.ceil(heartbeat_seconds)),
     }
-
-
-def _replace_or_append_phase(phases: list[dict[str, Any]], phase: dict[str, Any]) -> list[dict[str, Any]]:
-    name = phase.get("name")
-    replaced = False
-    out: list[dict[str, Any]] = []
-    for existing in phases:
-        if name and existing.get("name") == name:
-            out.append(phase)
-            replaced = True
-        else:
-            out.append(existing)
-    if not replaced:
-        out.append(phase)
-    return out
 
 
 def _run_integrated_finalizer(args: argparse.Namespace, *, spec: dict[str, Any], tasks_path: Path, artifact_dir: Path) -> tuple[int, dict[str, Any]]:
@@ -4256,6 +4194,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+ADMIN_COMMANDS = frozenset(
+    {
+        "cancel-jobs",
+        "cleanup-stale-messages",
+        "derive-canary",
+        "describe-job",
+        "dlq",
+        "doctor",
+        "enqueue-and-submit",
+        "enqueue-jsonl",
+        "estimate-runtime",
+        "finalize",
+        "jobs",
+        "lane-manager",
+        "logs",
+        "repair-plan",
+        "s3-delete-prefix",
+        "scout",
+        "submit-workers",
+        "supervise-workers",
+        "watch-job",
+        "worker",
+    }
+)
+
+
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "cancel": {"apply", "job_name_prefix", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cancel-jobs": {"apply", "format", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
@@ -4504,7 +4468,7 @@ def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
             break
         if command is None and not arg.startswith("-"):
             command = arg
-        if command == "lane-manager":
+        if command == "lane-manager" or (command == "admin" and arg == "lane-manager"):
             stripped.extend(argv[i:])
             break
         if arg == "--config":
@@ -4537,12 +4501,17 @@ def _load_config(path: Path | None) -> dict[str, Any]:
 
 
 def _command_name(argv: list[str]) -> str | None:
+    saw_admin = False
     for arg in argv:
         if arg == "--":
             return None
-        if not arg.startswith("-"):
-            return arg
-    return None
+        if arg.startswith("-"):
+            continue
+        if arg == "admin" and not saw_admin:
+            saw_admin = True
+            continue
+        return arg
+    return "admin" if saw_admin else None
 
 
 def _config_values(config: dict[str, Any], command: str | None) -> dict[str, Any]:
@@ -4598,6 +4567,14 @@ def main(argv: list[str] | None = None) -> int:
     config_path, raw_argv = _extract_config_arg(raw_argv)
     config = _load_config(config_path)
     raw_argv = _apply_config_defaults(raw_argv, config, _command_name(raw_argv))
+    if raw_argv and raw_argv[0] == "admin":
+        if len(raw_argv) == 1 or raw_argv[1] in {"-h", "--help"}:
+            print("advanced/admin commands: " + ", ".join(sorted(ADMIN_COMMANDS)))
+            return 0
+        admin_command = raw_argv[1]
+        if admin_command not in ADMIN_COMMANDS:
+            raise SystemExit(f"sweetspot admin supports advanced commands only; use top-level `{admin_command}` if it is part of the primary controller workflow")
+        raw_argv = raw_argv[1:]
     if raw_argv and raw_argv[0] == "scout":
         return int(scout.main(raw_argv[1:], prog="sweetspot scout"))
     if raw_argv and raw_argv[0] == "lane-manager":
