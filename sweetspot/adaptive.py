@@ -54,6 +54,16 @@ def _positive_int(value: Any) -> int | None:
     return max(1, int(parsed))
 
 
+def _non_negative_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
 def _commit_status(summary: dict[str, Any]) -> str:
     return str(summary.get("commit_status") or "").strip().lower()
 
@@ -109,6 +119,15 @@ def canary_observation_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
     commit_status = _commit_status(summary)
     success = summary.get("returncode") in (None, 0) and not summary.get("timed_out") and not summary.get("framework_error") and commit_status in SUCCESS_COMMIT_STATUSES
     architecture = _normalize_architecture(telemetry.get("architecture") or summary.get("architecture"))
+    worker_vcpus = _positive_float(telemetry.get("worker_vcpus") or summary.get("worker_vcpus") or summary.get("vcpus"))
+    hourly_price_usd = _positive_float(telemetry.get("hourly_price_usd") or telemetry.get("spot_hourly_price_usd") or summary.get("hourly_price_usd"))
+    vcpu_hour_usd = _positive_float(telemetry.get("vcpu_hour_usd") or telemetry.get("vcpu_hour_price_usd") or summary.get("vcpu_hour_usd"))
+    if vcpu_hour_usd is None and hourly_price_usd is not None and worker_vcpus:
+        vcpu_hour_usd = hourly_price_usd / worker_vcpus
+    replay_fraction = _non_negative_float(telemetry.get("replay_fraction") or summary.get("replay_fraction"))
+    discarded_compute_seconds = _non_negative_float(telemetry.get("discarded_compute_seconds") or summary.get("discarded_compute_seconds"))
+    if replay_fraction is None and discarded_compute_seconds is not None and seconds and seconds > 0:
+        replay_fraction = discarded_compute_seconds / seconds
     observation: dict[str, Any] = {
         "task_id": summary.get("task_id"),
         "success": bool(success),
@@ -119,9 +138,14 @@ def canary_observation_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "architecture": architecture,
         "region": telemetry.get("region") or summary.get("region"),
         "instance_type": telemetry.get("instance_type") or summary.get("instance_type"),
-        "worker_vcpus": _positive_float(telemetry.get("worker_vcpus") or summary.get("worker_vcpus") or summary.get("vcpus")),
+        "worker_vcpus": worker_vcpus,
         "worker_memory_mib": _positive_float(telemetry.get("worker_memory_mib") or summary.get("worker_memory_mib") or summary.get("memory_mib")),
         "peak_memory_mib": _positive_float(telemetry.get("peak_memory_mib") or summary.get("peak_memory_mib")),
+        "hourly_price_usd": hourly_price_usd,
+        "vcpu_hour_usd": vcpu_hour_usd,
+        "replay_fraction": replay_fraction,
+        "startup_overhead_seconds": _non_negative_float(telemetry.get("startup_overhead_seconds") or telemetry.get("startup_delay_seconds") or summary.get("startup_overhead_seconds")),
+        "placement_score": _non_negative_float(telemetry.get("placement_score") or summary.get("placement_score")),
     }
     if units and seconds:
         observation["units_per_second"] = units / seconds
@@ -199,14 +223,55 @@ def choose_resource_candidate(
                     rates.append(rate)
             if rates:
                 median_rate = statistics.median(rates)
-                candidate.update(
-                    {
-                        "status": "ready",
-                        "successful_observations": len(rates),
-                        "median_units_per_second": median_rate,
-                        "vcpu_seconds_per_unit": vcpus / median_rate,
-                    }
-                )
+                price_scores: list[float] = []
+                vcpu_prices: list[float] = []
+                replay_fractions: list[float] = []
+                startup_overheads: list[float] = []
+                placement_scores: list[float] = []
+                for row in rows:
+                    if row.get("success") is False:
+                        continue
+                    rate = _positive_float(row.get("units_per_second"))
+                    if rate is None:
+                        units = _positive_float(row.get("completed_units"))
+                        seconds = _positive_float(row.get("useful_compute_seconds"))
+                        rate = units / seconds if units and seconds else None
+                    vcpu_price = _positive_float(row.get("vcpu_hour_usd"))
+                    if rate is not None and vcpu_price is not None:
+                        replay = _non_negative_float(row.get("replay_fraction")) or 0.0
+                        startup = _non_negative_float(row.get("startup_overhead_seconds")) or 0.0
+                        useful = _positive_float(row.get("useful_compute_seconds")) or 3600.0
+                        price_scores.append(((vcpus * vcpu_price) / (rate * 3600.0)) * 1_000_000.0 * (1.0 + replay + startup / max(1.0, useful)))
+                        vcpu_prices.append(vcpu_price)
+                        replay_fractions.append(replay)
+                        startup_overheads.append(startup)
+                    placement = _non_negative_float(row.get("placement_score"))
+                    if placement is not None:
+                        placement_scores.append(placement)
+                candidate_payload: dict[str, Any] = {
+                    "status": "ready",
+                    "successful_observations": len(rates),
+                    "median_units_per_second": median_rate,
+                    "vcpu_seconds_per_unit": vcpus / median_rate,
+                }
+                if price_scores:
+                    median_price = statistics.median(price_scores)
+                    median_vcpu_price = statistics.median(vcpu_prices)
+                    candidate_payload.update(
+                        {
+                            "expected_cost_per_1m_units": median_price,
+                            "vcpu_hour_usd": median_vcpu_price,
+                            "hourly_price_usd": median_vcpu_price * vcpus,
+                            "pricing_observations": len(price_scores),
+                            "replay_fraction": statistics.median(replay_fractions),
+                            "startup_overhead_seconds": statistics.median(startup_overheads),
+                            "cost_basis": "telemetry_price_replay_startup",
+                        }
+                    )
+                if placement_scores:
+                    candidate_payload["placement_score"] = statistics.median(placement_scores)
+                    candidate_payload["placement_observations"] = len(placement_scores)
+                candidate.update(candidate_payload)
             else:
                 candidate.update(
                     {
@@ -226,18 +291,25 @@ def choose_resource_candidate(
             reasons.append({"code": "arm_canary_failed", "severity": "warning", "message": RESOURCE_SELECTION_REASON_CODES["arm_canary_failed"]})
         return {"schema": RESOURCE_SELECTION_SCHEMA_V1, "status": "blocked", "selected": None, "candidates": candidates, "reasons": reasons}
 
-    selected = min(ready_candidates, key=lambda candidate: float(candidate["vcpu_seconds_per_unit"]))
-    best_x86 = min((candidate for candidate in ready_candidates if candidate.get("architecture") == "x86_64"), key=lambda candidate: float(candidate["vcpu_seconds_per_unit"]), default=None)
+    use_priced_selection = all(candidate.get("expected_cost_per_1m_units") is not None for candidate in ready_candidates)
+
+    def selection_cost(candidate: dict[str, Any]) -> float:
+        if use_priced_selection:
+            return float(candidate["expected_cost_per_1m_units"])
+        return float(candidate["vcpu_seconds_per_unit"])
+
+    selected = min(ready_candidates, key=selection_cost)
+    best_x86 = min((candidate for candidate in ready_candidates if candidate.get("architecture") == "x86_64"), key=selection_cost, default=None)
     if selected.get("architecture") == "arm64" and "x86_64" in allowed and best_x86 is None:
         reasons.append({"code": "resource_canary_required", "severity": "warning", "message": RESOURCE_SELECTION_REASON_CODES["resource_canary_required"]})
         return {"schema": RESOURCE_SELECTION_SCHEMA_V1, "status": "needs_canary", "selected": None, "candidates": candidates, "reasons": reasons}
     if best_x86 is not None:
-        x86_cost = float(best_x86["vcpu_seconds_per_unit"])
+        x86_cost = selection_cost(best_x86)
         rejected_arm = False
         for candidate in candidates:
             if candidate.get("architecture") != "arm64" or candidate.get("status") != "ready":
                 continue
-            arm_cost = float(candidate["vcpu_seconds_per_unit"])
+            arm_cost = selection_cost(candidate)
             if arm_cost > x86_cost * arm_cost_penalty_threshold:
                 candidate["status"] = "rejected"
                 candidate["reason_code"] = "arm_cost_rejected"

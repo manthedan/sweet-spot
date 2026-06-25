@@ -168,6 +168,40 @@ class PlannerContractTests(unittest.TestCase):
         self.assertEqual(plan["selected"]["vcpus"], 1.0)
         self.assertEqual(plan["canaries"][0]["resource_selection"]["status"], "ready")
 
+    def test_plan_cost_model_uses_canary_price_replay_and_placement_evidence(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {
+                        "architecture": "x86_64",
+                        "region": "us-west-2",
+                        "worker_vcpus": 2,
+                        "worker_memory_mib": 4096,
+                        "completed_units": 1000,
+                        "useful_compute_seconds": 100,
+                        "vcpu_hour_usd": 0.02,
+                        "replay_fraction": 0.25,
+                        "startup_delay_seconds": 10,
+                        "placement_score": 0.92,
+                    },
+                }
+            ],
+            logical_unit_count=6500,
+        )
+        self.assertEqual(plan["status"], "ready")
+        cost_model = plan["estimates"]["cost_model"]
+        self.assertEqual(cost_model["source"], "canary_telemetry")
+        self.assertEqual(cost_model["confidence"], "telemetry_price_replay_placement")
+        self.assertEqual(cost_model["pricing_observations"], 1)
+        self.assertEqual(cost_model["placement_score"], 0.92)
+        self.assertEqual(cost_model["assumptions"]["vcpu_hour_usd"], 0.02)
+        self.assertEqual(cost_model["assumptions"]["expected_replay_fraction"], 0.25)
+        self.assertEqual(cost_model["assumptions"]["startup_overhead_seconds"], 10.0)
+
     def test_plan_ignores_resource_telemetry_outside_allowed_regions(self) -> None:
         spec = self._valid_job_spec()
         spec["constraints"]["regions"] = ["us-west-2"]

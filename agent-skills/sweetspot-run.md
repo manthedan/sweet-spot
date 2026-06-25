@@ -13,9 +13,8 @@ Thin guide for the preferred SweetSpot agent workflow. Use this skill for new ma
 sweetspot plan job.json
 sweetspot run job.json --artifact-dir artifacts/RUN_ID
 sweetspot run job.json --artifact-dir artifacts/RUN_ID \
-  --queue-url https://sqs... \
-  --batch-job-queue batch-queue \
-  --job-definition worker-jobdef \
+  --deployment deployment.json \
+  --input-manifest-jsonl manifest.jsonl \
   --apply
 sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID
 sweetspot repair RUN_ID --tasks-jsonl artifacts/RUN_ID/production_tasks.jsonl \
@@ -90,20 +89,18 @@ sweetspot run job.json \
   --artifact-dir artifacts/RUN_ID
 ```
 
-If the measured canaries are still too tiny to calibrate the target replay-safe duration, the next dry-run writes a larger canary generation instead of production tasks. Once shard sizing and resource telemetry are calibrated, the planner selects the measured architecture/resource shape and produces `production_tasks.jsonl` for review. Production kickoff requires the calibrated artifact and explicit AWS targets:
+If the measured canaries are still too tiny to calibrate the target replay-safe duration, the next dry-run writes a larger canary generation instead of production tasks. Once shard sizing and resource telemetry are calibrated, the planner selects the measured architecture/resource shape and produces `production_tasks.jsonl` for review. Production kickoff should use a deployment registry so the Plan-selected region/architecture resolves to a digest-pinned image, revision-pinned job definition, and verified S3 manifest identity:
 
 ```bash
 sweetspot run job.json \
   --canary-summary-jsonl canary_summaries.jsonl \
   --input-manifest-jsonl manifest.jsonl \
   --artifact-dir artifacts/RUN_ID \
-  --queue-url https://sqs... \
-  --batch-job-queue batch-queue \
-  --job-definition worker-jobdef \
+  --deployment deployment.json \
   --apply
 ```
 
-Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation. Reconciliation is bounded; pass `--dedicated-run-queue` only for a fresh queue dedicated to this run, where SQS depth is a valid run-specific backlog signal. Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. For a production dedicated queue, `--reconcile-until-drained --reconcile-rounds N --reconcile-interval-seconds S` turns bounded reconciliation into a watch loop that stops early only after run-scoped backlog and active workers both drain; rerun with a larger round limit to extend an already-completed watch. After workers have had time to finish, rerun the same production apply command with `--finalize` to stream done-marker validation into `artifacts/RUN_ID/finalizer/` and update the `finalize` phase in `run_state.json`; uploading manifests/READY remains explicit with `--finalize-upload` and `--finalize-publish-ready`.
+Legacy `--queue-url`/`--batch-job-queue`/`--job-definition` production targets remain compatibility fallbacks for operator debugging, but they bypass deployment-registry image/job-definition binding and should not be the primary agent path. Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation. Reconciliation is bounded; pass `--dedicated-run-queue --create-run-queue` to let the controller create/verify a tagged per-run SQS queue and bind production workers to that run-owned URL, so SQS depth is a valid run-specific backlog signal. Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. For a production dedicated queue, `--reconcile-until-drained --reconcile-rounds N --reconcile-interval-seconds S` turns bounded reconciliation into a watch loop that stops early only after run-scoped backlog and active workers both drain; rerun with a larger round limit to extend an already-completed watch. After workers have had time to finish, rerun the same production apply command with `--finalize` to stream done-marker validation into `artifacts/RUN_ID/finalizer/` and update the `finalize` phase in `run_state.json`; uploading manifests/READY remains explicit with `--finalize-upload` and `--finalize-publish-ready`.
 
 ## Status, repair, and cancel
 

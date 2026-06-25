@@ -20,6 +20,7 @@ from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
 from .batch_service import (
     redact_env as _redact_env,
+    safe_active_worker_count as _safe_active_worker_count,
     submit_worker_jobs as _submit_worker_jobs,
     supervisor_desired_workers as _supervisor_desired_workers,
     worker_overrides as _worker_overrides,
@@ -437,6 +438,10 @@ def _build_run_report(
     return report
 
 
+def _canary_generation_dir(artifact_dir: Path, generation: int) -> Path:
+    return artifact_dir / f"canary_generation_{generation:03d}"
+
+
 def _materialize_run_tasks(args: argparse.Namespace, spec: dict[str, Any], plan: dict[str, Any], logical_unit_count: int | None) -> tuple[dict[str, Any], Path | None]:
     artifacts: dict[str, Any] = {}
     tasks_path = args.out_production_tasks_jsonl
@@ -461,8 +466,10 @@ def _materialize_run_tasks(args: argparse.Namespace, spec: dict[str, Any], plan:
         artifacts["production_tasks_sha256"] = _sha256_file(tasks_path)
     if args.artifact_dir and logical_unit_count is not None and "production_tasks_jsonl" not in artifacts:
         if isinstance(decision, dict) and decision.get("next_action") == "run_canary":
-            canary_tasks_path = args.artifact_dir / "canary_tasks.jsonl"
+            canary_generation = 0
+            canary_tasks_path = _canary_generation_dir(args.artifact_dir, canary_generation) / "canary_tasks.jsonl"
             _write_canary_tasks_from_plan(spec, plan, logical_unit_count, canary_tasks_path)
+            artifacts["canary_generation"] = canary_generation
             artifacts["canary_tasks_jsonl"] = str(canary_tasks_path)
             artifacts["canary_task_count"] = plan.get("artifacts", {}).get("canary_task_count")
             artifacts["canary_tasks_sha256"] = _sha256_file(canary_tasks_path)
@@ -550,6 +557,101 @@ def _target_from_plan(args: argparse.Namespace, spec: dict[str, Any], plan: dict
         ),
         [],
         deployment_sha256,
+    )
+
+
+def _sqs_queue_name(queue_url: str) -> str:
+    return queue_url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _controller_run_queue_name(run_id: str, architecture: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", run_id).strip("-") or "run"
+    suffix = f"-{architecture}" if architecture else ""
+    name = f"sweetspot-{safe}{suffix}"
+    return name[:80].rstrip("-")
+
+
+def _queue_depth_is_zero(depth: dict[str, int]) -> bool:
+    return not (int(depth.get("visible", 0) or 0) or int(depth.get("not_visible", 0) or 0) or int(depth.get("delayed", 0) or 0))
+
+
+def _maybe_queue_arn(sqs: Any, queue_url: str) -> str | None:
+    attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"]).get("Attributes", {})
+    arn = attrs.get("QueueArn")
+    return str(arn) if arn else None
+
+
+def _prepare_controller_run_queue(
+    args: argparse.Namespace,
+    *,
+    sqs: Any,
+    target: DeploymentTarget,
+    run_id: str,
+    previous_state: dict[str, Any],
+    runtime_settings: dict[str, int | float],
+) -> tuple[DeploymentTarget, dict[str, Any] | None]:
+    if not getattr(args, "create_run_queue", False):
+        return target, None
+    if not getattr(args, "deployment", None):
+        raise SystemExit("sweetspot run --create-run-queue requires --deployment so the queue is bound to a reviewed deployment target")
+    if not getattr(args, "dedicated_run_queue", False):
+        raise SystemExit("sweetspot run --create-run-queue requires --dedicated-run-queue")
+    raw_previous_controller = previous_state.get("controller")
+    previous_controller: dict[str, Any] = raw_previous_controller if isinstance(raw_previous_controller, dict) else {}
+    raw_previous_run_queue = previous_controller.get("run_queue")
+    previous_run_queue: dict[str, Any] = raw_previous_run_queue if isinstance(raw_previous_run_queue, dict) else {}
+    queue_url = str(previous_run_queue.get("queue_url") or "")
+    created = False
+    dlq_arn = _maybe_queue_arn(sqs, target.dlq_url) if target.dlq_url else None
+    if not queue_url:
+        queue_name = _controller_run_queue_name(run_id, target.architecture)
+        attributes: dict[str, str] = {
+            "MessageRetentionPeriod": "1209600",
+            "VisibilityTimeout": str(int(runtime_settings["visibility_timeout"])),
+            "SqsManagedSseEnabled": "true",
+        }
+        if dlq_arn:
+            attributes["RedrivePolicy"] = json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": 5}, sort_keys=True)
+        resp = sqs.create_queue(
+            QueueName=queue_name,
+            Attributes=attributes,
+            tags={"SweetSpotOwner": "controller", "SweetSpotRunId": run_id, "SweetSpotArchitecture": target.architecture},
+        )
+        queue_url = str(resp.get("QueueUrl") or "")
+        created = True
+    if not queue_url:
+        raise SystemExit("SQS create_queue did not return QueueUrl for controller-owned run queue")
+    attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"]).get("Attributes", {})
+    queue_arn = str(attrs.get("QueueArn") or _maybe_queue_arn(sqs, queue_url) or "")
+    if dlq_arn:
+        raw_redrive = attrs.get("RedrivePolicy")
+        redrive = json.loads(raw_redrive) if isinstance(raw_redrive, str) and raw_redrive else {}
+        if redrive.get("deadLetterTargetArn") and redrive.get("deadLetterTargetArn") != dlq_arn:
+            raise SystemExit("controller-owned run queue redrive policy does not match deployment dlq_url")
+    depth = queue_depth(sqs, queue_url)
+    if not _enqueue_phase_started(previous_state) and not _queue_depth_is_zero(depth):
+        raise SystemExit("controller-owned run queue is not empty before enqueue; review or use a fresh artifact directory/run id")
+    queue_report = {
+        "mode": "controller_owned_sqs",
+        "created_or_existing": "created" if created else "existing",
+        "queue_url": queue_url,
+        "queue_arn": queue_arn,
+        "queue_name": _sqs_queue_name(queue_url),
+        "dlq_url": target.dlq_url,
+        "dlq_arn": dlq_arn,
+        "preflight_depth": depth,
+    }
+    return (
+        DeploymentTarget(
+            region=target.region,
+            architecture=target.architecture,
+            sqs_queue_url=queue_url,
+            dlq_url=target.dlq_url,
+            batch_job_queue=target.batch_job_queue,
+            job_definition=target.job_definition,
+            image=target.image,
+        ),
+        {key: value for key, value in queue_report.items() if value is not None},
     )
 
 
@@ -690,6 +792,8 @@ def _cmd_run_canary_apply(
 ) -> dict[str, Any]:
     if getattr(args, "finalize", False):
         raise SystemExit("sweetspot run --finalize is only valid for production Plans; canary Plans must collect summaries first")
+    if getattr(args, "create_run_queue", False):
+        raise SystemExit("sweetspot run --create-run-queue is only valid for production Plans; canary Plans use deployment canary_routes")
     if args.artifact_dir is None:
         raise SystemExit("sweetspot run --apply for canary Plans requires --artifact-dir so run_state.json can make retries/resume safe")
     if not getattr(args, "deployment", None):
@@ -717,9 +821,11 @@ def _cmd_run_canary_apply(
         plan = previous_plan
         artifacts, tasks_path = recorded_tasks
     else:
-        tasks_path = args.artifact_dir / "canary_tasks.jsonl"
+        canary_generation = 0
+        tasks_path = _canary_generation_dir(args.artifact_dir, canary_generation) / "canary_tasks.jsonl"
         _write_canary_tasks_from_plan(spec, plan, logical_unit_count, tasks_path)
         artifacts = {
+            "canary_generation": canary_generation,
             "canary_tasks_jsonl": str(tasks_path),
             "canary_task_count": plan.get("artifacts", {}).get("canary_task_count"),
             "canary_tasks_sha256": _sha256_file(tasks_path),
@@ -750,9 +856,12 @@ def _cmd_run_canary_apply(
         "canary_routes": route_bindings,
         "canary_tasks_sha256": artifacts["canary_tasks_sha256"],
     }
-    previous_binding = previous_state.get("controller", {}).get("plan_binding") if isinstance(previous_state.get("controller"), dict) else None
+    previous_controller = previous_state.get("controller", {}) if isinstance(previous_state.get("controller"), dict) else {}
+    previous_binding = previous_controller.get("canary_binding") or previous_controller.get("plan_binding")
+    if previous_controller.get("binding_kind") == "production":
+        raise SystemExit("existing run_state.json records production apply state; use status/repair/finalize or a new artifact directory")
     if previous_binding and _sha256_json_obj(previous_binding) != _sha256_json_obj(plan_binding):
-        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs; use the original inputs or a new artifact directory")
+        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs for canary; use the original inputs or a new artifact directory")
 
     allowed_s3_prefixes = _default_run_allowed_s3_prefixes(args, spec)
     enqueue_config_sha256 = _sha256_json_obj({"allowed_s3_prefixes": allowed_s3_prefixes, "profile": args.profile, "region": canary_region, "routes": route_bindings})
@@ -776,13 +885,26 @@ def _cmd_run_canary_apply(
         "resume_state_loaded": bool(previous_state),
         "plan_authoritative": True,
         "canary_routing": "isolated_per_candidate_deployment_routes",
+        "binding_kind": "canary",
+        "job_binding": {
+            "deployment_sha256": deployment_sha256,
+            "manifest_identity": manifest_identity,
+        },
+        "canary_binding": plan_binding,
         "plan_binding": plan_binding,
         "deployment_warnings": target_warnings,
     }
     run_id = str(spec["run_id"])
     phases_base: list[dict[str, Any]] = [
         {"name": "plan", "status": "completed"},
-        {"name": "materialize_canary_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks), "candidate_count": len(grouped)},
+        {
+            "name": "materialize_canary_tasks",
+            "status": "completed",
+            "artifact": str(tasks_path),
+            "task_count": len(tasks),
+            "candidate_count": len(grouped),
+            "generation": artifacts.get("canary_generation", 0),
+        },
     ]
     report = _build_run_report(
         spec=spec,
@@ -945,7 +1067,8 @@ def _cmd_run_canary_apply(
                 applied=True,
                 status=report_status,
                 artifacts=artifacts,
-                phases=phases_base + [enqueue_phase, phase, {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}],
+                phases=phases_base
+                + [enqueue_phase, phase, {"name": "reconcile_canary_workers", "status": "not_started"}, {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}],
                 job_spec_sha256=job_spec_sha256,
                 controller=controller_base,
                 next_actions=next_actions,
@@ -1013,6 +1136,144 @@ def _cmd_run_canary_apply(
                 next_actions=["Canary workers have been submitted; collect summary JSONL and rerun plan/run with --canary-summary-jsonl."],
             )
 
+    previous_canary_reconcile_phase = previous_phases.get("reconcile_canary_workers", {})
+    previous_canary_reconcile_status = previous_canary_reconcile_phase.get("status")
+    if previous_canary_reconcile_status in {"job_in_flight", "needs_review"}:
+        raise SystemExit("existing run_state.json has ambiguous canary reconciliation progress; review Batch jobs before retrying to avoid duplicate canary workers")
+    canary_reconcile_submitted = list(previous_canary_reconcile_phase.get("submitted", [])) if isinstance(previous_canary_reconcile_phase.get("submitted"), list) else []
+    canary_reconcile_decisions: list[dict[str, Any]] = []
+    canary_reconcile_stamp = str(previous_canary_reconcile_phase.get("submission_stamp") or utc_stamp())
+    canary_reconcile_skipped_reason = None
+    if previous_submit_status != "completed":
+        canary_reconcile_skipped_reason = "initial_canary_submission_not_reconciled_until_resume"
+    elif getattr(args, "collect_canary_summaries", False):
+        canary_reconcile_skipped_reason = "collection_reads_existing_done_or_attempt_summaries_before_relaunching_canary_work"
+    canary_reconcile_phase: dict[str, Any] = {
+        "name": "reconcile_canary_workers",
+        "status": "skipped" if canary_reconcile_skipped_reason else "completed",
+        "reason": canary_reconcile_skipped_reason,
+        "submission_stamp": canary_reconcile_stamp,
+        "submitted_count": len(canary_reconcile_submitted),
+        "submitted": canary_reconcile_submitted,
+        "decisions": canary_reconcile_decisions,
+    }
+    canary_reconcile_phase = {key: value for key, value in canary_reconcile_phase.items() if value is not None}
+
+    def persist_canary_reconcile(phase: dict[str, Any], *, report_status: str, next_actions: list[str]) -> None:
+        _write_run_state(
+            state_path,
+            _build_run_report(
+                spec=spec,
+                plan=plan,
+                mode="apply",
+                applied=True,
+                status=report_status,
+                artifacts=artifacts,
+                phases=phases_base + [enqueue_phase, submit_phase, phase, {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}],
+                job_spec_sha256=job_spec_sha256,
+                controller=controller_base,
+                next_actions=next_actions,
+            ),
+        )
+
+    if previous_submit_status == "completed" and not getattr(args, "collect_canary_summaries", False):
+        for key in sorted(grouped):
+            target = targets[key]
+            group = grouped[key]
+            depth = queue_depth(sqs, target.sqs_queue_url)
+            backlog = max(0, min(len(group), int(depth.get("visible", 0)) + int(depth.get("not_visible", 0)) + int(depth.get("delayed", 0))))
+            route_record = route_records.get(key, {})
+            route_preflight_depth: Any = route_record.get("preflight_queue_depth") if isinstance(route_record, dict) else None
+            preflight_clean = isinstance(route_preflight_depth, dict) and not (
+                int(route_preflight_depth.get("visible", 0) or 0) or int(route_preflight_depth.get("not_visible", 0) or 0) or int(route_preflight_depth.get("delayed", 0) or 0)
+            )
+            fallback_active = sum(1 for item in submitted + canary_reconcile_submitted if isinstance(item, dict) and item.get("candidate") == key)
+            active_count, active_examples, active_warning = _safe_active_worker_count(batch, job_queue=target.batch_job_queue, job_name_prefix=f"{run_id}-canary-{key}", fallback=fallback_active)
+            decision: dict[str, Any] = {
+                "candidate": key,
+                "queue_url": target.sqs_queue_url,
+                "queue_depth": depth,
+                "candidate_backlog_estimate": backlog,
+                "preflight_queue_depth": route_preflight_depth,
+                "preflight_queue_was_empty": preflight_clean,
+                "active_matching_workers": active_count,
+                "active_examples": active_examples,
+                "submitted_replacement_workers": 0,
+            }
+            if active_warning:
+                decision["warning"] = active_warning
+            if backlog > 0 and not preflight_clean:
+                decision["skip_reason"] = "canary_queue_backlog_is_not_run_scoped_without_empty_preflight"
+                canary_reconcile_decisions.append(decision)
+                continue
+            if backlog > 0 and active_count <= 0:
+                runtime = _canary_runtime_settings(plan, group[0])
+                try:
+                    validate_worker_timing(
+                        visibility_timeout=int(runtime["visibility_timeout"]),
+                        heartbeat_seconds=int(runtime["heartbeat_seconds"]),
+                        task_timeout_seconds=float(runtime["task_timeout_seconds"]),
+                    )
+                except ValueError as exc:
+                    raise SystemExit(str(exc)) from exc
+                overrides = _worker_overrides(
+                    sqs_queue_url=target.sqs_queue_url,
+                    messages_per_worker=len(group),
+                    visibility_timeout=int(runtime["visibility_timeout"]),
+                    heartbeat_seconds=int(runtime["heartbeat_seconds"]),
+                    task_timeout_seconds=float(runtime["task_timeout_seconds"]),
+                    env=args.env or [],
+                    allowed_s3_prefixes=allowed_s3_prefixes,
+                    log_tail_bytes=args.log_tail_bytes,
+                    max_log_bytes=args.max_log_bytes,
+                    redact_regexes=args.redact_regex or [],
+                    allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+                    vcpus=int(runtime["vcpus"]),
+                    memory=int(runtime["memory_mib"]),
+                )
+                job_name = f"{run_id}-canary-{key}-reconcile-{canary_reconcile_stamp}-{len(canary_reconcile_submitted):04d}"
+                in_flight_phase = {
+                    **canary_reconcile_phase,
+                    "status": "job_in_flight",
+                    "decisions": canary_reconcile_decisions + [decision],
+                    "in_flight_candidate": key,
+                    "in_flight_job_name": job_name,
+                }
+                persist_canary_reconcile(
+                    in_flight_phase,
+                    report_status="canary_reconcile_job_in_flight",
+                    next_actions=["A canary reconciliation submit_job call may have reached Batch; review Batch jobs before retrying if this controller stops here."],
+                )
+                reconcile_kwargs: dict[str, Any] = {"jobName": job_name, "jobQueue": target.batch_job_queue, "jobDefinition": target.job_definition, "containerOverrides": overrides}
+                if args.retry_attempts is not None:
+                    reconcile_kwargs["retryStrategy"] = {"attempts": args.retry_attempts}
+                try:
+                    resp = batch.submit_job(**reconcile_kwargs)
+                except Exception as exc:
+                    review_phase = {**in_flight_phase, "status": "needs_review", "submit_error": str(exc)}
+                    persist_canary_reconcile(
+                        review_phase,
+                        report_status="canary_reconcile_needs_review",
+                        next_actions=["A canary reconciliation Batch submit_job call failed or is ambiguous; review Batch jobs before retrying."],
+                    )
+                    raise
+                canary_reconcile_submitted.append({"candidate": key, "jobName": job_name, "jobId": resp.get("jobId"), "jobArn": resp.get("jobArn"), "queue_url": target.sqs_queue_url, "reason": "canary_reconcile_top_up"})
+                decision["submitted_replacement_workers"] = 1
+            canary_reconcile_decisions.append(decision)
+        canary_reconcile_phase = {
+            "name": "reconcile_canary_workers",
+            "status": "completed",
+            "submission_stamp": canary_reconcile_stamp,
+            "submitted_count": len(canary_reconcile_submitted),
+            "submitted": canary_reconcile_submitted,
+            "decisions": canary_reconcile_decisions,
+        }
+        persist_canary_reconcile(
+            canary_reconcile_phase,
+            report_status="canary_reconcile_complete",
+            next_actions=["Canary reconciliation observed each candidate queue and submitted one replacement worker where backlog remained and no candidate worker was active."],
+        )
+
     collect_phase: dict[str, Any] = {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True}
     if getattr(args, "collect_canary_summaries", False):
         summary_path = args.artifact_dir / "canary_summaries.jsonl"
@@ -1020,7 +1281,7 @@ def _cmd_run_canary_apply(
         collection = _collect_canary_summaries(s3_for_summaries, tasks=tasks, out_jsonl=summary_path)
         artifacts["canary_summary_jsonl"] = str(summary_path)
         collect_phase = {**collect_phase, **collection, "status": "completed" if collection["complete"] else "incomplete"}
-        phases = phases_base + [enqueue_phase, submit_phase, collect_phase]
+        phases = phases_base + [enqueue_phase, submit_phase, canary_reconcile_phase, collect_phase]
         next_actions = ["Canary summaries are still incomplete; rerun with --collect-canary-summaries after canary workers finish."]
         report_status = "canary_summaries_incomplete"
         production_plan = plan
@@ -1040,12 +1301,73 @@ def _cmd_run_canary_apply(
                 artifacts["production_task_count"] = production_plan.get("artifacts", {}).get("production_task_count")
                 artifacts["production_tasks_sha256"] = _sha256_file(production_tasks_path)
                 collect_phase = {**collect_phase, "status": "completed", "production_plan": str(production_plan_path), "production_tasks": str(production_tasks_path)}
-                phases = phases_base + [enqueue_phase, submit_phase, collect_phase]
+                phases = phases_base + [enqueue_phase, submit_phase, canary_reconcile_phase, collect_phase]
                 report_status = "production_plan_ready"
                 next_actions = [f"Review {production_plan_path}, then run production apply with --canary-summary-jsonl {summary_path}."]
             else:
                 report_status = "canary_summaries_collected"
                 next_actions = [f"Review {production_plan_path}; additional canaries may be required before production apply."]
+                next_decision = production_plan.get("canaries", [{}])[0].get("decision", {}) if isinstance(production_plan.get("canaries"), list) else {}
+                if isinstance(next_decision, dict) and next_decision.get("next_action") == "run_canary":
+                    next_generation = int(artifacts.get("canary_generation", 0) or 0) + 1
+                    next_tasks_path = _canary_generation_dir(args.artifact_dir, next_generation) / "canary_tasks.jsonl"
+                    _write_canary_tasks_from_plan(spec, production_plan, logical_unit_count, next_tasks_path)
+                    next_artifacts = {
+                        **artifacts,
+                        "canary_generation": next_generation,
+                        "canary_tasks_jsonl": str(next_tasks_path),
+                        "canary_task_count": production_plan.get("artifacts", {}).get("canary_task_count"),
+                        "canary_tasks_sha256": _sha256_file(next_tasks_path),
+                    }
+                    artifacts = next_artifacts
+                    next_tasks = _read_jsonl(next_tasks_path)
+                    next_grouped = group_canary_tasks_by_candidate(next_tasks)
+                    next_targets = {key: canary_deployment_target_for(registry, region=canary_region, task=group[0]) for key, group in next_grouped.items()}
+                    next_route_bindings = {key: target.as_dict() for key, target in sorted(next_targets.items())}
+                    next_canary_binding = {
+                        "deployment_sha256": deployment_sha256,
+                        "manifest_identity": manifest_identity,
+                        "canary_region": canary_region,
+                        "canary_routes": next_route_bindings,
+                        "canary_tasks_sha256": artifacts["canary_tasks_sha256"],
+                    }
+                    controller_base = {
+                        **controller_base,
+                        "canary_binding": next_canary_binding,
+                        "plan_binding": next_canary_binding,
+                        "canary_generations": [
+                            {
+                                "generation": int(artifacts.get("canary_generation", 0) or 0) - 1,
+                                "status": "collected",
+                                "canary_binding_sha256": _sha256_json_obj(plan_binding),
+                                "summary_jsonl": str(summary_path),
+                                "production_plan": str(production_plan_path),
+                            },
+                            {
+                                "generation": next_generation,
+                                "status": "materialized",
+                                "canary_tasks_jsonl": str(next_tasks_path),
+                                "canary_tasks_sha256": artifacts["canary_tasks_sha256"],
+                            },
+                        ],
+                    }
+                    phases = [
+                        {"name": "plan", "status": "completed"},
+                        {
+                            "name": "materialize_canary_tasks",
+                            "status": "completed",
+                            "artifact": str(next_tasks_path),
+                            "task_count": _count_jsonl_objects(next_tasks_path),
+                            "candidate_count": len(next_grouped),
+                            "generation": next_generation,
+                            "previous_generation_collected": True,
+                        },
+                        {"name": "enqueue_canary_tasks", "status": "not_started"},
+                        {"name": "submit_canary_workers", "status": "not_started"},
+                        {"name": "reconcile_canary_workers", "status": "not_started"},
+                        {"name": "collect_canary_summaries", "status": "not_started", "requires_worker_completion": True},
+                    ]
+                    next_actions = [f"Review {production_plan_path}; then rerun the same canary apply command to launch canary generation {next_generation}."]
         report = _build_run_report(
             spec=spec,
             plan=production_plan,
@@ -1061,7 +1383,7 @@ def _cmd_run_canary_apply(
         _write_run_state(state_path, report)
         return report
 
-    phases = phases_base + [enqueue_phase, submit_phase, collect_phase]
+    phases = phases_base + [enqueue_phase, submit_phase, canary_reconcile_phase, collect_phase]
     report = _build_run_report(
         spec=spec,
         plan=plan,
@@ -1129,6 +1451,55 @@ def _cmd_run_apply(
     _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=allowed_s3_prefixes)
     plan_worker_count = max(1, min(int(runtime_settings["estimated_workers"]), len(tasks) or 1))
     plan_messages_per_worker = max(1, math.ceil((len(tasks) or 1) / plan_worker_count))
+    if getattr(args, "reconcile_until_drained", False) and not getattr(args, "dedicated_run_queue", False):
+        raise SystemExit("sweetspot run --reconcile-until-drained requires --dedicated-run-queue so queue depth is run-scoped")
+    raw_previous_controller = previous_state.get("controller")
+    previous_controller: dict[str, Any] = raw_previous_controller if isinstance(raw_previous_controller, dict) else {}
+    raw_previous_run_queue = previous_controller.get("run_queue")
+    previous_run_queue: dict[str, Any] = raw_previous_run_queue if isinstance(raw_previous_run_queue, dict) else {}
+    if getattr(args, "create_run_queue", False) and previous_run_queue.get("queue_url"):
+        target = DeploymentTarget(
+            region=target.region,
+            architecture=target.architecture,
+            sqs_queue_url=str(previous_run_queue["queue_url"]),
+            dlq_url=target.dlq_url,
+            batch_job_queue=target.batch_job_queue,
+            job_definition=target.job_definition,
+            image=target.image,
+        )
+        artifacts["run_queue"] = dict(previous_run_queue)
+    preliminary_manifest_identity = _manifest_identity_for_run(args, spec, target)
+    preliminary_plan_binding = {
+        "deployment_sha256": deployment_sha256,
+        "manifest_identity": preliminary_manifest_identity,
+        "selected": plan.get("selected"),
+        "target": target.as_dict(),
+    }
+    preliminary_previous_binding = previous_controller.get("production_binding")
+    if preliminary_previous_binding is None and previous_controller.get("binding_kind") != "canary":
+        preliminary_previous_binding = previous_controller.get("plan_binding")
+    if preliminary_previous_binding and _sha256_json_obj(preliminary_previous_binding) != _sha256_json_obj(preliminary_plan_binding):
+        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs for production; use the original inputs or a new artifact directory")
+    preliminary_canary_binding = previous_controller.get("canary_binding")
+    if preliminary_canary_binding is None and previous_controller.get("binding_kind") == "canary":
+        preliminary_canary_binding = previous_controller.get("plan_binding")
+    if preliminary_canary_binding:
+        if previous_state.get("job_spec_sha256") and previous_state.get("job_spec_sha256") != job_spec_sha256:
+            raise SystemExit("existing run_state.json canary binding does not match production JobSpec; use the original inputs or a new artifact directory")
+        for common_key in ("deployment_sha256", "manifest_identity"):
+            if preliminary_canary_binding.get(common_key) != preliminary_plan_binding.get(common_key):
+                raise SystemExit("existing run_state.json canary binding does not match production deployment/manifest inputs; use the original inputs or a new artifact directory")
+    sqs = _aws_client_for_target(args, "sqs", target)
+    target, run_queue_report = _prepare_controller_run_queue(
+        args,
+        sqs=sqs,
+        target=target,
+        run_id=run_id,
+        previous_state=previous_state,
+        runtime_settings=runtime_settings,
+    )
+    if run_queue_report:
+        artifacts["run_queue"] = run_queue_report
     manifest_identity = _manifest_identity_for_run(args, spec, target)
     plan_binding = {
         "deployment_sha256": deployment_sha256,
@@ -1181,20 +1552,43 @@ def _cmd_run_apply(
         }
     )
 
+    promoted_from_canary = None
+    previous_canary_binding = previous_controller.get("canary_binding")
+    if previous_canary_binding is None and previous_controller.get("binding_kind") == "canary":
+        previous_canary_binding = previous_controller.get("plan_binding")
+    if previous_canary_binding:
+        if previous_state.get("job_spec_sha256") and previous_state.get("job_spec_sha256") != job_spec_sha256:
+            raise SystemExit("existing run_state.json canary binding does not match production JobSpec; use the original inputs or a new artifact directory")
+        for common_key in ("deployment_sha256", "manifest_identity"):
+            if previous_canary_binding.get(common_key) != plan_binding.get(common_key):
+                raise SystemExit("existing run_state.json canary binding does not match production deployment/manifest inputs; use the original inputs or a new artifact directory")
+        promoted_from_canary = {
+            "canary_binding_sha256": _sha256_json_obj(previous_canary_binding),
+            "canary_binding": previous_canary_binding,
+        }
     controller_base = {
         "apply_supported": True,
         "mutations_allowed": True,
         "resume_state_loaded": bool(previous_state),
         "plan_authoritative": True,
+        "binding_kind": "production",
+        "job_binding": {
+            "deployment_sha256": deployment_sha256,
+            "manifest_identity": manifest_identity,
+        },
+        "production_binding": plan_binding,
         "plan_binding": plan_binding,
         "deployment_warnings": target_warnings,
     }
-    previous_binding = previous_state.get("controller", {}).get("plan_binding") if isinstance(previous_state.get("controller"), dict) else None
+    if promoted_from_canary:
+        controller_base["promoted_from_canary"] = promoted_from_canary
+    if run_queue_report:
+        controller_base["run_queue"] = run_queue_report
+    previous_binding = previous_controller.get("production_binding")
+    if previous_binding is None and previous_controller.get("binding_kind") != "canary":
+        previous_binding = previous_controller.get("plan_binding")
     if previous_binding and _sha256_json_obj(previous_binding) != _sha256_json_obj(plan_binding):
-        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs; use the original inputs or a new artifact directory")
-    if getattr(args, "reconcile_until_drained", False) and not getattr(args, "dedicated_run_queue", False):
-        raise SystemExit("sweetspot run --reconcile-until-drained requires --dedicated-run-queue so queue depth is run-scoped")
-
+        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs for production; use the original inputs or a new artifact directory")
     previous_phases = _phase_by_name(previous_state)
     phases: list[dict[str, Any]] = [
         {"name": "plan", "status": "completed"},
@@ -1222,7 +1616,6 @@ def _cmd_run_apply(
     )
     _write_run_state(state_path, report)
 
-    sqs = _aws_client_for_target(args, "sqs", target)
     batch = _aws_client_for_target(args, "batch", target)
     target_warnings.extend(_preflight_deployment_target(batch, target=target, spec=spec))
     previous_enqueue_phase = previous_phases.get("enqueue_tasks", {})
@@ -3545,6 +3938,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "collect_canary_summaries",
         "deployment",
         "dedicated_run_queue",
+        "create_run_queue",
         "env",
         "heartbeat_seconds",
         "include_not_visible",
@@ -3867,7 +4261,7 @@ def main(argv: list[str] | None = None) -> int:
         sub,
         "run",
         help="Dry-run or apply a run controller for a SweetSpot JobSpec",
-        examples="  sweetspot run examples/job.x86.example.json\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1 --queue-url https://sqs... --batch-job-queue jq --job-definition jd --apply",
+        examples="  sweetspot run examples/job.x86.example.json\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1\n  sweetspot run examples/job.x86.example.json --canary-summary-jsonl summaries.jsonl --input-manifest-jsonl manifest.jsonl --artifact-dir artifacts/run-1 --deployment deployment.json --apply",
     )
     p.add_argument("job_spec", type=Path, help="Path to a sweetspot.job.v1 JSON JobSpec")
     p.add_argument("--profile")
@@ -3878,9 +4272,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL")
     p.add_argument("--artifact-dir", type=Path, help="Optional local directory for run_state.json and default production task artifacts")
     p.add_argument("--deployment", type=Path, help="sweetspot.deployment.v1 registry; normal --apply selects queue/job definition from the ready Plan, and canary apply requires isolated canary_routes")
-    p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL"), help="Legacy fallback SQS queue URL when --deployment is omitted")
-    p.add_argument("--batch-job-queue", help="Legacy fallback AWS Batch job queue when --deployment is omitted")
-    p.add_argument("--job-definition", help="Legacy fallback AWS Batch job definition when --deployment is omitted")
+    p.add_argument(
+        "--queue-url",
+        "--sqs-queue-url",
+        dest="queue_url",
+        default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL"),
+        help="Compatibility fallback SQS queue URL when --deployment is omitted; bypasses deployment-registry binding",
+    )
+    p.add_argument("--batch-job-queue", help="Compatibility fallback AWS Batch job queue when --deployment is omitted; prefer --deployment for agent workflows")
+    p.add_argument("--job-definition", help="Compatibility fallback AWS Batch job definition when --deployment is omitted; prefer --deployment for digest/revision binding")
     p.add_argument("--job-name-prefix", help="Run-scoped Batch worker name prefix; defaults to RUN_ID-worker and must start with RUN_ID-")
     _add_legacy_run_override_args(p)
     _add_legacy_run_runtime_args(p, legacy_done_markers_help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to submitted workers")
@@ -3888,6 +4288,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait-for-visible-seconds", type=float, default=0.0)
     p.add_argument("--wait-interval-seconds", type=float, default=1.0)
     p.add_argument("--dedicated-run-queue", action="store_true", help="Allow reconciliation to treat SQS depth as run-specific backlog; use only with a fresh/dedicated queue")
+    p.add_argument("--create-run-queue", action="store_true", help="With --deployment and --dedicated-run-queue, create or verify a controller-owned per-run SQS queue and bind production workers to it")
     p.add_argument("--kickoff-only", action="store_true", help="Advanced/debug mode: stop after the initial Plan-sized worker wave and skip reconciliation")
     p.add_argument("--reconcile-rounds", type=int, default=1, help="Bounded controller observation rounds after initial submission (default: 1)")
     p.add_argument("--reconcile-interval-seconds", type=float, default=0.0, help="Sleep between reconciliation rounds")
