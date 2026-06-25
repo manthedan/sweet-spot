@@ -1,0 +1,21 @@
+{
+  "schema": "sweetspot.deployment.v1",
+  "regions": {
+    "us-west-2": {
+      "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-work",
+      "dlq_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-work-dlq",
+      "architectures": {
+        "x86_64": {
+          "batch_job_queue": "sweetspot-x86-spot-queue",
+          "job_definition": "sweetspot-worker-x86:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "arm64": {
+          "batch_job_queue": "sweetspot-arm-spot-queue",
+          "job_definition": "sweetspot-worker-arm:1",
+          "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/sweetspot-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    }
+  }
+}

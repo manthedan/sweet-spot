@@ -27,7 +27,7 @@ Commands can write:
 
 ## Expected total cost
 
-`sweetspot-scout` still reads placement scores and Spot prices, but its top pool ranking is now:
+`sweetspot-scout` still reads placement scores and Spot prices, and `sweetspot plan` embeds the same shared model when it has only conservative default pricing. Pool ranking and Plan estimates use:
 
 ```text
 expected total $/1M units = compute $/1M

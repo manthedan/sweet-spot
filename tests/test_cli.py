@@ -421,6 +421,36 @@ class RunCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "requires --artifact-dir"):
             main(["run", "examples/job.x86.example.json", "--apply", "--queue-url", "https://sqs.example/q", "--batch-job-queue", "jq", "--job-definition", "jd"])
 
+    def test_run_apply_rejects_legacy_sizing_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text(json.dumps({"unit": 0}) + "\n")
+            with self.assertRaisesRegex(SystemExit, "Plan-authoritative"):
+                main(
+                    [
+                        "run",
+                        "examples/job.x86.example.json",
+                        "--canary-summary-jsonl",
+                        str(summaries),
+                        "--input-manifest-jsonl",
+                        str(manifest),
+                        "--artifact-dir",
+                        str(root / "artifacts"),
+                        "--queue-url",
+                        "https://sqs.example/q",
+                        "--batch-job-queue",
+                        "jq",
+                        "--job-definition",
+                        "jd",
+                        "--max-workers",
+                        "1",
+                        "--apply",
+                    ]
+                )
+
     def test_run_apply_enqueues_and_submits_workers_once(self) -> None:
         sqs = FakeQueueDepthSQS()
         batch = FakeSubmitBatch()
@@ -454,10 +484,6 @@ class RunCommandTests(unittest.TestCase):
                 "jq",
                 "--job-definition",
                 "jd",
-                "--messages-per-worker",
-                "2",
-                "--max-workers",
-                "5",
                 "--apply",
             ]
             out = io.StringIO()
@@ -469,9 +495,10 @@ class RunCommandTests(unittest.TestCase):
             self.assertEqual(report["status"], "workers_submitted")
             phases = {phase["name"]: phase for phase in report["phases"]}
             self.assertEqual(phases["enqueue_tasks"]["sent"], 3)
-            self.assertEqual(phases["submit_workers"]["submitted_count"], 2)
+            self.assertEqual(phases["submit_workers"]["submitted_count"], 1)
+            self.assertEqual(phases["submit_workers"]["messages_per_worker"], 3)
             self.assertEqual(sqs.sent, 3)
-            self.assertEqual(len(batch.submitted), 2)
+            self.assertEqual(len(batch.submitted), 1)
             self.assertTrue(str(batch.submitted[0]["jobName"]).startswith("example-x86-run-worker-"))
             self.assertEqual(batch.submitted[0]["jobQueue"], "jq")
             self.assertEqual(batch.submitted[0]["jobDefinition"], "jd")
@@ -488,18 +515,14 @@ class RunCommandTests(unittest.TestCase):
             self.assertTrue(resumed_phases["enqueue_tasks"]["resumed"])
             self.assertTrue(resumed_phases["submit_workers"]["resumed"])
             self.assertEqual(sqs.sent, 3)
-            self.assertEqual(len(batch.submitted), 2)
+            self.assertEqual(len(batch.submitted), 1)
 
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(9000)))
-            out = io.StringIO()
-            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
-                self.assertEqual(main(argv), 0)
-            resumed_with_changed_inputs = json.loads(out.getvalue())
-            changed_phases = {phase["name"]: phase for phase in resumed_with_changed_inputs["phases"]}
-            self.assertEqual(changed_phases["materialize_production_tasks"]["task_count"], 3)
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "plan/deployment/manifest binding differs"):
+                main(argv)
             self.assertEqual(tasks_path.read_text(), original_tasks_text)
             self.assertEqual(sqs.sent, 3)
-            self.assertEqual(len(batch.submitted), 2)
+            self.assertEqual(len(batch.submitted), 1)
 
     def test_run_apply_rejects_hashless_legacy_run_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -675,10 +698,6 @@ class RunCommandTests(unittest.TestCase):
                             "jq",
                             "--job-definition",
                             "jd",
-                            "--messages-per-worker",
-                            "1",
-                            "--max-workers",
-                            "10",
                             "--include-not-visible",
                             "--apply",
                         ]
@@ -757,7 +776,7 @@ class RunCommandTests(unittest.TestCase):
                 raise AssertionError(service)
 
             changed_queue_argv = ["https://sqs.example/other" if item == "https://sqs.example/q" else item for item in argv]
-            with patch("sweetspot.cli.boto3.client", side_effect=resume_client), self.assertRaisesRegex(SystemExit, "different queue_url"):
+            with patch("sweetspot.cli.boto3.client", side_effect=resume_client), self.assertRaisesRegex(SystemExit, "plan/deployment/manifest binding differs"):
                 main(changed_queue_argv)
 
             out = io.StringIO()
@@ -767,7 +786,7 @@ class RunCommandTests(unittest.TestCase):
             resumed_phases = {phase["name"]: phase for phase in resumed["phases"]}
             self.assertTrue(resumed_phases["enqueue_tasks"]["resumed"])
             self.assertEqual(second_sqs.sent, 0)
-            self.assertEqual(resumed_phases["submit_workers"]["submitted_count"], 3)
+            self.assertEqual(resumed_phases["submit_workers"]["submitted_count"], 1)
 
     def test_run_apply_rejects_worker_resume_config_drift(self) -> None:
         sqs = FakeQueueDepthSQS()
@@ -806,8 +825,6 @@ class RunCommandTests(unittest.TestCase):
                 "jq",
                 "--job-definition",
                 "jd",
-                "--max-workers",
-                "2",
                 "--apply",
             ]
             with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
@@ -822,11 +839,11 @@ class RunCommandTests(unittest.TestCase):
             submit_phase["submitted_count"] = 1
             state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
 
-            with patch("sweetspot.cli.boto3.Session", return_value=FakeRunSession()), self.assertRaisesRegex(SystemExit, "different enqueue settings"):
-                main(argv + ["--region", "us-east-1"])
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(argv + ["--region", "us-east-1"]), 0)
+            self.assertEqual(len(batch.submitted), 2)
             with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "different worker settings"):
                 main(argv + ["--allow-legacy-done-markers"])
-            self.assertEqual(len(batch.submitted), 2)
 
     def test_run_apply_refuses_ambiguous_worker_submit_resume(self) -> None:
         class FailingSecondSubmitBatch(FakeSubmitBatch):
@@ -852,9 +869,13 @@ class RunCommandTests(unittest.TestCase):
             artifact_dir = root / "artifacts"
             summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            job_spec = root / "job.json"
+            spec = json.loads(Path("examples/job.x86.example.json").read_text())
+            spec["constraints"]["deadline_hours"] = 0.07
+            job_spec.write_text(json.dumps(spec))
             argv = [
                 "run",
-                "examples/job.x86.example.json",
+                str(job_spec),
                 "--canary-summary-jsonl",
                 str(summaries),
                 "--input-manifest-jsonl",

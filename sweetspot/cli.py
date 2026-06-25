@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.metadata as importlib_metadata
 import json
+import math
 import os
 import re
 import statistics
@@ -17,6 +18,8 @@ import boto3
 
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
+from .controller import choose_worker_top_up
+from .deployment import DeploymentTarget, load_deployment, local_manifest_identity, manifest_identity_from_head, select_deployment_target, validate_local_manifest_matches_head, validate_target_matches_job
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .planner import PlannerSpecError, initial_blocked_plan, iter_canary_tasks_from_logical_unit_count, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
 from .s3util import parse_s3_uri, s3_delete, s3_download_text, s3_exists, s3_join, s3_upload_file, s3_upload_text
@@ -243,6 +246,31 @@ def _add_worker_sizing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include-not-visible", action="store_true")
 
 
+def _add_legacy_run_override_args(parser: argparse.ArgumentParser) -> None:
+    """Accept old run sizing flags without advertising them as the normal path."""
+
+    parser.add_argument("--messages-per-worker", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--max-workers", type=int, default=64, help=argparse.SUPPRESS)
+    parser.add_argument("--min-workers", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--subtract-active", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--include-not-visible", action="store_true", help=argparse.SUPPRESS)
+
+
+def _add_legacy_run_runtime_args(parser: argparse.ArgumentParser, *, legacy_done_markers_help: str) -> None:
+    parser.add_argument("--vcpus", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--memory", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--visibility-timeout", type=int, default=1800, help=argparse.SUPPRESS)
+    parser.add_argument("--heartbeat-seconds", type=int, default=300, help=argparse.SUPPRESS)
+    parser.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS, help=argparse.SUPPRESS)
+    parser.add_argument("--retry-attempts", type=int)
+    parser.add_argument("--env", action="append", type=_parse_env_pair, default=[])
+    parser.add_argument("--allowed-s3-prefix", action="append", default=[], help="Pass SWEETSPOT_ALLOWED_S3_PREFIXES to workers; repeatable.")
+    parser.add_argument("--log-tail-bytes", type=int, default=DEFAULT_LOG_TAIL_BYTES)
+    parser.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
+    parser.add_argument("--redact-regex", action="append", default=[], help="Regex to redact from worker task logs; repeatable.")
+    parser.add_argument("--allow-legacy-done-markers", action="store_true", help=legacy_done_markers_help)
+
+
 def _add_worker_runtime_args(parser: argparse.ArgumentParser, *, legacy_done_markers_help: str) -> None:
     parser.add_argument("--vcpus", type=int)
     parser.add_argument("--memory", type=int)
@@ -280,6 +308,36 @@ def _plan_from_optional_adaptive_inputs(
     return initial_blocked_plan(spec), logical_unit_count
 
 
+def _plan_task_timeout_seconds(plan: dict[str, Any]) -> float | None:
+    selected = plan.get("selected")
+    raw: Any | None = None
+    if isinstance(selected, dict):
+        raw = selected.get("task_timeout_seconds")
+    if raw is None:
+        decision = plan.get("canaries", [{}])[0].get("decision", {}) if isinstance(plan.get("canaries"), list) else {}
+        if isinstance(decision, dict) and decision.get("target_task_seconds") is not None:
+            try:
+                raw = min(39600.0, max(1.0, math.ceil(float(decision["target_task_seconds"]) * 2.0)))
+            except (TypeError, ValueError):
+                raw = None
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _task_with_plan_timeout(task: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    timeout = _plan_task_timeout_seconds(plan)
+    if timeout is None or task.get("timeout_seconds") is not None:
+        return task
+    out = dict(task)
+    out["timeout_seconds"] = timeout
+    return out
+
+
 def _write_production_tasks_from_plan(spec: dict[str, Any], plan: dict[str, Any], logical_unit_count: int | None, path: Path) -> int:
     if logical_unit_count is None:
         raise SystemExit("--out-production-tasks-jsonl requires --canary-summary-jsonl and --input-manifest-jsonl")
@@ -301,7 +359,7 @@ def _write_production_tasks_from_plan(spec: dict[str, Any], plan: dict[str, Any]
     task_count = 0
     with path.open("w", encoding="utf-8") as f:
         for task in iter_production_tasks_from_logical_unit_count(spec, logical_unit_count, selected_units):
-            f.write(json.dumps(task, sort_keys=True) + "\n")
+            f.write(json.dumps(_task_with_plan_timeout(task, plan), sort_keys=True) + "\n")
             task_count += 1
     plan.setdefault("artifacts", {})["production_tasks_jsonl"] = str(path)
     plan["artifacts"]["production_task_count"] = task_count
@@ -319,7 +377,7 @@ def _write_canary_tasks_from_plan(spec: dict[str, Any], plan: dict[str, Any], lo
     task_count = 0
     with path.open("w", encoding="utf-8") as f:
         for task in iter_canary_tasks_from_logical_unit_count(spec, logical_unit_count, selected_units, max_tasks=max_tasks):
-            f.write(json.dumps(task, sort_keys=True) + "\n")
+            f.write(json.dumps(_task_with_plan_timeout(task, plan), sort_keys=True) + "\n")
             task_count += 1
     if task_count == 0:
         raise SystemExit("input manifest is empty; cannot write canary tasks")
@@ -483,6 +541,147 @@ def _materialize_run_tasks(args: argparse.Namespace, spec: dict[str, Any], plan:
     return artifacts, tasks_path
 
 
+def _ceil_positive_int(raw: Any, field: str) -> int:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"ready Plan selected.{field} must be a positive number") from exc
+    if value <= 0:
+        raise SystemExit(f"ready Plan selected.{field} must be a positive number")
+    return max(1, int(math.ceil(value)))
+
+
+def _runtime_settings_from_plan(plan: dict[str, Any]) -> dict[str, int | float]:
+    selected = plan.get("selected")
+    if plan.get("status") != "ready" or not isinstance(selected, dict):
+        raise SystemExit("sweetspot run --apply requires a ready Plan with selected execution settings")
+    return {
+        "vcpus": _ceil_positive_int(selected.get("vcpus"), "vcpus"),
+        "memory_mib": _ceil_positive_int(selected.get("memory_mib"), "memory_mib"),
+        "estimated_workers": _ceil_positive_int(selected.get("estimated_workers"), "estimated_workers"),
+        "task_timeout_seconds": float(selected.get("task_timeout_seconds") or selected.get("target_task_seconds") or SAFE_TASK_TIMEOUT_SECONDS),
+        "visibility_timeout": _ceil_positive_int(selected.get("visibility_timeout_seconds") or 1800, "visibility_timeout_seconds"),
+        "heartbeat_seconds": _ceil_positive_int(selected.get("heartbeat_seconds") or 300, "heartbeat_seconds"),
+    }
+
+
+def _reject_legacy_run_sizing_overrides(args: argparse.Namespace) -> None:
+    overrides: list[str] = []
+    if getattr(args, "messages_per_worker", 1) != 1:
+        overrides.append("--messages-per-worker")
+    if getattr(args, "min_workers", 0) != 0:
+        overrides.append("--min-workers")
+    if getattr(args, "max_workers", 64) != 64:
+        overrides.append("--max-workers")
+    if getattr(args, "vcpus", None) is not None:
+        overrides.append("--vcpus")
+    if getattr(args, "memory", None) is not None:
+        overrides.append("--memory")
+    if getattr(args, "visibility_timeout", 1800) != 1800:
+        overrides.append("--visibility-timeout")
+    if getattr(args, "heartbeat_seconds", 300) != 300:
+        overrides.append("--heartbeat-seconds")
+    if getattr(args, "task_timeout_seconds", SAFE_TASK_TIMEOUT_SECONDS) != SAFE_TASK_TIMEOUT_SECONDS:
+        overrides.append("--task-timeout-seconds")
+    if getattr(args, "subtract_active", False):
+        overrides.append("--subtract-active")
+    if overrides:
+        raise SystemExit("sweetspot run --apply is Plan-authoritative; legacy sizing/timing overrides are not accepted: " + ", ".join(overrides))
+
+
+def _target_from_plan(args: argparse.Namespace, spec: dict[str, Any], plan: dict[str, Any]) -> tuple[DeploymentTarget, list[dict[str, Any]], str | None]:
+    selected = plan.get("selected")
+    if plan.get("status") != "ready" or not isinstance(selected, dict):
+        raise SystemExit("sweetspot run --apply requires a ready Plan before selecting a deployment target")
+    deployment_sha256: str | None = None
+    if getattr(args, "deployment", None):
+        deployment_sha256 = _sha256_file(args.deployment)
+        registry = load_deployment(args.deployment)
+        try:
+            target = select_deployment_target(plan, registry)
+            warnings = validate_target_matches_job(job_spec=spec, target=target)
+        except PlannerSpecError as exc:
+            raise SystemExit(str(exc)) from exc
+        return target, warnings, deployment_sha256
+    queue_url = args.queue_url
+    batch_job_queue = args.batch_job_queue
+    job_definition = args.job_definition
+    if not queue_url:
+        raise SystemExit("sweetspot run --apply requires --deployment or --queue-url/SWEETSPOT_SQS_QUEUE_URL")
+    if not batch_job_queue or not job_definition:
+        raise SystemExit("sweetspot run --apply requires --deployment or --batch-job-queue and --job-definition")
+    return (
+        DeploymentTarget(
+            region=str(selected.get("region") or args.region or ""),
+            architecture=str(selected.get("architecture") or ""),
+            sqs_queue_url=queue_url,
+            dlq_url=getattr(args, "dlq_url", None),
+            batch_job_queue=batch_job_queue,
+            job_definition=job_definition,
+            image=None,
+        ),
+        [],
+        deployment_sha256,
+    )
+
+
+def _aws_client_for_target(args: argparse.Namespace, service: str, target: DeploymentTarget):
+    profile = getattr(args, "profile", None)
+    explicit_region = getattr(args, "region", None)
+    region = target.region or explicit_region
+    if profile or getattr(args, "deployment", None):
+        return boto3.Session(profile_name=profile, region_name=region or None).client(service, region_name=region or None)
+    if region:
+        try:
+            return boto3.client(service, region_name=region)
+        except TypeError as exc:
+            # Unit tests often monkeypatch boto3.client with a tiny one-arg
+            # function; real boto3 accepts region_name and therefore honors the
+            # Plan-selected fallback region.
+            if "region_name" not in str(exc):
+                raise
+    return boto3.client(service)
+
+
+def _preflight_deployment_target(batch: Any, *, target: DeploymentTarget, spec: dict[str, Any]) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if not target.image:
+        return warnings
+    try:
+        resp = batch.describe_job_definitions(jobDefinitions=[target.job_definition])
+    except Exception as exc:  # noqa: BLE001 - remote deployment image identity must fail closed.
+        raise SystemExit(f"Batch job definition image preflight failed for deployment target {target.region}/{target.architecture}: {exc}") from exc
+    defs = resp.get("jobDefinitions") or []
+    if not defs:
+        raise SystemExit(f"deployment job definition not found: {target.job_definition}")
+    image = (defs[0].get("containerProperties") or {}).get("image")
+    if image:
+        try:
+            validate_target_matches_job(job_spec={**spec, "image": image}, target=target)
+        except PlannerSpecError as exc:
+            raise SystemExit(f"Batch job definition image does not match deployment target: {exc}") from exc
+    else:
+        warnings.append({"code": "job_definition_image_unknown", "severity": "warning", "message": "Batch job definition did not expose a container image for preflight."})
+    return warnings
+
+
+def _manifest_identity_for_run(args: argparse.Namespace, spec: dict[str, Any], target: DeploymentTarget) -> dict[str, Any]:
+    local_path = getattr(args, "input_manifest_jsonl", None)
+    local_sha = _sha256_file(local_path) if local_path else None
+    if getattr(args, "deployment", None):
+        if local_path is None or local_sha is None:
+            raise SystemExit("deployment run --apply requires --input-manifest-jsonl so the local task source can be verified against the S3 input_manifest")
+        try:
+            s3 = _aws_client_for_target(args, "s3", target)
+            bucket, key = parse_s3_uri(str(spec["input_manifest"]))
+            head = s3.head_object(Bucket=bucket, Key=key, ChecksumMode="ENABLED")
+            validate_local_manifest_matches_head(local_path=local_path, local_sha256=local_sha, head=head)
+            return manifest_identity_from_head(str(spec["input_manifest"]), head, local_path=local_path, local_sha256=local_sha).as_dict()
+        except Exception as exc:  # noqa: BLE001
+            raise SystemExit(f"failed to bind remote S3 manifest identity for deployment run: {exc}") from exc
+    return local_manifest_identity(str(spec["input_manifest"]), local_path=local_path, local_sha256=local_sha).as_dict()
+
+
 def _enqueue_phase_started(previous_state: dict[str, Any]) -> bool:
     phase = _phase_by_name(previous_state).get("enqueue_tasks", {})
     status = phase.get("status")
@@ -505,6 +704,22 @@ def _recorded_run_tasks_artifact(previous_state: dict[str, Any], artifact_dir: P
     return artifacts, path
 
 
+def _plan_requests_controller_canaries(plan: dict[str, Any]) -> bool:
+    canaries = plan.get("canaries")
+    if not isinstance(canaries, list) or not canaries:
+        return False
+    decision = canaries[0].get("decision") if isinstance(canaries[0], dict) else None
+    return isinstance(decision, dict) and decision.get("next_action") == "run_canary"
+
+
+def _safe_active_worker_count(batch: Any, *, job_queue: str, job_name_prefix: str, fallback: int) -> tuple[int, list[dict[str, Any]], dict[str, Any] | None]:
+    try:
+        active = active_jobs(batch, job_queue, job_name_prefix)
+        return len(active), active[:20], None
+    except Exception as exc:  # noqa: BLE001
+        return fallback, [], {"code": "active_worker_observation_unavailable", "severity": "warning", "message": str(exc)}
+
+
 def _cmd_run_apply(
     args: argparse.Namespace,
     *,
@@ -513,14 +728,22 @@ def _cmd_run_apply(
     logical_unit_count: int | None,
     job_spec_sha256: str,
 ) -> dict[str, Any]:
+    if _plan_requests_controller_canaries(plan):
+        raise SystemExit(
+            "sweetspot run --apply for canary Plans is not yet safe to mutate automatically; "
+            "run without --apply to materialize canary_tasks.jsonl, then launch reviewed canaries on dedicated per-candidate queues/job definitions"
+        )
     if args.artifact_dir is None:
         raise SystemExit("sweetspot run --apply requires --artifact-dir so run_state.json can make retries/resume safe")
-    if not args.queue_url:
-        raise SystemExit("sweetspot run --apply requires --queue-url or SWEETSPOT_SQS_QUEUE_URL")
-    if not args.batch_job_queue or not args.job_definition:
-        raise SystemExit("sweetspot run --apply requires --batch-job-queue and --job-definition")
+    _reject_legacy_run_sizing_overrides(args)
+    runtime_settings = _runtime_settings_from_plan(plan)
+    target, target_warnings, deployment_sha256 = _target_from_plan(args, spec, plan)
     try:
-        validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
+        validate_worker_timing(
+            visibility_timeout=int(runtime_settings["visibility_timeout"]),
+            heartbeat_seconds=int(runtime_settings["heartbeat_seconds"]),
+            task_timeout_seconds=float(runtime_settings["task_timeout_seconds"]),
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -549,44 +772,67 @@ def _cmd_run_apply(
         raise SystemExit("sweetspot run --job-name-prefix must start with RUN_ID- for run-scoped worker management")
     allowed_s3_prefixes = _default_run_allowed_s3_prefixes(args, spec)
     _validate_tasks_for_enqueue(tasks, allowed_s3_prefixes=allowed_s3_prefixes)
+    plan_worker_count = max(1, min(int(runtime_settings["estimated_workers"]), len(tasks) or 1))
+    plan_messages_per_worker = max(1, math.ceil((len(tasks) or 1) / plan_worker_count))
+    manifest_identity = _manifest_identity_for_run(args, spec, target)
+    plan_binding = {
+        "deployment_sha256": deployment_sha256,
+        "manifest_identity": manifest_identity,
+        "selected": plan.get("selected"),
+        "target": target.as_dict(),
+    }
     enqueue_config_sha256 = _sha256_json_obj(
         {
             "allowed_s3_prefixes": allowed_s3_prefixes,
             "profile": args.profile,
-            "queue_url": args.queue_url,
-            "region": args.region,
+            "queue_url": target.sqs_queue_url,
+            "region": target.region,
         }
     )
     worker_config_sha256 = _sha256_json_obj(
         {
             "allow_legacy_done_markers": bool(getattr(args, "allow_legacy_done_markers", False)),
             "allowed_s3_prefixes": allowed_s3_prefixes,
-            "batch_job_queue": args.batch_job_queue,
+            "batch_job_queue": target.batch_job_queue,
             "env": args.env or [],
-            "heartbeat_seconds": args.heartbeat_seconds,
+            "heartbeat_seconds": runtime_settings["heartbeat_seconds"],
             "include_not_visible": args.include_not_visible,
-            "job_definition": args.job_definition,
+            "job_definition": target.job_definition,
             "job_name_prefix": job_name_prefix,
             "log_tail_bytes": args.log_tail_bytes,
             "max_log_bytes": args.max_log_bytes,
-            "max_workers": args.max_workers,
-            "memory": args.memory,
-            "messages_per_worker": args.messages_per_worker,
-            "min_workers": args.min_workers,
+            "memory": runtime_settings["memory_mib"],
+            "messages_per_worker": plan_messages_per_worker,
+            "plan_estimated_workers": runtime_settings["estimated_workers"],
             "profile": args.profile,
-            "queue_url": args.queue_url,
+            "queue_url": target.sqs_queue_url,
             "redact_regex": args.redact_regex or [],
-            "region": args.region,
+            "region": target.region,
             "retry_attempts": args.retry_attempts,
-            "subtract_active": args.subtract_active,
-            "task_timeout_seconds": args.task_timeout_seconds,
-            "vcpus": args.vcpus,
-            "visibility_timeout": args.visibility_timeout,
+            "task_timeout_seconds": runtime_settings["task_timeout_seconds"],
+            "vcpus": runtime_settings["vcpus"],
+            "visibility_timeout": runtime_settings["visibility_timeout"],
             "wait_for_visible_min": args.wait_for_visible_min,
             "wait_for_visible_seconds": args.wait_for_visible_seconds,
             "wait_interval_seconds": args.wait_interval_seconds,
+            "dedicated_run_queue": bool(getattr(args, "dedicated_run_queue", False)),
+            "kickoff_only": bool(getattr(args, "kickoff_only", False)),
+            "reconcile_rounds": int(getattr(args, "reconcile_rounds", 1)),
+            "reconcile_interval_seconds": float(getattr(args, "reconcile_interval_seconds", 0.0)),
         }
     )
+
+    controller_base = {
+        "apply_supported": True,
+        "mutations_allowed": True,
+        "resume_state_loaded": bool(previous_state),
+        "plan_authoritative": True,
+        "plan_binding": plan_binding,
+        "deployment_warnings": target_warnings,
+    }
+    previous_binding = previous_state.get("controller", {}).get("plan_binding") if isinstance(previous_state.get("controller"), dict) else None
+    if previous_binding and _sha256_json_obj(previous_binding) != _sha256_json_obj(plan_binding):
+        raise SystemExit("existing run_state.json plan/deployment/manifest binding differs; use the original inputs or a new artifact directory")
 
     previous_phases = _phase_by_name(previous_state)
     phases: list[dict[str, Any]] = [
@@ -610,17 +856,18 @@ def _cmd_run_apply(
         artifacts=artifacts,
         phases=phases,
         job_spec_sha256=job_spec_sha256,
-        controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+        controller=controller_base,
         next_actions=["Persisted run_state.json before mutation; rerun the same command to resume without re-enqueueing completed phases."],
     )
     _write_run_state(state_path, report)
 
-    sqs = _aws_client(args, "sqs")
-    batch = _aws_client(args, "batch")
+    sqs = _aws_client_for_target(args, "sqs", target)
+    batch = _aws_client_for_target(args, "batch", target)
+    target_warnings.extend(_preflight_deployment_target(batch, target=target, spec=spec))
     previous_enqueue_phase = previous_phases.get("enqueue_tasks", {})
     previous_enqueue_status = previous_enqueue_phase.get("status")
     if _enqueue_phase_started(previous_state):
-        if previous_enqueue_phase.get("queue_url") and previous_enqueue_phase.get("queue_url") != args.queue_url:
+        if previous_enqueue_phase.get("queue_url") and previous_enqueue_phase.get("queue_url") != target.sqs_queue_url:
             raise SystemExit("existing run_state.json enqueue progress uses a different queue_url; use the original queue or a new artifact directory")
         if previous_enqueue_phase.get("enqueue_config_sha256") and previous_enqueue_phase.get("enqueue_config_sha256") != enqueue_config_sha256:
             raise SystemExit("existing run_state.json enqueue progress uses different enqueue settings; use the original settings or a new artifact directory")
@@ -646,7 +893,7 @@ def _cmd_run_apply(
                 previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
             ],
             job_spec_sha256=job_spec_sha256,
-            controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+            controller=controller_base,
             next_actions=next_actions,
         )
         _write_run_state(state_path, progress_report)
@@ -659,7 +906,7 @@ def _cmd_run_apply(
         enqueue_phase = {
             "name": "enqueue_tasks",
             "status": "in_progress" if sent < len(tasks) else "completed",
-            "queue_url": args.queue_url,
+            "queue_url": target.sqs_queue_url,
             "task_count": len(tasks),
             "sent": sent,
             "next_task_index": sent,
@@ -686,7 +933,7 @@ def _cmd_run_apply(
                 next_actions=["A task-message batch may have reached SQS; if this controller stops here, review SQS/task state before retrying."],
             )
             entries = [{"Id": str(batch_start + i), "MessageBody": json.dumps(t, sort_keys=True)} for i, t in enumerate(task_batch)]
-            resp = sqs.send_message_batch(QueueUrl=args.queue_url, Entries=entries)
+            resp = sqs.send_message_batch(QueueUrl=target.sqs_queue_url, Entries=entries)
             if resp.get("Failed"):
                 review_phase = {
                     **in_flight_phase,
@@ -700,7 +947,7 @@ def _cmd_run_apply(
             enqueue_phase = {
                 "name": "enqueue_tasks",
                 "status": "in_progress" if sent < len(tasks) else "completed",
-                "queue_url": args.queue_url,
+                "queue_url": target.sqs_queue_url,
                 "task_count": len(tasks),
                 "sent": sent,
                 "next_task_index": sent,
@@ -716,13 +963,13 @@ def _cmd_run_apply(
                 else ["Task enqueue is in progress; rerun the same command to resume from the recorded sent index if this controller stops."],
             )
 
-    depth = queue_depth(sqs, args.queue_url)
+    depth = queue_depth(sqs, target.sqs_queue_url)
     wait_history: list[dict[str, Any]] = []
     if sent and not _phase_completed(previous_state, "enqueue_tasks"):
         min_visible = args.wait_for_visible_min if args.wait_for_visible_min is not None else depth["visible"]
         depth, wait_history = _wait_for_visible_backlog(
             sqs,
-            queue_url=args.queue_url,
+            queue_url=target.sqs_queue_url,
             min_visible=min_visible,
             max_seconds=args.wait_for_visible_seconds,
             interval_seconds=args.wait_interval_seconds,
@@ -744,10 +991,26 @@ def _cmd_run_apply(
                 previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
             ],
             job_spec_sha256=job_spec_sha256,
-            controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+            controller=controller_base,
             next_actions=next_actions,
         )
         _write_run_state(state_path, progress_report)
+
+    overrides = _worker_overrides(
+        sqs_queue_url=target.sqs_queue_url,
+        messages_per_worker=plan_messages_per_worker,
+        visibility_timeout=int(runtime_settings["visibility_timeout"]),
+        heartbeat_seconds=int(runtime_settings["heartbeat_seconds"]),
+        task_timeout_seconds=float(runtime_settings["task_timeout_seconds"]),
+        env=args.env or [],
+        allowed_s3_prefixes=allowed_s3_prefixes,
+        log_tail_bytes=args.log_tail_bytes,
+        max_log_bytes=args.max_log_bytes,
+        redact_regexes=args.redact_regex or [],
+        allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+        vcpus=int(runtime_settings["vcpus"]),
+        memory=int(runtime_settings["memory_mib"]),
+    )
 
     submit_phase: dict[str, Any]
     previous_submit_phase = previous_phases.get("submit_workers", {})
@@ -755,11 +1018,11 @@ def _cmd_run_apply(
     if previous_submit_status in {"in_progress", "job_in_flight", "needs_review", "completed"}:
         if previous_submit_phase.get("worker_config_sha256") and previous_submit_phase.get("worker_config_sha256") != worker_config_sha256:
             raise SystemExit("existing run_state.json worker submission progress uses different worker settings; use the original settings or a new artifact directory")
-        if previous_submit_phase.get("queue_url") and previous_submit_phase.get("queue_url") != args.queue_url:
+        if previous_submit_phase.get("queue_url") and previous_submit_phase.get("queue_url") != target.sqs_queue_url:
             raise SystemExit("existing run_state.json worker submission progress uses a different queue_url; use the original queue or a new artifact directory")
-        if previous_submit_phase.get("batch_job_queue") and previous_submit_phase.get("batch_job_queue") != args.batch_job_queue:
+        if previous_submit_phase.get("batch_job_queue") and previous_submit_phase.get("batch_job_queue") != target.batch_job_queue:
             raise SystemExit("existing run_state.json worker submission progress uses a different Batch job queue; use the original queue or a new artifact directory")
-        if previous_submit_phase.get("job_definition") and previous_submit_phase.get("job_definition") != args.job_definition:
+        if previous_submit_phase.get("job_definition") and previous_submit_phase.get("job_definition") != target.job_definition:
             raise SystemExit("existing run_state.json worker submission progress uses a different job definition; use the original job definition or a new artifact directory")
     if previous_submit_status in {"job_in_flight", "needs_review"}:
         raise SystemExit("existing run_state.json has ambiguous worker submission progress; review Batch jobs before retrying to avoid duplicate workers")
@@ -781,43 +1044,27 @@ def _cmd_run_apply(
             # run controller only owns messages it just enqueued (or recorded as
             # enqueued), so size this initial wave from the run-scoped sent count.
             backlog = sent
-            raw_desired = desired_worker_count(backlog, args.messages_per_worker, args.min_workers, args.max_workers)
-            active = active_jobs(batch, args.batch_job_queue, job_name_prefix) if args.subtract_active else []
+            raw_desired = plan_worker_count if backlog else 0
+            active = active_jobs(batch, target.batch_job_queue, job_name_prefix) if args.subtract_active else []
             active_count = len(active)
             active_examples = active[:20]
             to_submit = max(0, raw_desired - active_count) if args.subtract_active else raw_desired
-            to_submit = min(to_submit, args.max_workers)
             submission_stamp = utc_stamp()
         if len(submitted) > to_submit:
             raise SystemExit("existing run_state.json has invalid worker submission progress")
-        overrides = _worker_overrides(
-            sqs_queue_url=args.queue_url,
-            messages_per_worker=args.messages_per_worker,
-            visibility_timeout=args.visibility_timeout,
-            heartbeat_seconds=args.heartbeat_seconds,
-            task_timeout_seconds=args.task_timeout_seconds,
-            env=args.env or [],
-            allowed_s3_prefixes=allowed_s3_prefixes,
-            log_tail_bytes=args.log_tail_bytes,
-            max_log_bytes=args.max_log_bytes,
-            redact_regexes=args.redact_regex or [],
-            allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
-            vcpus=args.vcpus,
-            memory=args.memory,
-        )
         submit_phase = {
             "name": "submit_workers",
             "status": "in_progress" if len(submitted) < to_submit else "completed",
-            "batch_job_queue": args.batch_job_queue,
-            "job_definition": args.job_definition,
+            "batch_job_queue": target.batch_job_queue,
+            "job_definition": target.job_definition,
             "job_name_prefix": job_name_prefix,
-            "queue_url": args.queue_url,
+            "queue_url": target.sqs_queue_url,
             "worker_config_sha256": worker_config_sha256,
             "submission_stamp": submission_stamp,
             "queue_depth": depth,
             "wait_history": wait_history,
             "backlog_used_for_sizing": backlog,
-            "messages_per_worker": args.messages_per_worker,
+            "messages_per_worker": plan_messages_per_worker,
             "raw_desired_workers": raw_desired,
             "active_matching_workers": active_count,
             "to_submit": to_submit,
@@ -846,8 +1093,8 @@ def _cmd_run_apply(
             )
             kwargs: dict[str, Any] = {
                 "jobName": job_name,
-                "jobQueue": args.batch_job_queue,
-                "jobDefinition": args.job_definition,
+                "jobQueue": target.batch_job_queue,
+                "jobDefinition": target.job_definition,
                 "containerOverrides": overrides,
             }
             if args.retry_attempts is not None:
@@ -873,11 +1120,82 @@ def _cmd_run_apply(
                 else ["Worker submission is in progress; rerun the same command to resume from the recorded submitted count if this controller stops."],
             )
 
+    submitted_for_reconcile = list(submit_phase.get("submitted", [])) if isinstance(submit_phase.get("submitted"), list) else []
+    previous_reconcile_phase = previous_phases.get("reconcile_workers", {})
+    reconcile_phase: dict[str, Any]
+    if getattr(args, "kickoff_only", False):
+        reconcile_phase = {"name": "reconcile_workers", "status": "skipped", "reason": "kickoff_only"}
+    elif previous_reconcile_phase.get("status") == "completed":
+        reconcile_phase = dict(previous_reconcile_phase)
+        reconcile_phase["resumed"] = True
+    else:
+        rounds = max(1, int(getattr(args, "reconcile_rounds", 1)))
+        reconcile_submitted: list[dict[str, Any]] = []
+        decisions: list[dict[str, Any]] = []
+        for round_index in range(rounds):
+            observed_depth = queue_depth(sqs, target.sqs_queue_url)
+            if getattr(args, "dedicated_run_queue", False):
+                observed_backlog = max(0, min(sent, int(observed_depth.get("visible", 0)) + int(observed_depth.get("not_visible", 0))))
+                backlog_signal = "dedicated_queue_depth"
+            else:
+                # SQS depth is queue-global and may include other runs.  Never
+                # turn unrelated shared-queue messages into this run's backlog
+                # estimate. Without a run-specific status artifact, the safe
+                # shared-queue signal is unassigned run work implied by the
+                # persisted task count minus submitted worker message capacity.
+                submitted_capacity = (len(submitted_for_reconcile) + len(reconcile_submitted)) * plan_messages_per_worker
+                observed_backlog = max(0, sent - submitted_capacity)
+                backlog_signal = "task_count_minus_submitted_capacity"
+            fallback_active = len(submitted_for_reconcile) + len(reconcile_submitted)
+            observed_active, active_examples, active_warning = _safe_active_worker_count(
+                batch,
+                job_queue=target.batch_job_queue,
+                job_name_prefix=job_name_prefix,
+                fallback=fallback_active,
+            )
+            top_up = choose_worker_top_up(backlog=observed_backlog, active_workers=observed_active, target_workers=plan_worker_count)
+            decision: dict[str, Any] = {
+                "round": round_index,
+                "queue_depth": observed_depth,
+                "run_backlog_estimate": observed_backlog,
+                "run_backlog_signal": backlog_signal,
+                "active_matching_workers": observed_active,
+                "active_examples": active_examples,
+                "target_workers": plan_worker_count,
+                "top_up_workers": top_up,
+            }
+            if active_warning:
+                decision["warning"] = active_warning
+            if top_up:
+                decision["would_top_up_workers"] = top_up
+                decision["top_up_blocked"] = "automatic reconcile top-ups are fail-closed until Batch in-flight progress can be persisted before each submit_job mutation"
+                top_up = 0
+            decisions.append(decision)
+            reconcile_phase = {
+                "name": "reconcile_workers",
+                "status": "in_progress" if round_index + 1 < rounds else "completed",
+                "rounds_completed": round_index + 1,
+                "target_workers": plan_worker_count,
+                "submitted_count": len(reconcile_submitted),
+                "submitted": reconcile_submitted,
+                "decisions": decisions,
+            }
+            persist_submit_phase(
+                {**submit_phase, "reconciliation": reconcile_phase},
+                report_status="worker_reconcile_in_progress" if reconcile_phase["status"] == "in_progress" else "worker_reconcile_complete",
+                next_actions=["Worker reconciliation observed queue depth/active Batch jobs; automatic top-ups remain fail-closed until top-up submits are durably persisted before mutation."],
+            )
+            if round_index + 1 < rounds and float(getattr(args, "reconcile_interval_seconds", 0.0)) > 0:
+                time.sleep(float(args.reconcile_interval_seconds))
+        if not decisions:
+            reconcile_phase = {"name": "reconcile_workers", "status": "completed", "rounds_completed": 0, "submitted_count": 0, "submitted": [], "decisions": []}
+
     phases = [
         {"name": "plan", "status": "completed"},
         {"name": "materialize_production_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks)},
         enqueue_phase,
         submit_phase,
+        reconcile_phase,
         previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
     ]
     report = _build_run_report(
@@ -889,7 +1207,7 @@ def _cmd_run_apply(
         artifacts=artifacts,
         phases=phases,
         job_spec_sha256=job_spec_sha256,
-        controller={"apply_supported": True, "mutations_allowed": True, "resume_state_loaded": bool(previous_state)},
+        controller=controller_base,
         next_actions=[
             f"Use `sweetspot status {run_id} --artifact-dir {args.artifact_dir}` to watch local/run-scoped state.",
             "After workers finish, run `sweetspot finalize` or `sweetspot repair` with the persisted production_tasks.jsonl if repair is needed.",
@@ -3383,12 +3701,15 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "artifact_dir",
         "batch_job_queue",
         "canary_summary_jsonl",
+        "deployment",
+        "dedicated_run_queue",
         "env",
         "heartbeat_seconds",
         "include_not_visible",
         "input_manifest_jsonl",
         "job_definition",
         "job_name_prefix",
+        "kickoff_only",
         "log_tail_bytes",
         "max_log_bytes",
         "max_workers",
@@ -3399,6 +3720,8 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "profile",
         "queue_url",
         "redact_regex",
+        "reconcile_interval_seconds",
+        "reconcile_rounds",
         "region",
         "retry_attempts",
         "sqs_queue_url",
@@ -3470,6 +3793,8 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "allow_legacy_done_markers": ("--allow-legacy-done-markers", False),
     "artifact_dir": ("--artifact-dir", False),
     "batch_job_queue": ("--batch-job-queue", False),
+    "deployment": ("--deployment", False),
+    "dedicated_run_queue": ("--dedicated-run-queue", False),
     "dlq_url": ("--dlq-url", False),
     "dry_run": ("--dry-run", False),
     "failed_status": ("--failed-status", True),
@@ -3481,6 +3806,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "job_id": ("--job-id", False),
     "job_name_prefix": ("--job-name-prefix", False),
     "job_name_regex": ("--job-name-regex", False),
+    "kickoff_only": ("--kickoff-only", False),
     "job_queue": ("--job-queue", False),
     "canary_summary_jsonl": ("--canary-summary-jsonl", False),
     "input_manifest_jsonl": ("--input-manifest-jsonl", False),
@@ -3501,6 +3827,8 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "profile": ("--profile", False),
     "publish_ready": ("--publish-ready", False),
     "queue_url": ("--queue-url", False),
+    "reconcile_interval_seconds": ("--reconcile-interval-seconds", False),
+    "reconcile_rounds": ("--reconcile-rounds", False),
     "region": ("--region", False),
     "reason": ("--reason", False),
     "run_id": ("--run-id", False),
@@ -3671,16 +3999,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--input-manifest-jsonl", type=Path, help="Optional local JSONL copy of logical work units for calibrated task materialization")
     p.add_argument("--out-production-tasks-jsonl", type=Path, help="Optional local output path for calibrated production sweetspot.task.v1 JSONL")
     p.add_argument("--artifact-dir", type=Path, help="Optional local directory for run_state.json and default production task artifacts")
-    p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL"), help="SQS queue URL for --apply")
-    p.add_argument("--batch-job-queue", help="AWS Batch job queue for worker submissions during --apply")
-    p.add_argument("--job-definition", help="AWS Batch job definition for worker submissions during --apply")
+    p.add_argument("--deployment", type=Path, help="sweetspot.deployment.v1 registry; normal --apply selects queue/job definition from the ready Plan")
+    p.add_argument("--queue-url", "--sqs-queue-url", dest="queue_url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL"), help="Legacy fallback SQS queue URL when --deployment is omitted")
+    p.add_argument("--batch-job-queue", help="Legacy fallback AWS Batch job queue when --deployment is omitted")
+    p.add_argument("--job-definition", help="Legacy fallback AWS Batch job definition when --deployment is omitted")
     p.add_argument("--job-name-prefix", help="Run-scoped Batch worker name prefix; defaults to RUN_ID-worker and must start with RUN_ID-")
-    _add_worker_sizing_args(p)
-    _add_worker_runtime_args(p, legacy_done_markers_help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to submitted workers")
+    _add_legacy_run_override_args(p)
+    _add_legacy_run_runtime_args(p, legacy_done_markers_help="Migration mode: pass SWEETSPOT_ALLOW_LEGACY_DONE_MARKERS=1 to submitted workers")
     p.add_argument("--wait-for-visible-min", type=int, help="minimum visible messages before submitting workers; default uses observed queue depth")
     p.add_argument("--wait-for-visible-seconds", type=float, default=0.0)
     p.add_argument("--wait-interval-seconds", type=float, default=1.0)
-    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit workers once, and persist run_state.json")
+    p.add_argument("--dedicated-run-queue", action="store_true", help="Allow reconciliation to treat SQS depth as run-specific backlog; use only with a fresh/dedicated queue")
+    p.add_argument("--kickoff-only", action="store_true", help="Advanced/debug mode: stop after the initial Plan-sized worker wave and skip reconciliation")
+    p.add_argument("--reconcile-rounds", type=int, default=1, help="Bounded controller observation rounds after initial submission (default: 1)")
+    p.add_argument("--reconcile-interval-seconds", type=float, default=0.0, help="Sleep between reconciliation rounds")
+    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit Plan-sized workers, observe bounded reconciliation, and persist run_state.json")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)

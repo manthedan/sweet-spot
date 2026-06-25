@@ -29,6 +29,8 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
 
+from .cost_model import expected_cost_per_1m_units
+
 X86_CPU_TYPES = [
     "c5.large",
     "c5.xlarge",
@@ -436,14 +438,6 @@ def noncompute_cost_per_1m_units(args: argparse.Namespace, *, bucket_local: bool
         + max(0.0, args.cloudwatch_log_gb_per_1m_units) * max(0.0, args.cloudwatch_log_cost_per_gb)
         + max(0.0, args.s3_storage_gb_month_per_1m_units) * max(0.0, args.s3_storage_cost_per_gb_month)
     )
-
-
-def expected_cost_per_1m_units(*, hourly_price: float, units_per_hour: float, replay_fraction: float, startup_overhead_seconds: float, useful_task_seconds: float, noncompute_per_1m: float) -> float:
-    if units_per_hour <= 0:
-        return math.nan
-    compute = (hourly_price / units_per_hour) * 1_000_000.0
-    startup_fraction = max(0.0, startup_overhead_seconds) / max(1.0, useful_task_seconds)
-    return compute * (1.0 + max(0.0, replay_fraction) + startup_fraction) + max(0.0, noncompute_per_1m)
 
 
 def instance_vcpus(ec2, instance_types: list[str]) -> dict[str, int]:

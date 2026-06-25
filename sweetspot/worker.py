@@ -885,45 +885,46 @@ def run_worker(
             break
         msg = messages[0]
         receipt = msg["ReceiptHandle"]
-        stop = threading.Event()
-        hb = threading.Thread(
-            target=_heartbeat,
-            args=(sqs, queue_url, receipt, visibility_timeout, heartbeat_seconds, stop),
-            daemon=True,
-        )
-        hb.start()
         try:
             task = json.loads(msg.get("Body", "{}"))
             attrs = msg.get("Attributes", {})
-            _emit_event(
-                "message_received",
-                queue_url=queue_url,
-                run_id=task.get("run_id") if isinstance(task, dict) else None,
-                task_id=task.get("task_id") if isinstance(task, dict) else None,
-                receive_count=attrs.get("ApproximateReceiveCount"),
-                sent_timestamp=attrs.get("SentTimestamp"),
-                retry=str(attrs.get("ApproximateReceiveCount") or "1") != "1",
+            stop = threading.Event()
+            hb = threading.Thread(
+                target=_heartbeat,
+                args=(sqs, queue_url, receipt, visibility_timeout, heartbeat_seconds, stop),
+                daemon=True,
             )
-            result = run_task(
-                task,
-                s3=s3,
-                work_root=work_dir,
-                default_timeout_seconds=task_timeout_seconds,
-                allowed_s3_prefixes=allowed_s3_prefixes,
-                log_tail_bytes=log_tail_bytes,
-                max_log_bytes=max_log_bytes,
-                redact_regexes=redact_regexes,
-                worker_context={"receive_count": attrs.get("ApproximateReceiveCount"), "sent_timestamp_ms": attrs.get("SentTimestamp")},
-                allow_legacy_done_markers=allow_legacy_done_markers,
-            )
-            print(json.dumps(result, sort_keys=True), flush=True)
-            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
-            _emit_event("message_deleted", queue_url=queue_url, run_id=task.get("run_id"), task_id=task.get("task_id"), receipt_deleted=True)
-            processed += 1
+            hb.start()
+            try:
+                _emit_event(
+                    "message_received",
+                    queue_url=queue_url,
+                    run_id=task.get("run_id") if isinstance(task, dict) else None,
+                    task_id=task.get("task_id") if isinstance(task, dict) else None,
+                    receive_count=attrs.get("ApproximateReceiveCount"),
+                    sent_timestamp=attrs.get("SentTimestamp"),
+                    retry=str(attrs.get("ApproximateReceiveCount") or "1") != "1",
+                )
+                result = run_task(
+                    task,
+                    s3=s3,
+                    work_root=work_dir,
+                    default_timeout_seconds=task_timeout_seconds,
+                    allowed_s3_prefixes=allowed_s3_prefixes,
+                    log_tail_bytes=log_tail_bytes,
+                    max_log_bytes=max_log_bytes,
+                    redact_regexes=redact_regexes,
+                    worker_context={"receive_count": attrs.get("ApproximateReceiveCount"), "sent_timestamp_ms": attrs.get("SentTimestamp")},
+                    allow_legacy_done_markers=allow_legacy_done_markers,
+                )
+                print(json.dumps(result, sort_keys=True), flush=True)
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+                _emit_event("message_deleted", queue_url=queue_url, run_id=task.get("run_id"), task_id=task.get("task_id"), receipt_deleted=True)
+                processed += 1
+            finally:
+                stop.set()
         except Exception as exc:
             _emit_event("task_failed", queue_url=queue_url, error_type=type(exc).__name__, error=str(exc))
             raise
-        finally:
-            stop.set()
     print(json.dumps({"schema": "sweetspot.worker_summary.v1", "processed": processed, "finished_at": iso_now()}), flush=True)
     return 0

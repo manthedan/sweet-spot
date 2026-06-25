@@ -307,6 +307,13 @@ class PlannerContractTests(unittest.TestCase):
         with self.assertRaisesRegex(PlannerSpecError, "selected.region"):
             validate_plan(plan)
 
+    def test_ready_plan_v1_keeps_new_timing_fields_optional(self) -> None:
+        plan = load_plan(ROOT / "examples" / "plan.example.json")
+        del plan["selected"]["task_timeout_seconds"]
+        del plan["selected"]["visibility_timeout_seconds"]
+        del plan["selected"]["heartbeat_seconds"]
+        self.assertIs(validate_plan(plan), plan)
+
     def test_blocked_plan_can_omit_execution_settings(self) -> None:
         plan = {
             "schema": "sweetspot.plan.v1",

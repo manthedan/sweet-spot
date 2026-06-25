@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .adaptive import DEFAULT_RESOURCE_LATTICE, canary_observation_from_summary, choose_next_shard_units, choose_resource_candidate, logical_shard_plan
+from .cost_model import estimate_worker_shape_cost
 from .s3util import parse_s3_uri, s3_join
 from .task_model import SAFE_ID_RE, TASK_SCHEMA_V1
 
@@ -228,10 +229,18 @@ def _populate_ready_plan_from_selection(
         ]
         return
     # Conservative portable fallback for EC2 Batch Spot planning. Account-specific
-    # prices can refine this later, but a nonzero estimate keeps budget/deadline
-    # tradeoffs visible to agents.
+    # prices can refine this later, but the formula is shared with Scout so Plan
+    # and Scout reason about the same replay/startup/non-compute components.
     assumed_vcpu_hour_usd = 0.05
-    expected_cost_usd = (single_worker_seconds * vcpus / 3600.0) * assumed_vcpu_hour_usd
+    cost_estimate = estimate_worker_shape_cost(
+        total_units=target_units,
+        units_per_second_per_worker=rate,
+        worker_vcpus=vcpus,
+        vcpu_hour_usd=assumed_vcpu_hour_usd,
+        useful_task_seconds=target_task_seconds,
+        confidence="price_defaulted",
+    )
+    expected_cost_usd = cost_estimate.expected_cost_usd
     if expected_cost_usd > float(constraints["max_cost_usd"]):
         plan["reasons"] = [
             {
@@ -254,12 +263,18 @@ def _populate_ready_plan_from_selection(
             "message": "Expected cost uses a conservative default vCPU-hour price until account-specific price telemetry is wired into the planner.",
         },
     ]
+    task_timeout_seconds = max(1.0, min(39600.0, math.ceil(target_task_seconds * 2.0)))
+    visibility_timeout_seconds = max(task_timeout_seconds + 60.0, min(43200.0, math.ceil(task_timeout_seconds * 1.5)))
+    heartbeat_seconds = max(1.0, min(300.0, math.floor(visibility_timeout_seconds / 3.0)))
     plan["selected"] = {
         "region": region,
         "architecture": selected["architecture"],
         "vcpus": vcpus,
         "memory_mib": memory_mib,
         "target_task_seconds": target_task_seconds,
+        "task_timeout_seconds": task_timeout_seconds,
+        "visibility_timeout_seconds": visibility_timeout_seconds,
+        "heartbeat_seconds": heartbeat_seconds,
         "estimated_workers": usable_parallelism,
     }
     plan["estimates"] = {
@@ -269,8 +284,13 @@ def _populate_ready_plan_from_selection(
         "production_task_count": production_task_count,
         "vcpu_seconds_per_unit": selected["vcpu_seconds_per_unit"],
         "cost_model": {
+            "schema": "sweetspot.cost_model.v1",
+            "source": "shared_scout_planner_model",
             "assumed_vcpu_hour_usd": assumed_vcpu_hour_usd,
-            "source": "conservative_default",
+            "expected_cost_per_1m_units": cost_estimate.expected_cost_per_1m_units,
+            "estimated_compute_cost_per_1m_units": cost_estimate.compute_cost_per_1m_units,
+            "confidence": cost_estimate.confidence,
+            "assumptions": cost_estimate.assumptions,
         },
     }
 
@@ -491,7 +511,21 @@ def _validate_ready_plan(plan: dict[str, Any]) -> None:
         raise PlannerSpecError("ready Plan selected.architecture must be x86_64 or arm64")
     _positive_number(selected.get("vcpus"), "selected.vcpus")
     _positive_number(selected.get("memory_mib"), "selected.memory_mib")
-    _positive_number(selected.get("target_task_seconds"), "selected.target_task_seconds")
+    target_task_seconds = _positive_number(selected.get("target_task_seconds"), "selected.target_task_seconds")
+    task_timeout_seconds = target_task_seconds
+    if "task_timeout_seconds" in selected:
+        task_timeout_seconds = _positive_number(selected.get("task_timeout_seconds"), "selected.task_timeout_seconds")
+        if task_timeout_seconds < target_task_seconds:
+            raise PlannerSpecError("selected.task_timeout_seconds must be >= selected.target_task_seconds")
+    visibility_timeout_seconds = task_timeout_seconds
+    if "visibility_timeout_seconds" in selected:
+        visibility_timeout_seconds = _positive_number(selected.get("visibility_timeout_seconds"), "selected.visibility_timeout_seconds")
+        if visibility_timeout_seconds <= task_timeout_seconds:
+            raise PlannerSpecError("selected.visibility_timeout_seconds must be > selected.task_timeout_seconds")
+    if "heartbeat_seconds" in selected:
+        heartbeat_seconds = _positive_number(selected.get("heartbeat_seconds"), "selected.heartbeat_seconds")
+        if heartbeat_seconds >= visibility_timeout_seconds:
+            raise PlannerSpecError("selected.heartbeat_seconds must be < selected.visibility_timeout_seconds")
     _positive_number(selected.get("estimated_workers"), "selected.estimated_workers")
 
     constraints = plan.get("constraints")

@@ -82,7 +82,7 @@ sweetspot run job.json \
   --apply
 ```
 
-Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift.
+Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation. Reconciliation is bounded and observational; pass `--dedicated-run-queue` only for a fresh queue dedicated to this run, where SQS depth is a valid run-specific backlog signal. Automatic top-up remains fail-closed until extra submits are durably recorded before each Batch mutation.
 
 ## Status, repair, and cancel
 

@@ -15,6 +15,9 @@
     "vcpus": 2,
     "memory_mib": 4096,
     "target_task_seconds": 300,
+    "task_timeout_seconds": 600,
+    "visibility_timeout_seconds": 900,
+    "heartbeat_seconds": 300,
     "estimated_workers": 20
   },
   "constraints": {
