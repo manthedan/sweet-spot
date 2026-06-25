@@ -902,6 +902,137 @@ class RunCommandTests(unittest.TestCase):
                 main(argv)
             self.assertEqual(len(batch.submitted), 1)
 
+    def test_run_apply_reconcile_submits_bounded_top_up_on_dedicated_queue(self) -> None:
+        class EmptyPaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class ZeroActiveBatch(FakeSubmitBatch):
+            def get_paginator(self, name):
+                return EmptyPaginator()
+
+        sqs = FakeQueueDepthSQS()
+        batch = ZeroActiveBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--dedicated-run-queue",
+                "--apply",
+            ]
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            report = json.loads(out.getvalue())
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            reconcile = phases["reconcile_workers"]
+            self.assertEqual(phases["submit_workers"]["submitted_count"], 1)
+            self.assertEqual(reconcile["submitted_count"], 1)
+            self.assertEqual(reconcile["decisions"][0]["submitted_top_up_workers"], 1)
+            self.assertEqual(len(batch.submitted), 2)
+            self.assertIn("-reconcile-", batch.submitted[1]["jobName"])
+
+            state_path = artifact_dir / "run_state.json"
+            state = json.loads(state_path.read_text())
+            state_reconcile = {phase["name"]: phase for phase in state["phases"]}["reconcile_workers"]
+            state_reconcile["status"] = "in_progress"
+            state_reconcile["rounds_completed"] = 1
+            state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            resumed = json.loads(out.getvalue())
+            resumed_reconcile = {phase["name"]: phase for phase in resumed["phases"]}["reconcile_workers"]
+            self.assertEqual(resumed_reconcile["status"], "completed")
+            self.assertEqual(len(batch.submitted), 2)
+
+    def test_run_apply_refuses_ambiguous_reconcile_top_up_resume(self) -> None:
+        class EmptyPaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FailingTopUpBatch(FakeSubmitBatch):
+            def get_paginator(self, name):
+                return EmptyPaginator()
+
+            def submit_job(self, **kwargs):
+                if len(self.submitted) >= 1:
+                    raise RuntimeError("top-up submit failed")
+                return super().submit_job(**kwargs)
+
+        sqs = FakeQueueDepthSQS()
+        batch = FailingTopUpBatch()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--dedicated-run-queue",
+                "--apply",
+            ]
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(RuntimeError, "top-up submit failed"):
+                main(argv)
+            self.assertEqual(len(batch.submitted), 1)
+            state = json.loads((artifact_dir / "run_state.json").read_text())
+            reconcile = {phase["name"]: phase for phase in state["phases"]}["reconcile_workers"]
+            self.assertEqual(reconcile["status"], "needs_review")
+
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), self.assertRaisesRegex(SystemExit, "ambiguous reconciliation worker submission"):
+                main(argv)
+            self.assertEqual(len(batch.submitted), 1)
+
     def test_run_apply_rejects_unscoped_worker_job_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

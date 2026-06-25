@@ -1122,17 +1122,55 @@ def _cmd_run_apply(
 
     submitted_for_reconcile = list(submit_phase.get("submitted", [])) if isinstance(submit_phase.get("submitted"), list) else []
     previous_reconcile_phase = previous_phases.get("reconcile_workers", {})
+
+    def persist_reconcile_phase(phase: dict[str, Any], *, report_status: str, next_actions: list[str]) -> None:
+        progress_report = _build_run_report(
+            spec=spec,
+            plan=plan,
+            mode="apply",
+            applied=True,
+            status=report_status,
+            artifacts=artifacts,
+            phases=[
+                {"name": "plan", "status": "completed"},
+                {"name": "materialize_production_tasks", "status": "completed", "artifact": str(tasks_path), "task_count": len(tasks)},
+                enqueue_phase,
+                submit_phase,
+                phase,
+                previous_phases.get("finalize", {"name": "finalize", "status": "not_started", "requires_resume_after_workers": True}),
+            ],
+            job_spec_sha256=job_spec_sha256,
+            controller=controller_base,
+            next_actions=next_actions,
+        )
+        _write_run_state(state_path, progress_report)
+
     reconcile_phase: dict[str, Any]
+    previous_reconcile_status = previous_reconcile_phase.get("status")
+    if previous_reconcile_status in {"job_in_flight", "needs_review"}:
+        raise SystemExit("existing run_state.json has ambiguous reconciliation worker submission progress; review Batch jobs before retrying to avoid duplicate workers")
     if getattr(args, "kickoff_only", False):
         reconcile_phase = {"name": "reconcile_workers", "status": "skipped", "reason": "kickoff_only"}
-    elif previous_reconcile_phase.get("status") == "completed":
+    elif previous_reconcile_status == "completed":
         reconcile_phase = dict(previous_reconcile_phase)
         reconcile_phase["resumed"] = True
     else:
         rounds = max(1, int(getattr(args, "reconcile_rounds", 1)))
-        reconcile_submitted: list[dict[str, Any]] = []
-        decisions: list[dict[str, Any]] = []
-        for round_index in range(rounds):
+        reconcile_submitted: list[dict[str, Any]] = list(previous_reconcile_phase.get("submitted", [])) if isinstance(previous_reconcile_phase.get("submitted"), list) else []
+        decisions: list[dict[str, Any]] = list(previous_reconcile_phase.get("decisions", [])) if isinstance(previous_reconcile_phase.get("decisions"), list) else []
+        start_round = int(previous_reconcile_phase.get("rounds_completed", 0) or 0) if previous_reconcile_status == "in_progress" else 0
+        reconcile_stamp = str(previous_reconcile_phase.get("submission_stamp") or utc_stamp())
+        reconcile_phase = {
+            "name": "reconcile_workers",
+            "status": "completed" if start_round >= rounds else "in_progress",
+            "submission_stamp": reconcile_stamp,
+            "rounds_completed": min(start_round, rounds),
+            "target_workers": plan_worker_count,
+            "submitted_count": len(reconcile_submitted),
+            "submitted": reconcile_submitted,
+            "decisions": decisions,
+        }
+        for round_index in range(start_round, rounds):
             observed_depth = queue_depth(sqs, target.sqs_queue_url)
             if getattr(args, "dedicated_run_queue", False):
                 observed_backlog = max(0, min(sent, int(observed_depth.get("visible", 0)) + int(observed_depth.get("not_visible", 0))))
@@ -1167,23 +1205,80 @@ def _cmd_run_apply(
             if active_warning:
                 decision["warning"] = active_warning
             if top_up:
-                decision["would_top_up_workers"] = top_up
-                decision["top_up_blocked"] = "automatic reconcile top-ups are fail-closed until Batch in-flight progress can be persisted before each submit_job mutation"
-                top_up = 0
+                if top_up > 1:
+                    decision["top_up_limit_reason"] = "one_top_up_per_reconciliation_round_keeps_crash_resume_idempotent"
+                    top_up = 1
+                decision["submitting_top_up_workers"] = top_up
+                for top_up_index in range(top_up):
+                    global_top_up_index = len(reconcile_submitted)
+                    job_name = f"{job_name_prefix}-reconcile-{reconcile_stamp}-r{round_index:02d}-{global_top_up_index:04d}"
+                    in_flight_phase = {
+                        "name": "reconcile_workers",
+                        "status": "job_in_flight",
+                        "submission_stamp": reconcile_stamp,
+                        "rounds_completed": round_index,
+                        "target_workers": plan_worker_count,
+                        "submitted_count": len(reconcile_submitted),
+                        "submitted": reconcile_submitted,
+                        "decisions": decisions + [decision],
+                        "in_flight_round": round_index,
+                        "in_flight_top_up_index": top_up_index,
+                        "in_flight_job_name": job_name,
+                    }
+                    persist_reconcile_phase(
+                        in_flight_phase,
+                        report_status="worker_reconcile_job_in_flight",
+                        next_actions=["A reconciliation top-up submit_job call may have reached Batch; if this controller stops here, review Batch jobs before retrying."],
+                    )
+                    top_up_kwargs: dict[str, Any] = {
+                        "jobName": job_name,
+                        "jobQueue": target.batch_job_queue,
+                        "jobDefinition": target.job_definition,
+                        "containerOverrides": overrides,
+                    }
+                    if args.retry_attempts is not None:
+                        top_up_kwargs["retryStrategy"] = {"attempts": args.retry_attempts}
+                    try:
+                        resp = batch.submit_job(**top_up_kwargs)
+                    except Exception as exc:
+                        review_phase = {**in_flight_phase, "status": "needs_review", "submit_error": str(exc)}
+                        persist_reconcile_phase(
+                            review_phase, report_status="worker_reconcile_needs_review", next_actions=["A reconciliation top-up submit_job call failed or is ambiguous; review Batch jobs before retrying."]
+                        )
+                        raise
+                    reconcile_submitted.append({"jobName": job_name, "jobId": resp.get("jobId"), "jobArn": resp.get("jobArn"), "round": round_index, "reason": "reconcile_top_up"})
+                    decision["submitted_top_up_workers"] = int(decision.get("submitted_top_up_workers", 0) or 0) + 1
+                    partial_phase = {
+                        "name": "reconcile_workers",
+                        "status": "in_progress",
+                        "submission_stamp": reconcile_stamp,
+                        "rounds_completed": round_index + 1,
+                        "target_workers": plan_worker_count,
+                        "submitted_count": len(reconcile_submitted),
+                        "submitted": reconcile_submitted,
+                        "decisions": decisions + [decision],
+                    }
+                    persist_reconcile_phase(
+                        partial_phase,
+                        report_status="worker_reconcile_in_progress",
+                        next_actions=["A reconciliation top-up worker was submitted and durably recorded; rerun the same command to continue with the next reconciliation round if this controller stops."],
+                    )
+                decision["submitted_top_up_workers"] = top_up
             decisions.append(decision)
             reconcile_phase = {
                 "name": "reconcile_workers",
                 "status": "in_progress" if round_index + 1 < rounds else "completed",
+                "submission_stamp": reconcile_stamp,
                 "rounds_completed": round_index + 1,
                 "target_workers": plan_worker_count,
                 "submitted_count": len(reconcile_submitted),
                 "submitted": reconcile_submitted,
                 "decisions": decisions,
             }
-            persist_submit_phase(
-                {**submit_phase, "reconciliation": reconcile_phase},
+            persist_reconcile_phase(
+                reconcile_phase,
                 report_status="worker_reconcile_in_progress" if reconcile_phase["status"] == "in_progress" else "worker_reconcile_complete",
-                next_actions=["Worker reconciliation observed queue depth/active Batch jobs; automatic top-ups remain fail-closed until top-up submits are durably persisted before mutation."],
+                next_actions=["Worker reconciliation observed queue depth/active Batch jobs and submitted bounded top-ups when active capacity was below the Plan target."],
             )
             if round_index + 1 < rounds and float(getattr(args, "reconcile_interval_seconds", 0.0)) > 0:
                 time.sleep(float(args.reconcile_interval_seconds))
@@ -4013,7 +4108,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kickoff-only", action="store_true", help="Advanced/debug mode: stop after the initial Plan-sized worker wave and skip reconciliation")
     p.add_argument("--reconcile-rounds", type=int, default=1, help="Bounded controller observation rounds after initial submission (default: 1)")
     p.add_argument("--reconcile-interval-seconds", type=float, default=0.0, help="Sleep between reconciliation rounds")
-    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit Plan-sized workers, observe bounded reconciliation, and persist run_state.json")
+    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit Plan-sized workers, reconcile bounded dedicated-queue top-ups, and persist run_state.json")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)

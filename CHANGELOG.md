@@ -50,7 +50,7 @@ All notable changes to this project are documented here. This project uses human
 - Run-centric `sweetspot status RUN_ID` summaries for local run/finalizer/repair artifacts, with Batch worker filtering scoped to the run by default.
 - Thin `sweetspot-run` agent skill for the simplified `plan`/`run`/`status`/`repair`/`cancel` workflow, with lower-level phase commands documented as advanced/operator controls.
 - Deployment registry preflight for Plan-authoritative `run --apply`, including digest-pinned image validation and remote manifest identity binding before mutation.
-- Bounded production worker reconciliation observation rounds after initial Plan-sized submission, with shared-queue-safe backlog accounting and fail-closed top-up decisions until top-up mutations have the same in-flight persistence as initial submits.
+- Bounded production worker reconciliation rounds after initial Plan-sized submission, with shared-queue-safe backlog accounting and durable pre-submit persistence for any dedicated-queue top-up workers.
 - Canary apply fail-closed guard: canary Plans still materialize reviewed `canary_tasks.jsonl`, but automatic canary mutation is blocked until per-candidate queue routing is safe.
 - Shared Scout/Planner expected-cost model plus a Tiny Leela Stockfish 18 case study documenting the production lessons behind the controller workflow.
 
