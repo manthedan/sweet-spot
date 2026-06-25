@@ -1,6 +1,6 @@
 ---
 name: sweetspot-scout
-description: Advanced/admin read-only Spot cost/capacity investigation: rank AWS Spot pools by expected total cost, use telemetry for pool choice, and allocate workers across lanes. For new runs, prefer sweetspot-run.
+description: 'Advanced/admin read-only Spot cost/capacity investigation: rank AWS Spot pools by expected total cost, use telemetry for pool choice, and allocate workers across lanes. For new runs, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-scout

@@ -1,6 +1,6 @@
 ---
 name: sweetspot-workers
-description: Advanced/admin workflow for manual SweetSpot AWS Batch worker sizing, submission, supervision, active-worker checks, and log inspection. For new runs, prefer sweetspot-run.
+description: 'Advanced/admin workflow for manual SweetSpot AWS Batch worker sizing, submission, supervision, active-worker checks, and log inspection. For new runs, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-workers

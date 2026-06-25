@@ -1,6 +1,6 @@
 ---
 name: sweetspot-enqueue
-description: Advanced/admin workflow for manually creating, validating, canarying, estimating, and enqueueing SweetSpot task JSONL workloads to SQS. For new runs, prefer sweetspot-run.
+description: 'Advanced/admin workflow for manually creating, validating, canarying, estimating, and enqueueing SweetSpot task JSONL workloads to SQS. For new runs, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-enqueue

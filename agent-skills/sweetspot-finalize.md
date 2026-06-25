@@ -1,6 +1,6 @@
 ---
 name: sweetspot-finalize
-description: Advanced/admin workflow for manual finalization, done-marker verification, repair planning, READY publishing, stale SQS cleanup, and guarded S3 prefix inspection/deletion. For new runs, prefer sweetspot-run.
+description: 'Advanced/admin workflow for manual finalization, done-marker verification, repair planning, READY publishing, stale SQS cleanup, and guarded S3 prefix inspection/deletion. For new runs, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-finalize

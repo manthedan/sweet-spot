@@ -1,6 +1,6 @@
 ---
 name: sweetspot-ops
-description: Advanced/admin diagnostics for SweetSpot AWS/SQS/S3/Batch/CloudWatch operations, status/jobs/logs/DLQs, safe redrive, and stalled-run troubleshooting. For normal visibility, prefer sweetspot-run.
+description: 'Advanced/admin diagnostics for SweetSpot AWS/SQS/S3/Batch/CloudWatch operations, status/jobs/logs/DLQs, safe redrive, and stalled-run troubleshooting. For normal visibility, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-ops

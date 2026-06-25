@@ -1,6 +1,6 @@
 ---
 name: sweetspot-reference
-description: Advanced/admin master SweetSpot CLI reference. Use for lower-level commands, task schemas, worker environments, output schemas, or safety rules; for new runs, prefer sweetspot-run.
+description: 'Advanced/admin master SweetSpot CLI reference. Use for lower-level commands, task schemas, worker environments, output schemas, or safety rules; for new runs, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-reference

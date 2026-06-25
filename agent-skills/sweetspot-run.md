@@ -1,6 +1,6 @@
 ---
 name: sweetspot-run
-description: Use the simplified SweetSpot planner/controller workflow: JobSpec, plan, run, status, repair, and cancel. Prefer this over lower-level phase commands for new runs.
+description: 'Use the simplified SweetSpot planner/controller workflow: JobSpec, plan, run, status, repair, and cancel. Prefer this over lower-level phase commands for new runs.'
 ---
 
 # Skill: sweetspot-run
