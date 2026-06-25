@@ -15,3 +15,4 @@ artifacts/
 .terraform.lock.hcl
 !infra/opentofu/.terraform.lock.hcl
 *.tfplan
+docs/expert_review_analysis.md
