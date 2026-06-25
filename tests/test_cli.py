@@ -1077,6 +1077,75 @@ class RunCommandTests(unittest.TestCase):
             self.assertEqual(resumed_reconcile["status"], "completed")
             self.assertEqual(len(batch.submitted), 2)
 
+    def test_run_apply_can_finalize_production_tasks(self) -> None:
+        sqs = FakeQueueDepthSQS()
+        batch = FakeSubmitBatch()
+        s3 = object()
+
+        def fake_client(service):
+            if service == "sqs":
+                return sqs
+            if service == "batch":
+                return batch
+            if service == "s3":
+                return s3
+            raise AssertionError(service)
+
+        def done_record(_s3, task, _existence_index, *, allow_legacy_done_markers=False):
+            return {
+                "task_id": task["task_id"],
+                "output_s3": task["output_s3"],
+                "logical_output_s3": task["output_s3"],
+                "summary_s3": task.get("summary_s3", ""),
+                "done_s3": task["done_s3"],
+                "done_exists": True,
+                "marker_valid": True,
+                "output_exists": True,
+                "summary_exists": False,
+                "state": "done",
+                "marker_validation_error": None,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            argv = [
+                "run",
+                "examples/job.x86.example.json",
+                "--canary-summary-jsonl",
+                str(summaries),
+                "--input-manifest-jsonl",
+                str(manifest),
+                "--artifact-dir",
+                str(artifact_dir),
+                "--queue-url",
+                "https://sqs.example/q",
+                "--batch-job-queue",
+                "jq",
+                "--job-definition",
+                "jd",
+                "--finalize",
+                "--apply",
+            ]
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.client", side_effect=fake_client), patch("sweetspot.cli._check_task", side_effect=done_record), contextlib.redirect_stdout(out):
+                self.assertEqual(main(argv), 0)
+            report = json.loads(out.getvalue())
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            self.assertEqual(report["status"], "finalized_complete")
+            self.assertEqual(phases["reconcile_workers"]["status"], "completed")
+            self.assertEqual(phases["finalize"]["status"], "completed")
+            self.assertEqual(phases["finalize"]["done_count"], 3)
+            self.assertEqual(report["artifacts"]["final_manifest"], str(artifact_dir / "finalizer" / "final_manifest.json"))
+            self.assertTrue((artifact_dir / "finalizer" / "task_status.jsonl").exists())
+            state = json.loads((artifact_dir / "run_state.json").read_text())
+            state_phases = {phase["name"]: phase for phase in state["phases"]}
+            self.assertEqual(state_phases["finalize"]["status"], "completed")
+
     def test_run_apply_refuses_ambiguous_reconcile_top_up_resume(self) -> None:
         class EmptyPaginator:
             def paginate(self, **kwargs):

@@ -92,7 +92,7 @@ sweetspot run job.json \
   --apply
 ```
 
-Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation. Reconciliation is bounded; pass `--dedicated-run-queue` only for a fresh queue dedicated to this run, where SQS depth is a valid run-specific backlog signal. Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only.
+Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation. Reconciliation is bounded; pass `--dedicated-run-queue` only for a fresh queue dedicated to this run, where SQS depth is a valid run-specific backlog signal. Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. After workers have had time to finish, rerun the same production apply command with `--finalize` to stream done-marker validation into `artifacts/RUN_ID/finalizer/` and update the `finalize` phase in `run_state.json`; uploading manifests/READY remains explicit with `--finalize-upload` and `--finalize-publish-ready`.
 
 ## Status, repair, and cancel
 

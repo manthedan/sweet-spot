@@ -51,6 +51,7 @@ All notable changes to this project are documented here. This project uses human
 - Thin `sweetspot-run` agent skill for the simplified `plan`/`run`/`status`/`repair`/`cancel` workflow, with lower-level phase commands documented as advanced/operator controls.
 - Deployment registry preflight for Plan-authoritative `run --apply`, including digest-pinned image validation and remote manifest identity binding before mutation.
 - Bounded production worker reconciliation rounds after initial Plan-sized submission, with shared-queue-safe backlog accounting and durable pre-submit persistence for any dedicated-queue top-up workers.
+- Integrated production finalization for `sweetspot run --apply --finalize`, which streams done-marker validation over persisted production tasks, writes finalizer artifacts, and records complete/incomplete finalizer state in `run_state.json`.
 - Safe controller-owned canary apply: canary Plans can enqueue/submit workers only through deployment-registry `canary_routes` that isolate every resource candidate on its own SQS queue/job definition; missing routes fail closed.
 - Shared Scout/Planner expected-cost model plus a Tiny Leela Stockfish 18 case study documenting the production lessons behind the controller workflow.
 

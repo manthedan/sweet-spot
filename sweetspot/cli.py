@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.metadata as importlib_metadata
+import io
 import json
 import math
 import os
@@ -766,6 +768,56 @@ def _canary_runtime_settings(plan: dict[str, Any], task: dict[str, Any]) -> dict
     }
 
 
+def _replace_or_append_phase(phases: list[dict[str, Any]], phase: dict[str, Any]) -> list[dict[str, Any]]:
+    name = phase.get("name")
+    replaced = False
+    out: list[dict[str, Any]] = []
+    for existing in phases:
+        if name and existing.get("name") == name:
+            out.append(phase)
+            replaced = True
+        else:
+            out.append(existing)
+    if not replaced:
+        out.append(phase)
+    return out
+
+
+def _run_integrated_finalizer(args: argparse.Namespace, *, spec: dict[str, Any], tasks_path: Path, artifact_dir: Path) -> tuple[int, dict[str, Any]]:
+    finalizer_args = argparse.Namespace(
+        allow_incomplete_ready=bool(getattr(args, "finalize_allow_incomplete_ready", False)),
+        allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+        artifact_dir=artifact_dir,
+        dry_run=bool(getattr(args, "finalize_dry_run", False)),
+        max_inline_outputs=int(getattr(args, "finalize_max_inline_outputs", FINALIZER_DEFAULT_MAX_INLINE_OUTPUTS)),
+        output_prefix=str(spec["output_prefix"]),
+        preload_s3_prefix=list(getattr(args, "finalize_preload_s3_prefix", None) or []),
+        profile=getattr(args, "profile", None),
+        progress_interval=int(getattr(args, "finalize_progress_interval", 0)),
+        publish_ready=bool(getattr(args, "finalize_publish_ready", False)),
+        ready_key=str(getattr(args, "finalize_ready_key", "READY")),
+        region=getattr(args, "region", None),
+        require_complete=False,
+        run_id=str(spec["run_id"]),
+        tasks_jsonl=tasks_path,
+        tasks_s3=None,
+        upload=bool(getattr(args, "finalize_upload", False)),
+        use_listing_index=bool(getattr(args, "finalize_use_listing_index", False)),
+        workers=int(getattr(args, "finalize_workers", 32)),
+        write_repair_jsonl=None,
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = cmd_finalize(finalizer_args)
+    try:
+        report = json.loads(out.getvalue())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"integrated finalizer did not emit JSON: {out.getvalue()!r}") from exc
+    if not isinstance(report, dict):
+        raise RuntimeError("integrated finalizer did not emit a JSON object")
+    return rc, report
+
+
 def _cmd_run_canary_apply(
     args: argparse.Namespace,
     *,
@@ -774,6 +826,8 @@ def _cmd_run_canary_apply(
     logical_unit_count: int | None,
     job_spec_sha256: str,
 ) -> dict[str, Any]:
+    if getattr(args, "finalize", False):
+        raise SystemExit("sweetspot run --finalize is only valid for production Plans; canary Plans must collect summaries first")
     if args.artifact_dir is None:
         raise SystemExit("sweetspot run --apply for canary Plans requires --artifact-dir so run_state.json can make retries/resume safe")
     if not getattr(args, "deployment", None):
@@ -1694,10 +1748,101 @@ def _cmd_run_apply(
         controller=controller_base,
         next_actions=[
             f"Use `sweetspot status {run_id} --artifact-dir {args.artifact_dir}` to watch local/run-scoped state.",
-            "After workers finish, run `sweetspot finalize` or `sweetspot repair` with the persisted production_tasks.jsonl if repair is needed.",
+            "After workers finish, rerun this command with --finalize or run `sweetspot repair` with the persisted production_tasks.jsonl if repair is needed.",
         ],
     )
     _write_run_state(state_path, report)
+
+    if getattr(args, "finalize", False):
+        finalizer_dir = args.artifact_dir / "finalizer"
+        finalize_phase: dict[str, Any] = {
+            "name": "finalize",
+            "status": "in_progress",
+            "artifact_dir": str(finalizer_dir),
+            "tasks_jsonl": str(tasks_path),
+            "upload": bool(getattr(args, "finalize_upload", False)),
+            "publish_ready": bool(getattr(args, "finalize_publish_ready", False)),
+            "dry_run": bool(getattr(args, "finalize_dry_run", False)),
+        }
+        phases = _replace_or_append_phase(phases, finalize_phase)
+        _write_run_state(
+            state_path,
+            _build_run_report(
+                spec=spec,
+                plan=plan,
+                mode="apply",
+                applied=True,
+                status="finalize_in_progress",
+                artifacts=artifacts,
+                phases=phases,
+                job_spec_sha256=job_spec_sha256,
+                controller=controller_base,
+                next_actions=["Integrated finalization is scanning done markers and writing finalizer artifacts."],
+            ),
+        )
+        try:
+            finalize_rc, finalize_report = _run_integrated_finalizer(args, spec=spec, tasks_path=tasks_path, artifact_dir=finalizer_dir)
+        except Exception as exc:  # noqa: BLE001 - persist finalizer failure before surfacing it.
+            failed_phase = {**finalize_phase, "status": "failed", "error": str(exc)}
+            _write_run_state(
+                state_path,
+                _build_run_report(
+                    spec=spec,
+                    plan=plan,
+                    mode="apply",
+                    applied=True,
+                    status="finalize_failed",
+                    artifacts=artifacts,
+                    phases=_replace_or_append_phase(phases, failed_phase),
+                    job_spec_sha256=job_spec_sha256,
+                    controller=controller_base,
+                    next_actions=["Finalization failed; inspect the persisted finalizer artifacts/logs before retrying."],
+                ),
+            )
+            raise
+        complete = bool(finalize_report.get("complete"))
+        finalize_phase = {
+            **finalize_phase,
+            "status": "completed" if complete else "incomplete",
+            "return_code": finalize_rc,
+            "complete": complete,
+            "task_count": finalize_report.get("task_count"),
+            "done_count": finalize_report.get("done_count"),
+            "missing_count": finalize_report.get("missing_count"),
+            "repair_task_count": finalize_report.get("missing_count"),
+            "final_manifest": finalize_report.get("final_manifest"),
+            "task_status": finalize_report.get("task_status"),
+            "repair_tasks": finalize_report.get("repair_tasks"),
+            "outputs_manifest": finalize_report.get("outputs_manifest"),
+            "final_manifest_s3": finalize_report.get("final_manifest_s3"),
+            "ready_s3": finalize_report.get("ready_s3"),
+        }
+        artifacts.update(
+            {
+                "final_manifest": finalize_report.get("final_manifest"),
+                "task_status_jsonl": finalize_report.get("task_status"),
+                "repair_tasks_jsonl": finalize_report.get("repair_tasks"),
+                "outputs_manifest": finalize_report.get("outputs_manifest"),
+            }
+        )
+        phases = _replace_or_append_phase(phases, finalize_phase)
+        report = _build_run_report(
+            spec=spec,
+            plan=plan,
+            mode="apply",
+            applied=True,
+            status="finalized_complete" if complete else "finalized_incomplete",
+            artifacts=artifacts,
+            phases=phases,
+            job_spec_sha256=job_spec_sha256,
+            controller=controller_base,
+            next_actions=[
+                f"Run is complete; READY is {finalize_phase.get('ready_s3') or 'not published by integrated finalization'}."
+                if complete
+                else f"Run is incomplete; review {finalize_phase.get('repair_tasks')} and run `sweetspot repair {run_id}` when ready."
+            ],
+        )
+        _write_run_state(state_path, report)
     return report
 
 
@@ -1713,6 +1858,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.apply:
             report = _cmd_run_apply(args, spec=spec, plan=plan, logical_unit_count=logical_unit_count, job_spec_sha256=job_spec_sha256)
         else:
+            if getattr(args, "finalize", False):
+                raise SystemExit("sweetspot run --finalize requires --apply and a production Plan")
             if args.artifact_dir:
                 state_path = args.artifact_dir / "run_state.json"
                 previous_state = _load_run_state(state_path, run_id=str(spec["run_id"]), job_spec_sha256=job_spec_sha256)
@@ -4207,6 +4354,10 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "reconcile_interval_seconds",
         "reconcile_rounds",
         "region",
+        "finalize",
+        "finalize_dry_run",
+        "finalize_publish_ready",
+        "finalize_upload",
         "retry_attempts",
         "sqs_queue_url",
         "subtract_active",
@@ -4283,6 +4434,10 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "dry_run": ("--dry-run", False),
     "failed_status": ("--failed-status", True),
     "format": ("--format", False),
+    "finalize": ("--finalize", False),
+    "finalize_dry_run": ("--finalize-dry-run", False),
+    "finalize_publish_ready": ("--finalize-publish-ready", False),
+    "finalize_upload": ("--finalize-upload", False),
     "heartbeat_seconds": ("--heartbeat-seconds", False),
     "include_active": ("--include-active", False),
     "include_not_visible": ("--include-not-visible", False),
@@ -4497,7 +4652,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--kickoff-only", action="store_true", help="Advanced/debug mode: stop after the initial Plan-sized worker wave and skip reconciliation")
     p.add_argument("--reconcile-rounds", type=int, default=1, help="Bounded controller observation rounds after initial submission (default: 1)")
     p.add_argument("--reconcile-interval-seconds", type=float, default=0.0, help="Sleep between reconciliation rounds")
-    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit Plan-sized workers, reconcile bounded dedicated-queue top-ups, and persist run_state.json")
+    p.add_argument("--finalize", action="store_true", help="After production worker reconciliation, run the finalizer with persisted production_tasks.jsonl and record finalizer artifacts in run_state.json")
+    p.add_argument("--finalize-upload", action="store_true", help="With --finalize, upload finalizer manifests to output_prefix/manifests")
+    p.add_argument("--finalize-dry-run", action="store_true", help="With --finalize, scan/write local finalizer artifacts but skip S3 uploads and READY mutations")
+    p.add_argument("--finalize-publish-ready", action="store_true", help="With --finalize-upload, publish READY if the finalizer is complete")
+    p.add_argument("--apply", action="store_true", help="Materialize tasks, enqueue once, submit Plan-sized workers, reconcile bounded dedicated-queue top-ups, optionally finalize, and persist run_state.json")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("scout", help="Rank AWS Spot regions/instance pools; forwards args to sweetspot-scout", add_help=False)
