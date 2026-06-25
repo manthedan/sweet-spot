@@ -59,7 +59,7 @@ All notable changes to this project are documented here. This project uses human
 ### Changed
 
 - README and bundled agent skills now demote lower-level enqueue/worker/finalize/scout/reference workflows as advanced/admin surfaces and point new runs to `sweetspot-run`.
-- Controller run-state and enqueue helpers moved into `sweetspot.run_state` and `sweetspot.enqueue_service` so CLI orchestration can continue thinning into services without changing JSON contracts.
+- Controller run-state, enqueue, and Batch worker helper logic moved into `sweetspot.run_state`, `sweetspot.enqueue_service`, and `sweetspot.batch_service` so CLI orchestration can continue thinning into services without changing JSON contracts.
 - `sweetspot scout` now emits JSON to stdout by default; human table output is opt-in with `--format table`.
 
 ### Fixed
