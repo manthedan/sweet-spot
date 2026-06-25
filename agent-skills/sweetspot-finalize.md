@@ -1,11 +1,11 @@
 ---
 name: sweetspot-finalize
-description: Finalize SweetSpot runs, verify done markers, plan repairs, publish READY markers, clean stale SQS messages, and safely inspect/delete old S3 prefixes.
+description: Advanced/admin workflow for manual finalization, done-marker verification, repair planning, READY publishing, stale SQS cleanup, and guarded S3 prefix inspection/deletion. For new runs, prefer sweetspot-run.
 ---
 
 # Skill: sweetspot-finalize
 
-Guide for finalizing SweetSpot runs, planning repairs, and cleaning up stale resources.
+Advanced/admin guide for finalizing SweetSpot runs, planning repairs, and cleaning up stale resources.
 
 ## When to use
 

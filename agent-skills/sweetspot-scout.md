@@ -1,11 +1,11 @@
 ---
 name: sweetspot-scout
-description: Rank AWS Spot pools by expected total cost, use telemetry for pool choice, and allocate SweetSpot workers across multi-region lanes with the lane manager.
+description: Advanced/admin read-only Spot cost/capacity investigation: rank AWS Spot pools by expected total cost, use telemetry for pool choice, and allocate workers across lanes. For new runs, prefer sweetspot-run.
 ---
 
 # Skill: sweetspot-scout
 
-Guide for Spot pool ranking, cost estimation, and multi-lane worker allocation.
+Advanced/admin guide for Spot pool ranking, cost estimation, and multi-lane worker allocation.
 
 ## When to use
 

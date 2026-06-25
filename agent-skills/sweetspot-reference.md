@@ -1,6 +1,6 @@
 ---
 name: sweetspot-reference
-description: Master SweetSpot CLI reference. Use when an agent needs to understand, reference, or execute any SweetSpot command, task schema, worker environment, output schema, or safety rule.
+description: Advanced/admin master SweetSpot CLI reference. Use for lower-level commands, task schemas, worker environments, output schemas, or safety rules; for new runs, prefer sweetspot-run.
 ---
 
 # Skill: sweetspot-reference

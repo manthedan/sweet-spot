@@ -1,11 +1,11 @@
 ---
 name: sweetspot-workers
-description: Size, submit, supervise, and monitor SweetSpot AWS Batch workers for SQS-backed workloads, including dry-run sizing, active-worker checks, and log inspection.
+description: Advanced/admin workflow for manual SweetSpot AWS Batch worker sizing, submission, supervision, active-worker checks, and log inspection. For new runs, prefer sweetspot-run.
 ---
 
 # Skill: sweetspot-workers
 
-Guide for submitting, supervising, and monitoring SweetSpot Batch workers.
+Advanced/admin guide for submitting, supervising, and monitoring SweetSpot Batch workers.
 
 ## When to use
 

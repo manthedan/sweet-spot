@@ -1,11 +1,11 @@
 ---
 name: sweetspot-enqueue
-description: Create, validate, canary, estimate, and enqueue SweetSpot task JSONL workloads to SQS. Use before submitting tasks or preparing large SweetSpot runs.
+description: Advanced/admin workflow for manually creating, validating, canarying, estimating, and enqueueing SweetSpot task JSONL workloads to SQS. For new runs, prefer sweetspot-run.
 ---
 
 # Skill: sweetspot-enqueue
 
-Guide for creating, validating, and enqueuing SweetSpot tasks to SQS.
+Advanced/admin guide for creating, validating, and enqueuing SweetSpot tasks to SQS.
 
 ## When to use
 

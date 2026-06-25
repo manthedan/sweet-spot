@@ -56,6 +56,7 @@ All notable changes to this project are documented here. This project uses human
 
 ### Changed
 
+- README and bundled agent skills now demote lower-level enqueue/worker/finalize/scout/reference workflows as advanced/admin surfaces and point new runs to `sweetspot-run`.
 - `sweetspot scout` now emits JSON to stdout by default; human table output is opt-in with `--format table`.
 
 ### Fixed
