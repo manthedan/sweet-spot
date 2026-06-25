@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Any, Iterator
 
-from .adaptive import choose_next_shard_units, logical_shard_plan
+from .adaptive import DEFAULT_RESOURCE_LATTICE, canary_observation_from_summary, choose_next_shard_units, choose_resource_candidate, logical_shard_plan
 from .s3util import parse_s3_uri, s3_join
 from .task_model import SAFE_ID_RE, TASK_SCHEMA_V1
 
@@ -38,6 +38,7 @@ PLAN_REASON_CODES: dict[str, str] = {
     "insufficient_telemetry": "Planner telemetry is missing or too sparse for a measured decision.",
     "memory_shape_rejected_oom": "A candidate resource shape was rejected after an out-of-memory signal or validation failure.",
     "placement_score_low": "Capacity placement evidence is below the configured safety threshold.",
+    "resource_shape_selected": "Architecture and resource shape were selected from successful canary telemetry.",
     "using_conservative_defaults": "The plan uses conservative defaults instead of measured workload-specific values.",
 }
 
@@ -98,7 +99,15 @@ def plan_with_adaptive_canaries(
     """
 
     plan = _base_blocked_plan(job_spec)
-    shard_decision = choose_next_shard_units(canary_observations, target_task_seconds=target_task_seconds)
+    constraints = validate_job_spec(job_spec)["constraints"]
+    scoped_observations = _observations_in_allowed_regions(canary_observations, constraints)
+    resource_selection = choose_resource_candidate(scoped_observations, allowed_architectures=constraints.get("architectures", ["x86_64"]))
+    shard_observations = _observations_for_selected_resource(scoped_observations, resource_selection)
+    shard_decision = choose_next_shard_units(shard_observations, target_task_seconds=target_task_seconds)
+    if resource_selection.get("status") == "needs_canary" and shard_decision.get("status") == "ready" and shard_decision.get("next_action") == "produce_production":
+        shard_decision = dict(shard_decision)
+        shard_decision["calibrated"] = False
+        shard_decision["next_action"] = "run_canary"
     if shard_decision["status"] == "blocked":
         decision_reasons = shard_decision.get("reasons") if isinstance(shard_decision.get("reasons"), list) else []
         raw_decision_code = decision_reasons[0].get("code") if decision_reasons and isinstance(decision_reasons[0], dict) else "memory_shape_rejected_oom"
@@ -111,6 +120,16 @@ def plan_with_adaptive_canaries(
                 "message": PLAN_REASON_CODES[plan_code],
             }
         ]
+    elif shard_decision.get("next_action") == "run_canary":
+        plan["reasons"] = [
+            {
+                "code": "insufficient_telemetry",
+                "severity": "warning",
+                "message": "Adaptive shard telemetry is not calibrated yet; run the next controller-owned canaries before production sizing.",
+            }
+        ]
+    elif resource_selection.get("status") == "ready" and logical_unit_count is not None:
+        _populate_ready_plan_from_selection(plan, constraints, resource_selection, shard_decision, logical_unit_count)
     else:
         plan["reasons"] = [
             {
@@ -122,13 +141,138 @@ def plan_with_adaptive_canaries(
     canary_entry: dict[str, Any] = {
         "purpose": "adaptive_shard_sizing",
         "decision": shard_decision,
+        "resource_selection": resource_selection,
     }
     selected_units = shard_decision.get("selected_units_per_task")
-    observations_used = shard_decision.get("observations_used")
-    if logical_unit_count is not None and isinstance(selected_units, int) and isinstance(observations_used, int) and observations_used > 0:
+    if logical_unit_count is not None and isinstance(selected_units, int) and shard_decision.get("next_action") == "produce_production" and resource_selection.get("status") == "ready":
         canary_entry["production_shards"] = logical_shard_plan(logical_unit_count, selected_units, max_inline_ranges=0)
     plan["canaries"] = [canary_entry]
     return validate_plan(plan)
+
+
+def _observations_in_allowed_regions(observations: list[dict[str, Any]], constraints: dict[str, Any]) -> list[dict[str, Any]]:
+    allowed_regions = constraints.get("regions")
+    if not isinstance(allowed_regions, list) or not allowed_regions:
+        return observations
+    allowed = {str(region) for region in allowed_regions}
+    raw_summary_keys = {"telemetry", "elapsed_sec", "returncode", "timed_out", "framework_error", "stderr_tail", "commit_status"}
+    out: list[dict[str, Any]] = []
+    for obs in observations:
+        normalized = canary_observation_from_summary(obs) if raw_summary_keys.intersection(obs) else dict(obs)
+        if normalized.get("region") in allowed:
+            out.append(obs)
+    return out
+
+
+def _observations_for_selected_resource(observations: list[dict[str, Any]], resource_selection: dict[str, Any]) -> list[dict[str, Any]]:
+    if resource_selection.get("status") != "ready" or not isinstance(resource_selection.get("selected"), dict):
+        return observations
+    selected = resource_selection["selected"]
+    out: list[dict[str, Any]] = []
+    raw_summary_keys = {"telemetry", "elapsed_sec", "returncode", "timed_out", "framework_error", "stderr_tail", "commit_status"}
+    for obs in observations:
+        normalized = canary_observation_from_summary(obs) if raw_summary_keys.intersection(obs) else dict(obs)
+        if (
+            normalized.get("architecture") == selected.get("architecture")
+            and normalized.get("region") == selected.get("region")
+            and float(normalized.get("worker_vcpus") or 0) == float(selected.get("vcpus") or -1)
+            and float(normalized.get("worker_memory_mib") or 0) == float(selected.get("memory_mib") or -1)
+        ):
+            out.append(obs)
+    return out or observations
+
+
+def _populate_ready_plan_from_selection(
+    plan: dict[str, Any],
+    constraints: dict[str, Any],
+    resource_selection: dict[str, Any],
+    shard_decision: dict[str, Any],
+    logical_unit_count: int,
+) -> None:
+    selected = resource_selection.get("selected")
+    if not isinstance(selected, dict):
+        return
+    region = selected.get("region")
+    if not isinstance(region, str) or not region:
+        if shard_decision.get("status") == "ready" and shard_decision.get("next_action") == "produce_production":
+            shard_decision["calibrated"] = False
+            shard_decision["next_action"] = "run_canary"
+        plan["reasons"] = [
+            {
+                "code": "insufficient_telemetry",
+                "severity": "warning",
+                "message": "Resource canaries selected a shape, but worker summaries did not include a region for a ready Plan.",
+            }
+        ]
+        return
+    rate = float(selected["median_units_per_second"])
+    vcpus = float(selected["vcpus"])
+    memory_mib = float(selected["memory_mib"])
+    target_task_seconds = float(shard_decision["target_task_seconds"])
+    selected_units = _positive_int(shard_decision.get("selected_units_per_task"), "selected_units_per_task")
+    production_task_count = math.ceil(logical_unit_count / selected_units) if logical_unit_count > 0 else 0
+    completion_fraction = float(constraints.get("completion_fraction", 1.0))
+    target_units = max(0.0, float(logical_unit_count) * completion_fraction)
+    single_worker_seconds = target_units / rate if target_units > 0 else 0.0
+    deadline_seconds = float(constraints["deadline_hours"]) * 3600 if "deadline_hours" in constraints else None
+    deadline_workers = 1 if deadline_seconds is None or single_worker_seconds == 0 else max(1, math.ceil(single_worker_seconds / deadline_seconds))
+    usable_parallelism = max(1, min(deadline_workers, production_task_count)) if production_task_count else 1
+    expected_wall_seconds = max(1.0, single_worker_seconds / usable_parallelism) if single_worker_seconds else 1.0
+    if deadline_seconds is not None and production_task_count and expected_wall_seconds > deadline_seconds:
+        plan["reasons"] = [
+            {
+                "code": "deadline_unachievable",
+                "severity": "error",
+                "message": PLAN_REASON_CODES["deadline_unachievable"],
+            }
+        ]
+        return
+    # Conservative portable fallback for EC2 Batch Spot planning. Account-specific
+    # prices can refine this later, but a nonzero estimate keeps budget/deadline
+    # tradeoffs visible to agents.
+    assumed_vcpu_hour_usd = 0.05
+    expected_cost_usd = (single_worker_seconds * vcpus / 3600.0) * assumed_vcpu_hour_usd
+    if expected_cost_usd > float(constraints["max_cost_usd"]):
+        plan["reasons"] = [
+            {
+                "code": "budget_caps_parallelism",
+                "severity": "error",
+                "message": PLAN_REASON_CODES["budget_caps_parallelism"],
+            }
+        ]
+        return
+    plan["status"] = "ready"
+    plan["reasons"] = [
+        {
+            "code": "resource_shape_selected",
+            "severity": "info",
+            "message": PLAN_REASON_CODES["resource_shape_selected"],
+        },
+        {
+            "code": "using_conservative_defaults",
+            "severity": "info",
+            "message": "Expected cost uses a conservative default vCPU-hour price until account-specific price telemetry is wired into the planner.",
+        },
+    ]
+    plan["selected"] = {
+        "region": region,
+        "architecture": selected["architecture"],
+        "vcpus": vcpus,
+        "memory_mib": memory_mib,
+        "target_task_seconds": target_task_seconds,
+        "estimated_workers": usable_parallelism,
+    }
+    plan["estimates"] = {
+        "expected_cost_usd": expected_cost_usd,
+        "expected_wall_seconds": expected_wall_seconds,
+        "p50_units_per_second_per_worker": rate,
+        "production_task_count": production_task_count,
+        "vcpu_seconds_per_unit": selected["vcpu_seconds_per_unit"],
+        "cost_model": {
+            "assumed_vcpu_hour_usd": assumed_vcpu_hour_usd,
+            "source": "conservative_default",
+        },
+    }
 
 
 def iter_production_tasks_from_logical_unit_count(job_spec: dict[str, Any], total_units: int, units_per_task: int) -> Iterator[dict[str, Any]]:
@@ -164,18 +308,31 @@ def iter_canary_tasks_from_logical_unit_count(job_spec: dict[str, Any], total_un
         shard_indices = [0]
     else:
         shard_indices = sorted({round(i * (shard_count - 1) / (sample_count - 1)) for i in range(sample_count)})
-    for sample_index, shard_index in enumerate(shard_indices):
-        unit_start = shard_index * units
-        unit_count = min(units, total - unit_start)
-        yield _task_for_range(
-            spec,
-            job_type="canary",
-            task_id=f"canary-{sample_index:06d}",
-            base_prefix="canaries",
-            unit_start=unit_start,
-            unit_count=unit_count,
-            extra_input={"logical_shard_index": shard_index},
-        )
+    architectures = list(dict.fromkeys(spec["constraints"].get("architectures", ["x86_64"])))
+    for architecture in architectures:
+        for shape in DEFAULT_RESOURCE_LATTICE:
+            vcpus = int(shape["vcpus"])
+            memory_mib = int(shape["memory_mib"])
+            candidate_id = f"{architecture}-{vcpus}vcpu-{memory_mib}mib"
+            for sample_index, shard_index in enumerate(shard_indices):
+                unit_start = shard_index * units
+                unit_count = min(units, total - unit_start)
+                task_id = f"canary-{candidate_id}-{sample_index:06d}" if units == 1 else f"canary-{candidate_id}-u{units:010d}-{sample_index:06d}"
+                yield _task_for_range(
+                    spec,
+                    job_type="canary",
+                    task_id=task_id,
+                    base_prefix=f"canaries/{candidate_id}/u{units:010d}",
+                    unit_start=unit_start,
+                    unit_count=unit_count,
+                    extra_input={
+                        "logical_shard_index": shard_index,
+                        "canary_units_per_task": units,
+                        "candidate_architecture": architecture,
+                        "candidate_vcpus": vcpus,
+                        "candidate_memory_mib": memory_mib,
+                    },
+                )
 
 
 def production_tasks_from_logical_shard_plan(job_spec: dict[str, Any], shard_plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -265,6 +422,8 @@ def _base_blocked_plan(job_spec: dict[str, Any]) -> dict[str, Any]:
         plan["constraints"]["deadline_seconds"] = constraints["deadline_hours"] * 3600
     if constraints.get("low_urgency") is True:
         plan["constraints"]["low_urgency"] = True
+    if "regions" in constraints:
+        plan["constraints"]["regions"] = list(constraints["regions"])
     return plan
 
 
@@ -412,6 +571,13 @@ def _validate_constraints(value: Any) -> None:
     invalid = sorted({repr(arch) for arch in architectures if not isinstance(arch, str) or arch not in ARCHITECTURES})
     if invalid:
         raise PlannerSpecError(f"unsupported architecture(s): {', '.join(invalid)}")
+    regions = value.get("regions")
+    if regions is not None:
+        if not isinstance(regions, list) or not regions:
+            raise PlannerSpecError("constraints.regions must be a non-empty list when present")
+        invalid_regions = sorted({repr(region) for region in regions if not isinstance(region, str) or not region or any(ord(ch) < 32 for ch in region)})
+        if invalid_regions:
+            raise PlannerSpecError(f"unsupported region(s): {', '.join(invalid_regions)}")
 
 
 def _validate_validation(value: Any) -> None:

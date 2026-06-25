@@ -9,7 +9,9 @@ Guide for Spot pool ranking, cost estimation, and multi-lane worker allocation.
 
 ## When to use
 
-Invoke this skill when an agent needs to:
+Invoke this skill for advanced/operator workflows. For new manifest-based runs, prefer `sweetspot-run`; `sweetspot plan` consumes measured canary telemetry for architecture/resource selection, while scout remains a read-only capacity/cost investigation tool.
+
+Use this skill when an agent explicitly needs to:
 - Rank AWS Spot regions/instance pools by expected total cost
 - Use observed telemetry to inform pool selection
 - Allocate workers across multiple regions/lanes

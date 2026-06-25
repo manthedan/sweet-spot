@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sweetspot.adaptive import canary_observation_from_summary, choose_next_shard_units, logical_shard_plan
+from sweetspot.adaptive import canary_observation_from_summary, choose_next_shard_units, choose_resource_candidate, logical_shard_plan
 
 
 class AdaptiveShardTests(unittest.TestCase):
@@ -11,6 +11,8 @@ class AdaptiveShardTests(unittest.TestCase):
         self.assertEqual(decision["schema"], "sweetspot.adaptive_shard_decision.v1")
         self.assertEqual(decision["status"], "ready")
         self.assertEqual(decision["selected_units_per_task"], 5)
+        self.assertFalse(decision["calibrated"])
+        self.assertEqual(decision["next_action"], "run_canary")
         self.assertIn("canary_required", {reason["code"] for reason in decision["reasons"]})
 
     def test_choose_next_shard_units_targets_duration_from_median_rate(self) -> None:
@@ -28,6 +30,8 @@ class AdaptiveShardTests(unittest.TestCase):
         self.assertEqual(decision["observations_used"], 3)
         self.assertEqual(decision["median_units_per_second"], 10.0)
         self.assertEqual(decision["selected_units_per_task"], 300)
+        self.assertTrue(decision["calibrated"])
+        self.assertEqual(decision["next_action"], "produce_production")
         self.assertIn("target_duration_selected", {reason["code"] for reason in decision["reasons"]})
 
     def test_choose_next_shard_units_caps_geometric_growth(self) -> None:
@@ -38,6 +42,8 @@ class AdaptiveShardTests(unittest.TestCase):
             growth_factor=4,
         )
         self.assertEqual(decision["selected_units_per_task"], 40)
+        self.assertFalse(decision["calibrated"])
+        self.assertEqual(decision["next_action"], "run_canary")
         self.assertIn("geometric_growth_cap", {reason["code"] for reason in decision["reasons"]})
 
     def test_choose_next_shard_units_normalizes_summary_without_telemetry(self) -> None:
@@ -178,6 +184,90 @@ class AdaptiveShardTests(unittest.TestCase):
         )
         self.assertFalse(observation["success"])
         self.assertFalse(observation["validation_failed"])
+
+    def test_canary_observation_includes_resource_telemetry(self) -> None:
+        observation = canary_observation_from_summary(
+            {
+                "task_id": "canary-x86",
+                "returncode": 0,
+                "telemetry": {"completed_units": 50, "useful_compute_seconds": 5, "architecture": "amd64", "worker_vcpus": 2, "worker_memory_mib": 4096, "peak_memory_mib": 1024},
+            }
+        )
+        self.assertEqual(observation["architecture"], "x86_64")
+        self.assertEqual(observation["worker_vcpus"], 2.0)
+        self.assertEqual(observation["worker_memory_mib"], 4096.0)
+        self.assertEqual(observation["peak_memory_mib"], 1024.0)
+
+    def test_choose_resource_candidate_selects_lowest_vcpu_seconds(self) -> None:
+        selection = choose_resource_candidate(
+            [
+                {"success": True, "architecture": "x86_64", "worker_vcpus": 2, "worker_memory_mib": 4096, "completed_units": 100, "useful_compute_seconds": 10},
+                {"success": True, "architecture": "arm64", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 100, "useful_compute_seconds": 10},
+            ],
+            allowed_architectures=["x86_64", "arm64"],
+        )
+        self.assertEqual(selection["status"], "ready")
+        self.assertEqual(selection["selected"]["architecture"], "arm64")
+        self.assertIn("resource_shape_selected", {reason["code"] for reason in selection["reasons"]})
+
+    def test_choose_resource_candidate_requires_x86_baseline_before_selecting_arm(self) -> None:
+        selection = choose_resource_candidate(
+            [{"success": True, "architecture": "arm64", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 100, "useful_compute_seconds": 10}],
+            allowed_architectures=["x86_64", "arm64"],
+        )
+        self.assertEqual(selection["status"], "needs_canary")
+        self.assertIsNone(selection["selected"])
+        self.assertIn("resource_canary_required", {reason["code"] for reason in selection["reasons"]})
+
+    def test_choose_resource_candidate_rejects_arm_when_materially_worse_than_x86(self) -> None:
+        selection = choose_resource_candidate(
+            [
+                {"success": True, "architecture": "x86_64", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 100, "useful_compute_seconds": 10},
+                {"success": True, "architecture": "arm64", "worker_vcpus": 2, "worker_memory_mib": 4096, "completed_units": 100, "useful_compute_seconds": 10},
+            ],
+            allowed_architectures=["x86_64", "arm64"],
+        )
+        self.assertEqual(selection["status"], "ready")
+        self.assertEqual(selection["selected"]["architecture"], "x86_64")
+        self.assertIn("arm_cost_rejected", {reason["code"] for reason in selection["reasons"]})
+
+    def test_choose_resource_candidate_keeps_region_measurements_separate(self) -> None:
+        selection = choose_resource_candidate(
+            [
+                {"success": True, "architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 100, "useful_compute_seconds": 10},
+                {"success": True, "architecture": "x86_64", "region": "us-east-1", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 100, "useful_compute_seconds": 1},
+            ],
+            allowed_architectures=["x86_64"],
+        )
+        self.assertEqual(selection["status"], "ready")
+        self.assertEqual(selection["selected"]["region"], "us-east-1")
+        self.assertEqual(selection["selected"]["median_units_per_second"], 100.0)
+        self.assertEqual(len(selection["candidates"]), 2)
+
+    def test_choose_resource_candidate_rejects_shape_when_any_sample_fails(self) -> None:
+        selection = choose_resource_candidate(
+            [
+                {"success": True, "architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 100, "useful_compute_seconds": 10},
+                {"success": False, "architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 0, "useful_compute_seconds": 1},
+            ],
+            allowed_architectures=["x86_64"],
+        )
+        self.assertEqual(selection["status"], "blocked")
+        self.assertEqual(selection["candidates"][0]["status"], "rejected")
+
+    def test_choose_resource_candidate_blocks_failed_arm_without_x86_fallback(self) -> None:
+        selection = choose_resource_candidate(
+            [{"success": False, "architecture": "arm64", "worker_vcpus": 1, "worker_memory_mib": 2048, "validation_failed": True}],
+            allowed_architectures=["arm64"],
+        )
+        self.assertEqual(selection["status"], "blocked")
+        self.assertIsNone(selection["selected"])
+        self.assertIn("arm_canary_failed", {reason["code"] for reason in selection["reasons"]})
+
+    def test_choose_resource_candidate_needs_canary_without_resource_telemetry(self) -> None:
+        selection = choose_resource_candidate([{"success": True, "completed_units": 100, "useful_compute_seconds": 10}], allowed_architectures=["x86_64"])
+        self.assertEqual(selection["status"], "needs_canary")
+        self.assertIsNone(selection["selected"])
 
     def test_canary_observation_does_not_match_oom_inside_words(self) -> None:
         observation = canary_observation_from_summary(

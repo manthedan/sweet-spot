@@ -60,7 +60,7 @@ sweetspot run job.json \
   --artifact-dir artifacts/RUN_ID
 ```
 
-This dry-run materializes `artifacts/RUN_ID/canary_tasks.jsonl` from tiny controller-owned shards. Review/run those canaries through the normal SweetSpot worker path, collect worker summaries, then rerun with measured telemetry:
+This dry-run materializes `artifacts/RUN_ID/canary_tasks.jsonl` from tiny controller-owned shards. The artifact includes the built-in 1/2/4 vCPU resource lattice and, when `arm64` is allowed in the JobSpec, paired x86/ARM candidates. Review/run those canaries through the normal SweetSpot worker path using separate architecture queues/job definitions as needed, collect worker summaries, then rerun with measured telemetry:
 
 ```bash
 sweetspot run job.json \
@@ -69,7 +69,7 @@ sweetspot run job.json \
   --artifact-dir artifacts/RUN_ID
 ```
 
-That produces calibrated `production_tasks.jsonl` for review. Production kickoff requires the calibrated artifact and explicit AWS targets:
+If the measured canaries are still too tiny to calibrate the target replay-safe duration, the next dry-run writes a larger canary generation instead of production tasks. Once shard sizing and resource telemetry are calibrated, the planner selects the measured architecture/resource shape and produces `production_tasks.jsonl` for review. Production kickoff requires the calibrated artifact and explicit AWS targets:
 
 ```bash
 sweetspot run job.json \
@@ -92,7 +92,7 @@ Rerunning the same apply command resumes from `run_state.json` and refuses unsaf
 
 ## ARM/Graviton policy
 
-Keep x86 as the safe default. Include `arm64` in `constraints.architectures` only when the image is multi-arch and you are prepared to canary ARM compatibility. Use separate x86/ARM queues and job definitions for mixed-architecture operation.
+Keep x86 as the safe default. Include `arm64` in `constraints.architectures` only when the image is multi-arch and you are prepared to canary ARM compatibility. ARM is selected only from successful measured canaries and is rejected on validation/runtime failure or materially worse measured vCPU-seconds per useful unit. Use separate x86/ARM queues and job definitions for mixed-architecture operation.
 
 ## Advanced commands
 

@@ -38,7 +38,9 @@ All notable changes to this project are documented here. This project uses human
 - Internal adaptive shard-sizing helper for growing canaries toward replay-safe task durations without agent-supplied shard sizes.
 - `sweetspot plan --canary-summary-jsonl` to embed adaptive shard-sizing decisions from local canary summaries in the Plan JSON envelope.
 - `sweetspot plan --input-manifest-jsonl` can combine a local logical-unit manifest copy with canary sizing to report adaptive production shard counts without mutating AWS resources.
-- Controller-owned initial adaptive canary task materialization via `sweetspot plan --out-canary-tasks-jsonl` and `sweetspot run --artifact-dir` when a manifest is available but measured canary summaries are not yet present.
+- Controller-owned adaptive canary task materialization via `sweetspot plan --out-canary-tasks-jsonl` and `sweetspot run --artifact-dir`, including geometric canary escalation before production shards are emitted.
+- Canary task artifacts now cover the built-in 1/2/4 vCPU resource lattice and paired x86/ARM candidates when ARM is explicitly allowed.
+- Planner resource selection from measured canary telemetry, including OOM/validation rejection, ARM compatibility/cost gating, and ready-plan execution settings when shard and resource calibration are both available.
 - `sweetspot repair RUN_ID` high-level wrapper that builds run-scoped repair plans by default and can enqueue repair tasks with guarded `--apply`.
 - `sweetspot plan --out-production-tasks-jsonl` for explicitly writing calibrated production `sweetspot.task.v1` shards as a local review/enqueue artifact.
 - Adaptive canary decisions now block production shard generation with `canary_validation_failed` when canaries fail framework/output validation.

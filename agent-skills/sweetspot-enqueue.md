@@ -9,7 +9,9 @@ Guide for creating, validating, and enqueuing SweetSpot tasks to SQS.
 
 ## When to use
 
-Invoke this skill when an agent needs to:
+Invoke this skill for advanced/operator workflows. For new manifest-based runs, prefer `sweetspot-run` and let `sweetspot plan`/`sweetspot run` materialize canary and production tasks.
+
+Use this skill when an agent explicitly needs to:
 - Create a tasks.jsonl file for a batch workload
 - Validate task payloads before submission
 - Enqueue tasks to an SQS queue

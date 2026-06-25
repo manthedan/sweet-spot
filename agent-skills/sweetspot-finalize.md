@@ -9,7 +9,9 @@ Guide for finalizing SweetSpot runs, planning repairs, and cleaning up stale res
 
 ## When to use
 
-Invoke this skill when an agent needs to:
+Invoke this skill for advanced/operator workflows. For normal run lifecycle checks, prefer `sweetspot-run` plus `sweetspot status RUN_ID` and `sweetspot repair RUN_ID`.
+
+Use this skill when an agent explicitly needs to:
 - Check completion status of a run (which tasks are done vs incomplete)
 - Generate repair tasks for incomplete/failed tasks
 - Upload finalization manifests to S3

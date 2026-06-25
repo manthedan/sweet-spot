@@ -73,6 +73,27 @@ from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
 
 
+def _calibrated_summary_jsonl() -> str:
+    return (
+        json.dumps(
+            {
+                "returncode": 0,
+                "completed_units": 1000,
+                "elapsed_sec": 100,
+                "telemetry": {
+                    "architecture": "x86_64",
+                    "region": "us-west-2",
+                    "worker_vcpus": 1,
+                    "worker_memory_mib": 2048,
+                    "completed_units": 1000,
+                    "useful_compute_seconds": 100,
+                },
+            }
+        )
+        + "\n"
+    )
+
+
 class VersionTests(unittest.TestCase):
     def test_version_reports_installed_package(self) -> None:
         out = io.StringIO()
@@ -105,7 +126,7 @@ class PlanCommandTests(unittest.TestCase):
     def test_plan_can_embed_adaptive_canary_summary_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             summaries = Path(tmp) / "summaries.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(main(["plan", "examples/job.x86.example.json", "--canary-summary-jsonl", str(summaries)]), 0)
@@ -137,18 +158,46 @@ class PlanCommandTests(unittest.TestCase):
             report = json.loads(out.getvalue())
             self.assertEqual(report["canaries"][0]["decision"]["reasons"][0]["code"], "canary_required")
             self.assertNotIn("production_shards", report["canaries"][0])
-            self.assertEqual(report["artifacts"]["canary_task_count"], 3)
+            self.assertEqual(report["artifacts"]["canary_task_count"], 9)
             tasks = [json.loads(line) for line in canary_tasks_path.read_text().splitlines()]
-        self.assertEqual([task["job_type"] for task in tasks], ["canary", "canary", "canary"])
-        self.assertEqual([task["logical_unit_start"] for task in tasks], [0, 4, 8])
-        self.assertTrue(tasks[0]["output_s3"].endswith("/canaries/shards/canary-000000"))
+        self.assertEqual({task["job_type"] for task in tasks}, {"canary"})
+        self.assertEqual([task["logical_unit_start"] for task in tasks[:3]], [0, 4, 8])
+        self.assertEqual({task["input"]["candidate_architecture"] for task in tasks}, {"x86_64"})
+        self.assertEqual({task["input"]["candidate_vcpus"] for task in tasks}, {1, 2, 4})
+        self.assertIn("/canaries/x86_64-1vcpu-2048mib/u0000000001/shards/", tasks[0]["output_s3"])
         validate_task_model(tasks[0], default_timeout_seconds=300, max_timeout_seconds=39600)
+
+    def test_plan_writes_paired_arm_canary_tasks_when_arm_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "manifest.jsonl"
+            canary_tasks_path = Path(tmp) / "canary_tasks.jsonl"
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(3)))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "plan",
+                            "examples/job.arm-eligible.example.json",
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--out-canary-tasks-jsonl",
+                            str(canary_tasks_path),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["artifacts"]["canary_task_count"], 18)
+            tasks = [json.loads(line) for line in canary_tasks_path.read_text().splitlines()]
+        self.assertEqual({task["input"]["candidate_architecture"] for task in tasks}, {"x86_64", "arm64"})
+        self.assertEqual({task["input"]["candidate_memory_mib"] for task in tasks}, {2048, 4096, 8192})
 
     def test_plan_counts_manifest_units_for_adaptive_shard_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             summaries = Path(tmp) / "summaries.jsonl"
             manifest = Path(tmp) / "manifest.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -173,7 +222,7 @@ class PlanCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             summaries = Path(tmp) / "summaries.jsonl"
             manifest = Path(tmp) / "empty.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("")
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -190,7 +239,7 @@ class PlanCommandTests(unittest.TestCase):
             summaries = Path(tmp) / "summaries.jsonl"
             manifest = Path(tmp) / "manifest.jsonl"
             tasks_path = Path(tmp) / "artifacts" / "tasks.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -218,11 +267,32 @@ class PlanCommandTests(unittest.TestCase):
         self.assertEqual(tasks[-1]["logical_unit_count"], 500)
         validate_task_model(tasks[0], default_timeout_seconds=300, max_timeout_seconds=39600)
 
+    def test_plan_requires_resource_calibration_for_production_task_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries.jsonl"
+            manifest = Path(tmp) / "manifest.jsonl"
+            tasks_path = Path(tmp) / "tasks.jsonl"
+            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            with self.assertRaisesRegex(SystemExit, "resource decisions need calibrated"):
+                main(
+                    [
+                        "plan",
+                        "examples/job.x86.example.json",
+                        "--canary-summary-jsonl",
+                        str(summaries),
+                        "--input-manifest-jsonl",
+                        str(manifest),
+                        "--out-production-tasks-jsonl",
+                        str(tasks_path),
+                    ]
+                )
+
     def test_plan_requires_manifest_for_production_task_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             summaries = Path(tmp) / "summaries.jsonl"
             tasks_path = Path(tmp) / "tasks.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             with self.assertRaisesRegex(SystemExit, "requires --canary-summary-jsonl and --input-manifest-jsonl"):
                 main(["plan", "examples/job.x86.example.json", "--canary-summary-jsonl", str(summaries), "--out-production-tasks-jsonl", str(tasks_path)])
 
@@ -267,12 +337,13 @@ class RunCommandTests(unittest.TestCase):
             canary_tasks_path = artifact_dir / "canary_tasks.jsonl"
             phases = {phase["name"]: phase for phase in report["phases"]}
             self.assertEqual(report["artifacts"]["canary_tasks_jsonl"], str(canary_tasks_path))
-            self.assertEqual(report["artifacts"]["canary_task_count"], 3)
+            self.assertEqual(report["artifacts"]["canary_task_count"], 9)
             self.assertEqual(phases["materialize_production_tasks"]["status"], "skipped")
             self.assertEqual(phases["materialize_canary_tasks"]["status"], "completed")
             tasks = [json.loads(line) for line in canary_tasks_path.read_text().splitlines()]
-        self.assertEqual([task["job_type"] for task in tasks], ["canary", "canary", "canary"])
-        self.assertEqual([task["logical_unit_start"] for task in tasks], [0, 4, 8])
+        self.assertEqual({task["job_type"] for task in tasks}, {"canary"})
+        self.assertEqual([task["logical_unit_start"] for task in tasks[:3]], [0, 4, 8])
+        self.assertEqual({task["input"]["candidate_vcpus"] for task in tasks}, {1, 2, 4})
 
     def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,7 +351,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -309,6 +380,43 @@ class RunCommandTests(unittest.TestCase):
             tasks = [json.loads(line) for line in tasks_path.read_text().splitlines()]
         self.assertEqual([task["task_id"] for task in tasks], ["shard-000000", "shard-000001", "shard-000002"])
 
+    def test_run_does_not_emit_canaries_for_calibrated_terminal_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summaries = root / "summaries.jsonl"
+            manifest = root / "manifest.jsonl"
+            artifact_dir = root / "artifacts"
+            job_spec = root / "job.json"
+            summaries.write_text(_calibrated_summary_jsonl())
+            manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
+            spec = json.loads(Path("examples/job.x86.example.json").read_text())
+            spec["constraints"]["max_cost_usd"] = 0.000001
+            job_spec.write_text(json.dumps(spec))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "run",
+                            str(job_spec),
+                            "--canary-summary-jsonl",
+                            str(summaries),
+                            "--input-manifest-jsonl",
+                            str(manifest),
+                            "--artifact-dir",
+                            str(artifact_dir),
+                        ]
+                    ),
+                    0,
+                )
+            report = json.loads(out.getvalue())
+            phases = {phase["name"]: phase for phase in report["phases"]}
+            self.assertEqual(report["plan"]["status"], "blocked")
+            self.assertEqual(report["plan"]["canaries"][0]["decision"]["next_action"], "produce_production")
+            self.assertNotIn("canary_tasks_jsonl", report.get("artifacts", {}))
+            self.assertFalse((artifact_dir / "canary_tasks.jsonl").exists())
+            self.assertEqual(phases["materialize_canary_tasks"]["status"], "skipped")
+
     def test_run_apply_requires_artifact_dir_for_resume_state(self) -> None:
         with self.assertRaisesRegex(SystemExit, "requires --artifact-dir"):
             main(["run", "examples/job.x86.example.json", "--apply", "--queue-url", "https://sqs.example/q", "--batch-job-queue", "jq", "--job-definition", "jd"])
@@ -329,7 +437,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             argv = [
                 "run",
@@ -401,7 +509,7 @@ class RunCommandTests(unittest.TestCase):
             artifact_dir = root / "artifacts"
             artifact_dir.mkdir()
             tasks_path = artifact_dir / "production_tasks.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text(json.dumps({"unit": 0}) + "\n")
             tasks_path.write_text(json.dumps({"run_id": "example-x86-run", "task_id": "old"}) + "\n")
             (artifact_dir / "run_state.json").write_text(
@@ -452,7 +560,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             base_argv = [
                 "run",
@@ -494,7 +602,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             base_argv = [
                 "run",
@@ -546,7 +654,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text(json.dumps({"unit": 0}) + "\n")
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.client", side_effect=fake_client), contextlib.redirect_stdout(out):
@@ -604,7 +712,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             argv = [
                 "run",
@@ -681,7 +789,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             argv = [
                 "run",
@@ -742,7 +850,7 @@ class RunCommandTests(unittest.TestCase):
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
             artifact_dir = root / "artifacts"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text("".join(json.dumps({"unit": i}) + "\n" for i in range(6500)))
             argv = [
                 "run",
@@ -778,7 +886,7 @@ class RunCommandTests(unittest.TestCase):
             root = Path(tmp)
             summaries = root / "summaries.jsonl"
             manifest = root / "manifest.jsonl"
-            summaries.write_text(json.dumps({"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}) + "\n")
+            summaries.write_text(_calibrated_summary_jsonl())
             manifest.write_text(json.dumps({"unit": 0}) + "\n")
             with self.assertRaisesRegex(SystemExit, "must start with RUN_ID-"):
                 main(

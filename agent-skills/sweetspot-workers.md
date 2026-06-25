@@ -9,7 +9,9 @@ Guide for submitting, supervising, and monitoring SweetSpot Batch workers.
 
 ## When to use
 
-Invoke this skill when an agent needs to:
+Invoke this skill for advanced/operator workflows. For new manifest-based runs, prefer `sweetspot-run`; the controller should choose shard size, resource shape, and initial worker submission from canary evidence.
+
+Use this skill when an agent explicitly needs to:
 - Size and submit AWS Batch workers for an SQS queue
 - Run a multi-loop supervisor to maintain a target worker pool
 - Monitor active jobs, logs, and job status

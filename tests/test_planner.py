@@ -84,6 +84,8 @@ class PlannerContractTests(unittest.TestCase):
         self.assertEqual(decision["schema"], "sweetspot.adaptive_shard_decision.v1")
         self.assertEqual(decision["selected_units_per_task"], 3000)
         self.assertEqual(decision["target_task_seconds"], 300.0)
+        self.assertEqual(decision["next_action"], "run_canary")
+        self.assertEqual(plan["canaries"][0]["resource_selection"]["status"], "needs_canary")
 
     def test_plan_with_adaptive_canaries_surfaces_oom_as_blocker(self) -> None:
         plan = plan_with_adaptive_canaries(
@@ -113,7 +115,14 @@ class PlannerContractTests(unittest.TestCase):
     def test_plan_with_adaptive_canaries_counts_production_shards(self) -> None:
         plan = plan_with_adaptive_canaries(
             self._valid_job_spec(),
-            [{"returncode": 0, "completed_units": 1000, "elapsed_sec": 100}],
+            [
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 1000, "useful_compute_seconds": 100},
+                }
+            ],
             logical_unit_count=6500,
         )
         shard_plan = plan["canaries"][0]["production_shards"]
@@ -122,6 +131,129 @@ class PlannerContractTests(unittest.TestCase):
         self.assertEqual(shard_plan["logical_unit_count"], 6500)
         self.assertEqual(shard_plan["task_count"], 3)
         self.assertEqual(shard_plan["ranges_omitted"], 3)
+
+    def test_plan_with_adaptive_canaries_waits_for_next_geometric_canary_before_production(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [{"returncode": 0, "completed_units": 10, "elapsed_sec": 1}],
+            logical_unit_count=6500,
+        )
+        decision = plan["canaries"][0]["decision"]
+        self.assertEqual(decision["next_action"], "run_canary")
+        self.assertNotIn("production_shards", plan["canaries"][0])
+
+    def test_plan_with_resource_telemetry_selects_ready_execution_shape(self) -> None:
+        spec = self._valid_job_spec()
+        spec["constraints"]["architectures"] = ["x86_64", "arm64"]
+        plan = plan_with_adaptive_canaries(
+            spec,
+            [
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 2, "worker_memory_mib": 4096, "completed_units": 1000, "useful_compute_seconds": 100},
+                },
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "arm64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 1000, "useful_compute_seconds": 100},
+                },
+            ],
+            logical_unit_count=6500,
+        )
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["selected"]["architecture"], "arm64")
+        self.assertEqual(plan["selected"]["vcpus"], 1.0)
+        self.assertEqual(plan["canaries"][0]["resource_selection"]["status"], "ready")
+
+    def test_plan_ignores_resource_telemetry_outside_allowed_regions(self) -> None:
+        spec = self._valid_job_spec()
+        spec["constraints"]["regions"] = ["us-west-2"]
+        plan = plan_with_adaptive_canaries(
+            spec,
+            [
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "x86_64", "region": "us-east-1", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 1000, "useful_compute_seconds": 100},
+                }
+            ],
+            logical_unit_count=6500,
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertNotIn("selected", plan)
+        self.assertEqual(plan["canaries"][0]["resource_selection"]["status"], "needs_canary")
+        self.assertEqual(plan["canaries"][0]["decision"]["next_action"], "run_canary")
+
+    def test_plan_requests_more_canaries_when_resource_telemetry_has_no_region(self) -> None:
+        plan = plan_with_adaptive_canaries(
+            self._valid_job_spec(),
+            [
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "x86_64", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 1000, "useful_compute_seconds": 100},
+                }
+            ],
+            logical_unit_count=6500,
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertNotIn("selected", plan)
+        self.assertEqual(plan["canaries"][0]["decision"]["next_action"], "run_canary")
+
+    def test_job_spec_rejects_invalid_region_constraints(self) -> None:
+        spec = self._valid_job_spec()
+        spec["constraints"]["regions"] = []
+        with self.assertRaisesRegex(PlannerSpecError, "constraints.regions"):
+            validate_job_spec(spec)
+
+    def test_plan_filters_failed_resource_candidates_before_shard_sizing(self) -> None:
+        spec = self._valid_job_spec()
+        spec["constraints"]["architectures"] = ["x86_64", "arm64"]
+        plan = plan_with_adaptive_canaries(
+            spec,
+            [
+                {
+                    "returncode": 137,
+                    "framework_error": "out of memory",
+                    "completed_units": 10,
+                    "elapsed_sec": 1,
+                    "telemetry": {"architecture": "arm64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 10, "useful_compute_seconds": 1},
+                },
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 2, "worker_memory_mib": 4096, "completed_units": 1000, "useful_compute_seconds": 100},
+                },
+            ],
+            logical_unit_count=6500,
+        )
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["selected"]["architecture"], "x86_64")
+        self.assertEqual(plan["canaries"][0]["decision"]["status"], "ready")
+
+    def test_ready_plan_does_not_claim_more_workers_than_production_shards(self) -> None:
+        spec = self._valid_job_spec()
+        spec["constraints"]["deadline_hours"] = 0.001
+        plan = plan_with_adaptive_canaries(
+            spec,
+            [
+                {
+                    "returncode": 0,
+                    "completed_units": 1000,
+                    "elapsed_sec": 100,
+                    "telemetry": {"architecture": "x86_64", "region": "us-west-2", "worker_vcpus": 1, "worker_memory_mib": 2048, "completed_units": 1000, "useful_compute_seconds": 100},
+                }
+            ],
+            logical_unit_count=1000,
+        )
+        self.assertEqual(plan["status"], "blocked")
+        self.assertEqual(plan["reasons"][0]["code"], "deadline_unachievable")
 
     def test_iter_production_tasks_from_logical_unit_count_streams_task_payloads(self) -> None:
         tasks = list(iter_production_tasks_from_logical_unit_count(self._valid_job_spec(), 25, 10))

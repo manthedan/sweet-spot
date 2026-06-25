@@ -286,8 +286,17 @@ def _write_production_tasks_from_plan(spec: dict[str, Any], plan: dict[str, Any]
     decision = plan["canaries"][0]["decision"]
     selected_units = decision.get("selected_units_per_task")
     observations_used = decision.get("observations_used")
-    if not isinstance(selected_units, int) or not isinstance(observations_used, int) or observations_used <= 0:
-        raise SystemExit("adaptive shard decision needs measured canary summaries before production tasks can be written")
+    resource_selection = plan.get("canaries", [{}])[0].get("resource_selection", {})
+    if (
+        plan.get("status") != "ready"
+        or not isinstance(resource_selection, dict)
+        or resource_selection.get("status") != "ready"
+        or not isinstance(selected_units, int)
+        or not isinstance(observations_used, int)
+        or observations_used <= 0
+        or decision.get("next_action") != "produce_production"
+    ):
+        raise SystemExit("adaptive shard and resource decisions need calibrated measured canary summaries before production tasks can be written")
     path.parent.mkdir(parents=True, exist_ok=True)
     task_count = 0
     with path.open("w", encoding="utf-8") as f:
@@ -304,8 +313,8 @@ def _write_canary_tasks_from_plan(spec: dict[str, Any], plan: dict[str, Any], lo
         raise SystemExit("canary task output requires --input-manifest-jsonl")
     decision = plan.get("canaries", [{}])[0].get("decision", {})
     selected_units = decision.get("selected_units_per_task") if isinstance(decision, dict) else None
-    if not isinstance(selected_units, int):
-        raise SystemExit("adaptive shard decision is blocked; cannot write canary tasks")
+    if not isinstance(selected_units, int) or decision.get("next_action") != "run_canary":
+        raise SystemExit("adaptive shard decision does not request canary tasks")
     path.parent.mkdir(parents=True, exist_ok=True)
     task_count = 0
     with path.open("w", encoding="utf-8") as f:
@@ -445,9 +454,17 @@ def _build_run_report(
 def _materialize_run_tasks(args: argparse.Namespace, spec: dict[str, Any], plan: dict[str, Any], logical_unit_count: int | None) -> tuple[dict[str, Any], Path | None]:
     artifacts: dict[str, Any] = {}
     tasks_path = args.out_production_tasks_jsonl
+    decision = plan.get("canaries", [{}])[0].get("decision", {})
+    resource_selection = plan.get("canaries", [{}])[0].get("resource_selection", {})
     if tasks_path is None and args.artifact_dir and logical_unit_count is not None and args.canary_summary_jsonl:
-        decision = plan.get("canaries", [{}])[0].get("decision", {})
-        if isinstance(decision, dict) and isinstance(decision.get("selected_units_per_task"), int):
+        if (
+            plan.get("status") == "ready"
+            and isinstance(resource_selection, dict)
+            and resource_selection.get("status") == "ready"
+            and isinstance(decision, dict)
+            and isinstance(decision.get("selected_units_per_task"), int)
+            and decision.get("next_action") == "produce_production"
+        ):
             tasks_path = args.artifact_dir / "production_tasks.jsonl"
     if tasks_path:
         if not (args.canary_summary_jsonl and args.input_manifest_jsonl):
@@ -456,12 +473,13 @@ def _materialize_run_tasks(args: argparse.Namespace, spec: dict[str, Any], plan:
         artifacts["production_tasks_jsonl"] = str(tasks_path)
         artifacts["production_task_count"] = plan.get("artifacts", {}).get("production_task_count")
         artifacts["production_tasks_sha256"] = _sha256_file(tasks_path)
-    if args.artifact_dir and logical_unit_count is not None and not args.canary_summary_jsonl and "production_tasks_jsonl" not in artifacts:
-        canary_tasks_path = args.artifact_dir / "canary_tasks.jsonl"
-        _write_canary_tasks_from_plan(spec, plan, logical_unit_count, canary_tasks_path)
-        artifacts["canary_tasks_jsonl"] = str(canary_tasks_path)
-        artifacts["canary_task_count"] = plan.get("artifacts", {}).get("canary_task_count")
-        artifacts["canary_tasks_sha256"] = _sha256_file(canary_tasks_path)
+    if args.artifact_dir and logical_unit_count is not None and "production_tasks_jsonl" not in artifacts:
+        if isinstance(decision, dict) and decision.get("next_action") == "run_canary":
+            canary_tasks_path = args.artifact_dir / "canary_tasks.jsonl"
+            _write_canary_tasks_from_plan(spec, plan, logical_unit_count, canary_tasks_path)
+            artifacts["canary_tasks_jsonl"] = str(canary_tasks_path)
+            artifacts["canary_task_count"] = plan.get("artifacts", {}).get("canary_task_count")
+            artifacts["canary_tasks_sha256"] = _sha256_file(canary_tasks_path)
     return artifacts, tasks_path
 
 

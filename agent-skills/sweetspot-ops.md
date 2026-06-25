@@ -9,7 +9,9 @@ Guide for operational diagnostics, DLQ management, and troubleshooting SweetSpot
 
 ## When to use
 
-Invoke this skill when an agent needs to:
+Invoke this skill for advanced/operator workflows. For normal run visibility, prefer `sweetspot-run` plus `sweetspot status RUN_ID`; use this skill when diagnosis goes beyond the simplified workflow.
+
+Use this skill when an agent explicitly needs to:
 - Diagnose SweetSpot or AWS infrastructure issues
 - Inspect or redrive DLQ messages
 - Run the doctor preflight check
