@@ -92,6 +92,19 @@ class SetupModelTests(unittest.TestCase):
         with self.assertRaisesRegex(SetupSpecError, r"schema: must be 'sweetspot.project.v1'"):
             validate_setup(data)
 
+    def test_explicit_null_optional_strings_report_field_path(self) -> None:
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["project"]["description"] = None
+
+        with self.assertRaisesRegex(SetupSpecError, r"project\.description: must be a non-empty string"):
+            validate_setup(data)
+
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["bootstrap"]["job"] = None
+
+        with self.assertRaisesRegex(SetupSpecError, r"bootstrap\.job: must be a non-empty string"):
+            validate_setup(data)
+
     def test_invalid_workload_s3_reference_reports_field_path(self) -> None:
         data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
         data["workload"]["input_manifest"] = "local/tasks.jsonl"
@@ -153,6 +166,25 @@ class SetupModelTests(unittest.TestCase):
         with self.assertRaisesRegex(SetupSpecError, r"workload\.command\[2\]: secret_value_aws_access_key_id") as ctx:
             validate_setup(data)
         self.assertNotIn(secret_text, str(ctx.exception))
+
+    def test_secret_scanner_reports_aws_secret_access_key_values_without_echoing_value(self) -> None:
+        for secret_text in (
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN",
+        ):
+            with self.subTest(secret_text=secret_text):
+                data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+                data["aws"]["auth"]["profile"] = secret_text
+
+                findings = scan_for_secrets(data)
+
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0].path, "aws.auth.profile")
+                self.assertEqual(findings[0].code, "secret_value_aws_secret_access_key")
+                self.assertNotIn(secret_text, findings[0].message)
+                with self.assertRaisesRegex(SetupSpecError, r"aws\.auth\.profile: secret_value_aws_secret_access_key") as ctx:
+                    validate_setup(data)
+                self.assertNotIn(secret_text, str(ctx.exception))
 
     def test_secret_scanner_reports_bearer_token_and_private_key_markers(self) -> None:
         bearer_text = "Bearer abcdefghijklmnopqrstuvwxyz123456"
@@ -349,6 +381,39 @@ class SetupModelTests(unittest.TestCase):
         self.assertEqual(checks["planner_job"]["status"], "fail")
         self.assertEqual(checks["planner_job"]["findings"][0]["code"], "missing_job_artifact")
 
+    def test_doctor_project_reports_directory_artifact_as_invalid(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            worker_notes = project_dir / WORKER_NOTES_PATH
+            worker_notes.unlink()
+            worker_notes.mkdir()
+            report = doctor_project(project_dir / ".sweetspot")
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["generated_artifacts"]["status"], "fail")
+        self.assertIn("invalid_generated_artifact", {finding["code"] for finding in checks["generated_artifacts"]["findings"]})
+
+    def test_doctor_project_reports_directory_job_without_throwing(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            job_path = project_dir / JOB_SPEC_PATH
+            job_path.unlink()
+            job_path.mkdir()
+            report = doctor_project(project_dir / ".sweetspot")
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["generated_artifacts"]["status"], "fail")
+        self.assertEqual(checks["planner_job"]["status"], "fail")
+        self.assertEqual(checks["planner_job"]["findings"][0]["code"], "invalid_job_artifact")
+
     def test_doctor_project_reports_malformed_setup_without_throwing(self) -> None:
         secret_text = "AKIA1234567890ABCDEF"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -403,6 +468,92 @@ class SetupModelTests(unittest.TestCase):
         self.assertTrue(any(finding["code"] == "secret_value_bearer_token" for finding in findings))
         self.assertTrue(any(finding["path"].startswith(WORKER_NOTES_PATH) for finding in findings))
         self.assertTrue(all(secret_text not in str(finding) for finding in findings))
+
+    def test_validate_setup_rejects_bootstrap_path_collision_with_reserved_config(self) -> None:
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["bootstrap"]["job"] = SWEETSPOT_CONFIG_PATH
+
+        with self.assertRaisesRegex(SetupSpecError, r"bootstrap\.job: must not collide with generated setup config"):
+            validate_setup(data)
+
+    def test_validate_setup_normalizes_bootstrap_path_before_collision_check(self) -> None:
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["bootstrap"]["job"] = ".sweetspot/./sweetspot.yaml"
+
+        with self.assertRaisesRegex(SetupSpecError, r"bootstrap\.job: must not collide with generated setup config"):
+            validate_setup(data)
+
+    def test_validate_setup_rejects_duplicate_bootstrap_paths(self) -> None:
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["bootstrap"]["deployment_template"] = data["bootstrap"]["job"]
+
+        with self.assertRaisesRegex(SetupSpecError, r"bootstrap\.deployment_template: must not collide with bootstrap\.job"):
+            validate_setup(data)
+
+    def test_write_project_context_rejects_symlinked_sweetspot_dir_before_writing(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            project_dir = root / "project"
+            outside_dir = root / "outside"
+            project_dir.mkdir()
+            outside_dir.mkdir()
+            (project_dir / ".sweetspot").symlink_to(outside_dir, target_is_directory=True)
+
+            with self.assertRaisesRegex(FileExistsError, r"paths must not contain symlinks") as ctx:
+                write_project_context(config, project_dir)
+
+            self.assertIn(".sweetspot", str(ctx.exception))
+            self.assertFalse((outside_dir / "sweetspot.yaml").exists())
+            self.assertFalse((outside_dir / "job.json").exists())
+
+    def test_write_project_context_rejects_directory_destination_even_with_overwrite(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            config_path = project_dir / SWEETSPOT_CONFIG_PATH
+            original_config = config_path.read_text(encoding="utf-8")
+            job_path = project_dir / JOB_SPEC_PATH
+            job_path.unlink()
+            job_path.mkdir()
+
+            with self.assertRaisesRegex(FileExistsError, r"file paths are not regular files") as ctx:
+                write_project_context(config, project_dir, overwrite=True)
+
+            self.assertIn(JOB_SPEC_PATH, str(ctx.exception))
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original_config)
+
+    def test_write_project_context_rejects_parent_file_conflicts_before_writing(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            blocked_parent = project_dir / ".sweetspot" / "worker"
+            blocked_parent.parent.mkdir(parents=True)
+            blocked_parent.write_text("not a directory\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(FileExistsError, r"parent paths are files") as ctx:
+                write_project_context(config, project_dir)
+
+            self.assertIn(".sweetspot/worker", str(ctx.exception))
+            self.assertEqual(blocked_parent.read_text(encoding="utf-8"), "not a directory\n")
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+            self.assertFalse((project_dir / JOB_SPEC_PATH).exists())
+
+    def test_write_project_context_rejects_generated_parent_path_overlap_before_writing(self) -> None:
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["bootstrap"]["job"] = ".sweetspot/worker"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            with self.assertRaisesRegex(FileExistsError, r"generated artifact paths overlap") as ctx:
+                write_project_context(data, project_dir)
+
+            self.assertIn(".sweetspot/worker", str(ctx.exception))
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
 
     def test_write_project_context_conflicts_fail_closed_unless_overwrite_true(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")

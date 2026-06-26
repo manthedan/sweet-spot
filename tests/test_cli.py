@@ -136,7 +136,7 @@ class AdminCommandAliasTests(unittest.TestCase):
         self.assertIn("init", text)
         self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
         self.assertIn("doctor", text)
-        self.assertIn("Validate local generated .sweetspot project context", text)
+        self.assertIn("Validate local .sweetspot context with `doctor project`; legacy AWS checks require explicit AWS flags", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -1970,6 +1970,25 @@ class InitCommandTests(unittest.TestCase):
             self.assertEqual(main(["init", f"--config={ROOT / 'examples' / 'setup.example.yaml'}", "--project-dir", str(project_dir)]), 0)
             self.assertTrue((project_dir / SWEETSPOT_CONFIG_PATH).exists())
 
+    def test_init_global_config_flag_loads_setup_yaml_for_init(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            self.assertEqual(main(["--config", str(ROOT / "examples" / "setup.example.yaml"), "init", "--project-dir", str(project_dir)]), 0)
+            self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), load_setup(ROOT / "examples" / "setup.example.yaml"))
+
+    def test_init_malformed_setup_yaml_returns_sanitized_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bad_config = root / "bad.yaml"
+            bad_config.write_text("schema: [unterminated\n", encoding="utf-8")
+            project_dir = root / "project"
+
+            with self.assertRaisesRegex(SystemExit, r"invalid setup config at \$: setup document must be valid YAML"):
+                main(["init", "--config", str(bad_config), "--project-dir", str(project_dir)])
+
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+            self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
+
     def test_init_invalid_secret_like_setup_config_returns_sanitized_error(self) -> None:
         secret_value = "AKIA1234567890ABCDEF"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2012,7 +2031,6 @@ class InitCommandTests(unittest.TestCase):
 
             self._assert_init_created_starter_bundle(project_dir, out.getvalue())
             self.assertNotEqual(blocked.read_text(), "existing deployment template\n")
-
 
 
 class ConfigTests(unittest.TestCase):
@@ -5751,6 +5769,21 @@ class ProjectDoctorCliIntegrationTests(unittest.TestCase):
 
     def _assert_report_does_not_echo(self, report: dict[str, object], secret_text: str) -> None:
         self.assertNotIn(secret_text, json.dumps(report, sort_keys=True))
+
+    def test_legacy_top_level_doctor_routes_to_aws_doctor_without_project_subcommand(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_doctor(args):
+            captured["profile"] = args.profile
+            captured["queue_url"] = args.queue_url
+            captured["format"] = args.format
+            return 0
+
+        with patch("sweetspot.cli.cmd_doctor", side_effect=fake_doctor):
+            rc, stdout, stderr = self._run_main(["doctor", "--profile", "prod", "--queue-url", "https://sqs.example/q", "--format", "json"])
+
+        self.assertEqual(rc, 0, stderr or stdout)
+        self.assertEqual(captured, {"profile": "prod", "queue_url": "https://sqs.example/q", "format": "json"})
 
     def test_generated_bundle_smoke_plans_and_doctor_project_reports_warning_only_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
