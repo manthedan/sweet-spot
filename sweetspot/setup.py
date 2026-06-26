@@ -120,6 +120,74 @@ def dump_setup(config: SweetSpotProject) -> str:
     return yaml.safe_dump(setup_to_dict(config), sort_keys=False)
 
 
+def render_sweetspot_doc(config: SweetSpotProject) -> str:
+    """Render deterministic human/agent setup context for a SweetSpot project."""
+    project = _ensure_valid_project(config)
+    auth_reference = _auth_reference(project.aws)
+    command = " ".join(project.workload.command)
+    bootstrap_rows = [
+        ("Job spec", project.bootstrap.job),
+        ("Deployment template", project.bootstrap.deployment_template),
+        ("Worker notes", project.bootstrap.worker_notes),
+        ("Worker scaffold", project.bootstrap.worker_scaffold),
+        ("Infra vars stub", project.bootstrap.infra_vars_stub),
+        ("Next steps", project.bootstrap.next_steps),
+    ]
+    bootstrap_lines = "\n".join(f"- {label}: `{path}`" for label, path in bootstrap_rows)
+    description = project.project.description or "No description provided."
+    return (
+        f"# SweetSpot Project: {project.project.name}\n\n"
+        "## Setup Status\n\n"
+        "This directory has been initialized with SweetSpot project context only. "
+        "No AWS resources have been created, and no starter runtime bundle has been written. "
+        "No secrets or AWS credential values are stored in these files.\n\n"
+        "## Project\n\n"
+        f"- Name: `{project.project.name}`\n"
+        f"- Description: {description}\n\n"
+        "## Workload Intent\n\n"
+        f"- Input manifest: `{project.workload.input_manifest}`\n"
+        f"- Output prefix: `{project.workload.output_prefix}`\n"
+        f"- Command: `{command}`\n"
+        f"- Architecture: `{project.workload.architecture}`\n\n"
+        "## AWS Auth Intent\n\n"
+        f"- Region: `{project.aws.region}`\n"
+        f"- Method: `{project.aws.method}`\n"
+        f"- Credential reference: `{auth_reference}`\n"
+        "- Secret policy: reference credentials by profile, role, SSO, or environment only; "
+        "do not paste access keys, session tokens, passwords, private keys, or other secret values here.\n\n"
+        "## Bootstrap Artifact Placeholders\n\n"
+        "The following paths are reserved for later bootstrap/runtime slices and are not created by init:\n\n"
+        f"{bootstrap_lines}\n"
+    )
+
+
+def write_project_context(config: SweetSpotProject | dict[str, Any], project_dir: Path, *, overwrite: bool = False) -> list[Path]:
+    """Write .sweetspot/sweetspot.yaml and .sweetspot/SWEETSPOT.md for a validated project.
+
+    The init writer is intentionally narrow: it creates only the project-context
+    files owned by setup/init and leaves S03 starter runtime artifacts absent.
+    Existing destinations fail closed unless overwrite=True.
+    """
+    project = _ensure_valid_project(config)
+    base_dir = Path(project_dir)
+    sweetspot_dir = base_dir / SWEETSPOT_DIR
+    config_path = base_dir / SWEETSPOT_CONFIG_PATH
+    doc_path = base_dir / SWEETSPOT_DOC_PATH
+    destinations = [config_path, doc_path]
+    if not overwrite:
+        conflicts = [path for path in destinations if path.exists()]
+        if conflicts:
+            relative_conflicts = ", ".join(_display_path(path, base_dir) for path in conflicts)
+            raise FileExistsError(f"SweetSpot project context files already exist: {relative_conflicts}; pass overwrite=True to replace them")
+
+    config_text = dump_setup(project)
+    doc_text = render_sweetspot_doc(project)
+    sweetspot_dir.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(config_text, encoding="utf-8")
+    doc_path.write_text(doc_text, encoding="utf-8")
+    return destinations
+
+
 def setup_to_dict(config: SweetSpotProject) -> dict[str, Any]:
     return {
         "schema": config.schema,
@@ -261,6 +329,31 @@ def _scan_for_secrets(value: Any, field_path: str, findings: list[SecretFinding]
                     message="value looks like a private key; store auth intent references only",
                 )
             )
+
+
+def _ensure_valid_project(config: SweetSpotProject | dict[str, Any]) -> SweetSpotProject:
+    if isinstance(config, SweetSpotProject):
+        return validate_setup(setup_to_dict(config))
+    return validate_setup(config)
+
+
+def _auth_reference(auth: AwsAuthIntent) -> str:
+    if auth.method == "profile":
+        return auth.profile or "profile reference required"
+    if auth.method == "role":
+        return auth.role_arn or "role ARN reference required"
+    if auth.method == "sso":
+        return "AWS SSO session configured outside SweetSpot"
+    if auth.method == "env":
+        return "AWS environment variables supplied outside SweetSpot"
+    return "credential reference configured outside SweetSpot"
+
+
+def _display_path(path: Path, base_dir: Path) -> str:
+    try:
+        return path.relative_to(base_dir).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def _without_none(values: dict[str, str | None]) -> dict[str, str]:

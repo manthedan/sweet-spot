@@ -19,9 +19,11 @@ from sweetspot.setup import (
     SetupSpecError,
     dump_setup,
     load_setup,
+    render_sweetspot_doc,
     scan_for_secrets,
     setup_to_dict,
     validate_setup,
+    write_project_context,
 )
 
 
@@ -179,6 +181,77 @@ class SetupModelTests(unittest.TestCase):
 
             with self.assertRaises(Exception):
                 load_setup(path)
+
+    def test_write_project_context_round_trips_and_renders_sweetspot_doc_only(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            written = write_project_context(config, project_dir)
+
+            self.assertEqual(
+                written,
+                [project_dir / SWEETSPOT_CONFIG_PATH, project_dir / SWEETSPOT_DOC_PATH],
+            )
+            self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), config)
+            self.assertFalse((project_dir / JOB_SPEC_PATH).exists())
+            self.assertFalse((project_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
+            self.assertFalse((project_dir / WORKER_NOTES_PATH).exists())
+            self.assertFalse((project_dir / WORKER_SCAFFOLD_PATH).exists())
+            self.assertFalse((project_dir / INFRA_VARS_STUB_PATH).exists())
+            self.assertFalse((project_dir / NEXT_STEPS_PATH).exists())
+
+            doc = (project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8")
+
+        self.assertEqual(doc, render_sweetspot_doc(config))
+        self.assertIn("example-batch-project", doc)
+        self.assertIn("s3://example-sweetspot-input/manifests/tasks.jsonl", doc)
+        self.assertIn("s3://example-sweetspot-output/runs/example/", doc)
+        self.assertIn("python worker.py --task {task_json}", doc)
+        self.assertIn("x86_64", doc)
+        self.assertIn("us-west-2", doc)
+        self.assertIn("profile", doc)
+        self.assertIn("sweetspot-dev", doc)
+        self.assertIn(JOB_SPEC_PATH, doc)
+        self.assertIn(DEPLOYMENT_TEMPLATE_PATH, doc)
+        self.assertIn(WORKER_NOTES_PATH, doc)
+        self.assertIn(WORKER_SCAFFOLD_PATH, doc)
+        self.assertIn(INFRA_VARS_STUB_PATH, doc)
+        self.assertIn(NEXT_STEPS_PATH, doc)
+        self.assertIn("No AWS resources have been created", doc)
+        self.assertIn("No secrets or AWS credential values are stored", doc)
+
+    def test_write_project_context_conflicts_fail_closed_unless_overwrite_true(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            original_config_text = (project_dir / SWEETSPOT_CONFIG_PATH).read_text(encoding="utf-8")
+            original_doc_text = (project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(FileExistsError, r"\.sweetspot/sweetspot\.yaml") as ctx:
+                write_project_context(config, project_dir)
+
+            self.assertIn(".sweetspot/SWEETSPOT.md", str(ctx.exception))
+            self.assertEqual((project_dir / SWEETSPOT_CONFIG_PATH).read_text(encoding="utf-8"), original_config_text)
+            self.assertEqual((project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8"), original_doc_text)
+
+            written = write_project_context(config, project_dir, overwrite=True)
+
+        self.assertEqual([path.relative_to(project_dir).as_posix() for path in written], [SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH])
+
+    def test_write_project_context_rejects_secret_bearing_config_without_writes(self) -> None:
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["aws"]["auth"]["session_token"] = "not-allowed"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            with self.assertRaisesRegex(SetupSpecError, r"aws\.auth\.session_token: secret_key_name"):
+                write_project_context(data, project_dir)
+
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+            self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
 
 
 if __name__ == "__main__":
