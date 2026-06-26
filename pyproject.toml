@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: System :: Distributed Computing",
 ]
-dependencies = ["boto3==1.43.36", "botocore==1.43.36"]
+dependencies = ["boto3==1.43.36", "botocore==1.43.36", "PyYAML==6.0.2"]
 
 [project.urls]
 Homepage = "https://github.com/manthedan/sweet-spot"
