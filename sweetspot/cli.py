@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.metadata as importlib_metadata
 import json
@@ -11,6 +12,7 @@ import shlex
 import statistics
 import sys
 import time
+from io import StringIO
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,7 @@ import boto3
 
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
+from .lifecycle import RunContext, load_run_context
 from .batch_service import (
     redact_env as _redact_env,
     safe_active_worker_count as _safe_active_worker_count,
@@ -2427,46 +2430,54 @@ def _run_status_report(run_id: str | None, artifact_dir: Path | None) -> dict[st
 def cmd_status(args: argparse.Namespace) -> int:
     run_id = getattr(args, "run_id", None)
     artifact_dir = getattr(args, "artifact_dir", None)
+    from_state = bool(getattr(args, "from_state", False))
+    context: RunContext | None = load_run_context(run_id, artifact_dir) if from_state else None
+    if context is not None:
+        run_id = context.run_id
+        artifact_dir = context.artifact_dir
     run_report = _run_status_report(run_id, artifact_dir)
     effective_run_id = str(run_report.get("run_id")) if run_report and run_report.get("run_id") else run_id
-    job_name_prefix = getattr(args, "job_name_prefix", None)
+    job_name_prefix = getattr(args, "job_name_prefix", None) or (context.job_name_prefix if context is not None else None)
     if effective_run_id and job_name_prefix and not _is_run_scoped_job_prefix(effective_run_id, job_name_prefix):
         raise SystemExit("status --job-name-prefix must start with RUN_ID-; omit it to use the safe default")
     effective_job_name_prefix = job_name_prefix or (f"{effective_run_id}-" if effective_run_id else "sweetspot-worker")
-    queue_url = args.queue_url
+    queue_url = args.queue_url or (context.queue_url if context is not None else None)
     if queue_url is None and run_id is None and artifact_dir is None:
         queue_url = os.environ.get("SWEETSPOT_SQS_QUEUE_URL", "")
-    output_prefix = getattr(args, "output_prefix", None)
-    needs_aws = bool(queue_url or args.dlq_url or args.job_queue or output_prefix or (run_id is None and artifact_dir is None))
-    session = boto3.Session(profile_name=args.profile, region_name=args.region) if needs_aws else None
+    dlq_url = getattr(args, "dlq_url", None) or (context.dlq_url if context is not None else None)
+    job_queue = getattr(args, "job_queue", None) or (context.batch_job_queue if context is not None else None)
+    output_prefix = getattr(args, "output_prefix", None) or (context.output_prefix if context is not None else None)
+    region = getattr(args, "region", None) or (context.region if context is not None else None)
+    needs_aws = bool(queue_url or dlq_url or job_queue or output_prefix or (run_id is None and artifact_dir is None))
+    session = boto3.Session(profile_name=args.profile, region_name=region) if needs_aws else None
     identity: dict[str, Any] | None = None
     if session is not None:
-        sts = session.client("sts", region_name=args.region)
+        sts = session.client("sts", region_name=region)
         raw_identity = sts.get_caller_identity()
         identity = {"account": raw_identity.get("Account"), "arn": raw_identity.get("Arn"), "user_id": raw_identity.get("UserId")}
     queues: dict[str, Any] = {}
     if queue_url:
         assert session is not None
-        sqs = session.client("sqs", region_name=args.region)
+        sqs = session.client("sqs", region_name=region)
         queues["source"] = {"queue_url": queue_url, "depth": queue_depth(sqs, queue_url)}
-    if args.dlq_url:
+    if dlq_url:
         assert session is not None
-        sqs = session.client("sqs", region_name=args.region)
-        queues["dlq"] = {"queue_url": args.dlq_url, "depth": queue_depth(sqs, args.dlq_url)}
+        sqs = session.client("sqs", region_name=region)
+        queues["dlq"] = {"queue_url": dlq_url, "depth": queue_depth(sqs, dlq_url)}
     output_s3: dict[str, Any] | None = None
     if output_prefix:
         assert session is not None
-        s3 = session.client("s3", region_name=args.region)
+        s3 = session.client("s3", region_name=region)
         expected_count = run_report.get("production_task_count") if run_report else None
         output_s3 = {"output_prefix": output_prefix, "done_markers": _s3_done_marker_progress(s3, output_prefix, expected_count)}
     batch_status: dict[str, Any] | None = None
-    if args.job_queue:
+    if job_queue:
         assert session is not None
-        batch = session.client("batch", region_name=args.region)
-        active = active_jobs(batch, args.job_queue, effective_job_name_prefix)
+        batch = session.client("batch", region_name=region)
+        active = active_jobs(batch, job_queue, effective_job_name_prefix)
         by_status = dict(Counter(str(job.get("status")) for job in active).most_common())
         batch_status = {
-            "job_queue": args.job_queue,
+            "job_queue": job_queue,
             "job_name_prefix": effective_job_name_prefix,
             "active_count": len(active),
             "active_by_status": by_status,
@@ -2476,7 +2487,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         "schema": "sweetspot.status.v1",
         "checked_at": iso_now(),
         "run": run_report,
-        "region": args.region or (session.region_name if session is not None else None),
+        "run_context": context.as_report() if context is not None else None,
+        "region": region or (session.region_name if session is not None else None),
         "identity": identity,
         "queues": queues,
         "batch": batch_status,
@@ -3044,8 +3056,179 @@ def _read_tasks_for_finalizer(args: argparse.Namespace, s3) -> list[dict[str, An
     return _service_read_tasks_for_finalizer(args, s3, iter_jsonl=_iter_jsonl)
 
 
+def _finalizer_artifact_dir_from_context(context: RunContext) -> Path:
+    if context.task_status_jsonl is not None:
+        return context.task_status_jsonl.parent
+    if context.repair_tasks_jsonl is not None:
+        return context.repair_tasks_jsonl.parent
+    return context.artifact_dir / "finalizer"
+
+
+def _print_finalize_from_state_drift(*, run_id: str, field: str, expected: str | None, actual: str | None, artifact_dir: Path | None) -> int:
+    command_parts: list[str | Path | None] = ["sweetspot", "finalize", run_id, "--from-state"]
+    if artifact_dir is not None:
+        command_parts.extend(["--artifact-dir", artifact_dir])
+    report = {
+        "schema": "sweetspot.lifecycle_error.v1",
+        "ok": False,
+        "reason": "binding_drift",
+        "run_id": run_id,
+        "field": field,
+        "expected": expected,
+        "actual": actual,
+        "recovery_command": _shell_command(command_parts),
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 2
+
+
+def _finalize_args_from_state(args: argparse.Namespace) -> argparse.Namespace | int:
+    requested_run_id = getattr(args, "run_id", None) or getattr(args, "run_id_arg", None)
+    context = load_run_context(requested_run_id, getattr(args, "artifact_dir", None))
+    explicit_output_prefix = getattr(args, "output_prefix", None)
+    if explicit_output_prefix and context.output_prefix and explicit_output_prefix.rstrip("/") != context.output_prefix.rstrip("/"):
+        return _print_finalize_from_state_drift(run_id=context.run_id, field="output_prefix", expected=context.output_prefix, actual=explicit_output_prefix, artifact_dir=context.artifact_dir)
+    if not context.output_prefix:
+        raise SystemExit("finalize --from-state could not recover plan.job.output_prefix from run_state.json")
+    explicit_tasks_jsonl = getattr(args, "tasks_jsonl", None)
+    explicit_tasks_s3 = getattr(args, "tasks_s3", None)
+    if explicit_tasks_s3:
+        return _print_finalize_from_state_drift(run_id=context.run_id, field="tasks_s3", expected=None, actual=str(explicit_tasks_s3), artifact_dir=context.artifact_dir)
+    if explicit_tasks_jsonl is not None and context.production_tasks_jsonl is not None and explicit_tasks_jsonl.resolve() != context.production_tasks_jsonl.resolve():
+        return _print_finalize_from_state_drift(run_id=context.run_id, field="tasks_jsonl", expected=str(context.production_tasks_jsonl), actual=str(explicit_tasks_jsonl), artifact_dir=context.artifact_dir)
+    tasks_jsonl = context.production_tasks_jsonl
+    if tasks_jsonl is None:
+        raise SystemExit("finalize --from-state could not recover artifacts.production_tasks_jsonl from run_state.json")
+    merged = argparse.Namespace(**vars(args))
+    merged.run_id = context.run_id
+    merged.output_prefix = context.output_prefix
+    merged.tasks_jsonl = tasks_jsonl
+    merged.tasks_s3 = None
+    merged.artifact_dir = _finalizer_artifact_dir_from_context(context)
+    merged.region = getattr(args, "region", None) or context.region
+    return merged
+
+
 def cmd_finalize(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "from_state", False)):
+        from_state_args = _finalize_args_from_state(args)
+        if isinstance(from_state_args, int):
+            return from_state_args
+        args = from_state_args
+    else:
+        run_id_arg = getattr(args, "run_id_arg", None)
+        if run_id_arg and not getattr(args, "run_id", None):
+            args.run_id = run_id_arg
     return _run_finalizer_service(args, aws_client=_aws_client, iter_jsonl=_iter_jsonl, check_task_fn=_check_task)
+
+
+def _finish_finalizer_args(args: argparse.Namespace, context: RunContext) -> argparse.Namespace:
+    if not context.output_prefix:
+        raise SystemExit("finish --from-state could not recover plan.job.output_prefix from run_state.json")
+    if context.production_tasks_jsonl is None:
+        raise SystemExit("finish --from-state could not recover artifacts.production_tasks_jsonl from run_state.json")
+    return argparse.Namespace(
+        allow_incomplete_ready=False,
+        allow_legacy_done_markers=bool(getattr(args, "allow_legacy_done_markers", False)),
+        artifact_dir=_finalizer_artifact_dir_from_context(context),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        max_inline_outputs=int(getattr(args, "max_inline_outputs", FINALIZER_DEFAULT_MAX_INLINE_OUTPUTS)),
+        output_prefix=context.output_prefix,
+        preload_s3_prefix=list(getattr(args, "preload_s3_prefix", None) or []),
+        profile=getattr(args, "profile", None),
+        progress_interval=0,
+        publish_ready=bool(getattr(args, "publish_ready", False)),
+        ready_key=str(getattr(args, "ready_key", "READY")),
+        region=getattr(args, "region", None) or context.region,
+        require_complete=True,
+        run_id=context.run_id,
+        tasks_jsonl=context.production_tasks_jsonl,
+        tasks_s3=None,
+        upload=bool(getattr(args, "upload", False) or getattr(args, "publish_ready", False)),
+        use_listing_index=bool(getattr(args, "use_listing_index", False)),
+        workers=int(getattr(args, "workers", 32)),
+        write_repair_jsonl=None,
+    )
+
+
+def cmd_finish(args: argparse.Namespace) -> int:
+    if not bool(getattr(args, "from_state", False)):
+        raise SystemExit("finish currently requires --from-state")
+    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    region = getattr(args, "region", None) or context.region
+    session = boto3.Session(profile_name=getattr(args, "profile", None), region_name=region)
+    queues: dict[str, Any] = {}
+    blockers: list[dict[str, Any]] = []
+    if context.queue_url:
+        sqs = session.client("sqs", region_name=region)
+        depth = queue_depth(sqs, context.queue_url)
+        queues["source"] = {"queue_url": context.queue_url, "depth": depth}
+        if not _queue_depth_is_zero(depth):
+            blockers.append({"code": "source_queue_not_empty", "details": queues["source"]})
+    if context.dlq_url:
+        sqs = session.client("sqs", region_name=region)
+        depth = queue_depth(sqs, context.dlq_url)
+        queues["dlq"] = {"queue_url": context.dlq_url, "depth": depth}
+        if not _queue_depth_is_zero(depth):
+            blockers.append({"code": "dlq_not_empty", "details": queues["dlq"]})
+    batch_status: dict[str, Any] | None = None
+    job_name_prefix = context.job_name_prefix or f"{context.run_id}-"
+    if context.job_name_prefix and not _is_run_scoped_job_prefix(context.run_id, context.job_name_prefix):
+        blockers.append({"code": "invalid_job_name_prefix", "expected_prefix": f"{context.run_id}-", "actual": context.job_name_prefix})
+    if context.batch_job_queue and not any(blocker.get("code") == "invalid_job_name_prefix" for blocker in blockers):
+        batch = session.client("batch", region_name=region)
+        active = active_jobs(batch, context.batch_job_queue, job_name_prefix)
+        batch_status = {
+            "job_queue": context.batch_job_queue,
+            "job_name_prefix": job_name_prefix,
+            "active_count": len(active),
+            "active_by_status": dict(Counter(str(job.get("status")) for job in active).most_common()),
+            "active_examples": active[:20],
+        }
+        if active:
+            blockers.append({"code": "batch_jobs_active", "details": batch_status})
+    output_s3 = None
+    if context.output_prefix:
+        s3 = session.client("s3", region_name=region)
+        expected_count = _count_jsonl_objects(context.production_tasks_jsonl) if context.production_tasks_jsonl else None
+        output_s3 = {"output_prefix": context.output_prefix, "done_markers": _s3_done_marker_progress(s3, context.output_prefix, expected_count)}
+    finalizer_report: dict[str, Any] | None = None
+    finalizer_return_code: int | None = None
+    if not blockers:
+        finalizer_args = _finish_finalizer_args(args, context)
+        finalizer_stdout = StringIO()
+        with contextlib.redirect_stdout(finalizer_stdout):
+            finalizer_return_code = _run_finalizer_service(finalizer_args, aws_client=_aws_client, iter_jsonl=_iter_jsonl, check_task_fn=_check_task)
+        try:
+            loaded = json.loads(finalizer_stdout.getvalue())
+            finalizer_report = loaded if isinstance(loaded, dict) else {"raw_stdout": finalizer_stdout.getvalue()}
+        except json.JSONDecodeError:
+            finalizer_report = {"raw_stdout": finalizer_stdout.getvalue()}
+        if finalizer_return_code != 0:
+            blockers.append({"code": "finalizer_failed", "return_code": finalizer_return_code, "details": finalizer_report})
+        elif not finalizer_report.get("complete"):
+            blockers.append({"code": "finalizer_incomplete", "details": finalizer_report})
+    report = {
+        "schema": "sweetspot.finish.v1",
+        "checked_at": iso_now(),
+        "ok": not blockers,
+        "blocked": bool(blockers),
+        "run_id": context.run_id,
+        "run_context": context.as_report(),
+        "region": region,
+        "queues": queues,
+        "batch": batch_status,
+        "output_s3": output_s3,
+        "finalizer_return_code": finalizer_return_code,
+        "finalizer": finalizer_report,
+        "blockers": blockers,
+        "cleanup_recommendation": f"sweetspot cleanup {context.run_id} --from-state --dry-run",
+    }
+    report_path = context.artifact_dir / "finish_report.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report["finish_report_json"] = str(report_path)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if not blockers else 2
 
 
 def _containers_log_stream(task_properties: Any) -> str | None:
@@ -4023,11 +4206,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "monitor", "plan", "repair", "run", "status", "version"})
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "finalize", "finish", "monitor", "plan", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,finalize,finish,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
@@ -4035,6 +4218,8 @@ def _print_primary_help() -> None:
     print("  run       Dry-run or apply the Plan-authoritative run controller")
     print("  monitor   Emit non-blocking status/finalize checkpoint commands")
     print("  status    Show run artifacts, queue depth, DLQ depth, active workers, and S3 progress")
+    print("  finalize  Reconstruct finalization from run_state.json or explicit finalizer inputs")
+    print("  finish    Run the production closeout checklist from run_state.json")
     print("  repair    Dry-run/apply run-scoped repair planning")
     print("  cancel    Dry-run/apply run-scoped Batch job cancellation")
     print("  admin     List and run advanced/operator commands")
@@ -4116,7 +4301,22 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "visibility_timeout",
     },
     "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "sqs_queue_url", "submit", "tasks_jsonl"},
-    "finalize": {"allow_legacy_done_markers", "artifact_dir", "dry_run", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
+    "finalize": {"allow_legacy_done_markers", "artifact_dir", "dry_run", "from_state", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
+    "finish": {
+        "allow_legacy_done_markers",
+        "artifact_dir",
+        "dry_run",
+        "from_state",
+        "max_inline_outputs",
+        "preload_s3_prefix",
+        "profile",
+        "publish_ready",
+        "ready_key",
+        "region",
+        "upload",
+        "use_listing_index",
+        "workers",
+    },
     "describe-job": {"format", "job_id", "profile", "region"},
     "jobs": {"format", "job_name_regex", "job_queue", "max_jobs", "profile", "region"},
     "logs": {"format", "job_id", "log_group", "log_stream", "profile", "region"},
@@ -4217,7 +4417,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "wait_interval_seconds",
     },
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
-    "status": {"artifact_dir", "dlq_url", "format", "job_name_prefix", "job_queue", "output_prefix", "profile", "queue_url", "region"},
+    "status": {"artifact_dir", "dlq_url", "format", "from_state", "job_name_prefix", "job_queue", "output_prefix", "profile", "queue_url", "region"},
     "submit-workers": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -4283,6 +4483,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "dry_run": ("--dry-run", False),
     "failed_status": ("--failed-status", True),
     "format": ("--format", False),
+    "from_state": ("--from-state", False),
     "finalize": ("--finalize", False),
     "finalize_dry_run": ("--finalize-dry-run", False),
     "finalize_publish_ready": ("--finalize-publish-ready", False),
@@ -4300,6 +4501,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "input_manifest_jsonl": ("--input-manifest-jsonl", False),
     "log_group": ("--log-group", False),
     "log_stream": ("--log-stream", False),
+    "max_inline_outputs": ("--max-inline-outputs", False),
     "max_jobs": ("--max-jobs", False),
     "max_messages": ("--max-messages", False),
     "max_workers": ("--max-workers", False),
@@ -4312,6 +4514,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "out_production_tasks_jsonl": ("--out-production-tasks-jsonl", False),
     "output_prefix": ("--output-prefix", False),
     "prefix": ("--prefix", False),
+    "preload_s3_prefix": ("--preload-s3-prefix", True),
     "profile": ("--profile", False),
     "publish_ready": ("--publish-ready", False),
     "queue_url": ("--queue-url", False),
@@ -4320,6 +4523,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "reconcile_until_drained": ("--reconcile-until-drained", False),
     "region": ("--region", False),
     "reason": ("--reason", False),
+    "ready_key": ("--ready-key", False),
     "run_id": ("--run-id", False),
     "sqs_queue_url": ("--queue-url", False),
     "s3_prefix": ("--s3-prefix", True),
@@ -4333,12 +4537,14 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "task_timeout_seconds": ("--task-timeout-seconds", False),
     "tasks_jsonl": ("--tasks-jsonl", False),
     "upload": ("--upload", False),
+    "use_listing_index": ("--use-listing-index", False),
     "delete": ("--delete", False),
     "completion_marker_s3": ("--completion-marker-s3", False),
     "min_prefix_chars": ("--min-prefix-chars", False),
     "vcpus": ("--vcpus", False),
     "visibility_timeout": ("--visibility-timeout", False),
     "worker_job_name_prefix": ("--worker-job-name-prefix", False),
+    "workers": ("--workers", False),
 }
 
 
@@ -4644,9 +4850,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job-queue")
     p.add_argument("--job-name-prefix", help="Batch job-name prefix to inspect; with RUN_ID it must start with RUN_ID- and defaults to RUN_ID-")
     p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory; defaults to artifacts/RUN_ID when RUN_ID is provided")
+    p.add_argument("--from-state", action="store_true", help="Discover queue, DLQ, Batch queue, job-name prefix, output prefix, and artifact paths from run_state.json")
     p.add_argument("--output-prefix", help="Optional S3 output prefix; when set, status counts done markers and estimates remaining work")
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_status)
+
+    p = _add_parser_with_examples(
+        sub,
+        "finish",
+        help="Run a run_state-driven production closeout checklist and finalizer",
+        examples="  sweetspot finish run-1 --from-state --dry-run\n  sweetspot finish run-1 --from-state --publish-ready",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory containing run_state.json; defaults to artifacts/RUN_ID")
+    p.add_argument("--from-state", action="store_true", help="Load queue, DLQ, Batch, output, and task facts from run_state.json")
+    p.add_argument("--dry-run", action="store_true", help="Run the finalizer in dry-run mode after drain checks")
+    p.add_argument("--upload", action="store_true", help="Upload finalizer manifests after drain checks")
+    p.add_argument("--publish-ready", action="store_true", help="Upload manifests and publish READY only if finalization is complete")
+    p.add_argument("--ready-key", default="READY")
+    p.add_argument("--allow-legacy-done-markers", action="store_true", help="Migration mode: accept legacy done markers during finalization")
+    p.add_argument("--workers", type=int, default=32)
+    p.add_argument("--max-inline-outputs", type=int, default=FINALIZER_DEFAULT_MAX_INLINE_OUTPUTS)
+    p.add_argument("--use-listing-index", action="store_true")
+    p.add_argument("--preload-s3-prefix", action="append", default=[])
+    p.set_defaults(func=cmd_finish)
 
     p = sub.add_parser("worker", help=argparse.SUPPRESS)
     p.add_argument("--profile")
@@ -4784,12 +5013,14 @@ def main(argv: list[str] | None = None) -> int:
         sub,
         "finalize",
         help=argparse.SUPPRESS,
-        examples="  sweetspot admin finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
+        examples="  sweetspot finalize run-1 --from-state --upload --publish-ready\n  sweetspot admin finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
     )
+    p.add_argument("run_id_arg", nargs="?", help="Run id; with --from-state this is used to locate artifacts/RUN_ID/run_state.json unless --artifact-dir is set")
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--run-id", required=True)
-    p.add_argument("--output-prefix", required=True)
+    p.add_argument("--from-state", action="store_true", help="Recover run id, output prefix, production tasks, region, and finalizer artifact directory from run_state.json")
+    p.add_argument("--run-id")
+    p.add_argument("--output-prefix")
     p.add_argument("--tasks-jsonl", type=Path)
     p.add_argument("--tasks-s3")
     p.add_argument("--artifact-dir", type=Path)
