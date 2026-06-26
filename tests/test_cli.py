@@ -116,7 +116,7 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,plan,run,monitor,status,repair,cancel,admin}", text)
+        self.assertIn("{version,plan,run,monitor,status,finalize,finish,repair,cancel,admin}", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -2199,6 +2199,309 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(progress["remaining_count"], 1)
         self.assertAlmostEqual(progress["completion_fraction"], 2 / 3)
         self.assertIsNotNone(progress["estimated_remaining_seconds"])
+
+    def test_status_from_state_discovers_aws_targets_and_output_prefix(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123", "Arn": "arn", "UserId": "u"}
+
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                visible = "4" if kwargs["QueueUrl"] == "run-queue" else "0"
+                return {
+                    "Attributes": {
+                        "ApproximateNumberOfMessages": visible,
+                        "ApproximateNumberOfMessagesNotVisible": "1",
+                        "ApproximateNumberOfMessagesDelayed": "0",
+                    }
+                }
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [{"Key": "runs/r1/done/t0.done.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)}], "IsTruncated": False}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                if kwargs["jobStatus"] == "RUNNING":
+                    return [{"jobSummaryList": [{"jobId": "j1", "jobName": "run-1-worker-0000", "status": "RUNNING"}]}]
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeSession:
+            region_name = "us-west-2"
+
+            def __init__(self, profile_name=None, region_name=None):
+                self.profile_name = profile_name
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "s3":
+                    return FakeS3()
+                if service == "batch":
+                    return FakeBatch()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t1"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {
+                    "run_queue": {"queue_url": "run-queue", "dlq_url": "dlq"},
+                    "production_binding": {"target": {"region": "us-west-2", "sqs_queue_url": "fallback-queue", "dlq_url": "dlq", "batch_job_queue": "jq"}},
+                },
+                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker", "batch_job_queue": "jq"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["region"], "us-west-2")
+        self.assertEqual(report["queues"]["source"]["queue_url"], "run-queue")
+        self.assertEqual(report["queues"]["source"]["depth"]["visible"], 4)
+        self.assertEqual(report["queues"]["dlq"]["queue_url"], "dlq")
+        self.assertEqual(report["batch"]["job_queue"], "jq")
+        self.assertEqual(report["batch"]["job_name_prefix"], "run-1-worker")
+        self.assertEqual(report["output_s3"]["output_prefix"], "s3://bucket/runs/r1")
+        self.assertEqual(report["output_s3"]["done_markers"]["expected_count"], 2)
+        self.assertEqual(report["run_context"]["queue_url"], "run-queue")
+
+
+class FinishTests(unittest.TestCase):
+    def test_finish_from_state_blocks_when_workers_are_active(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                if kwargs["jobStatus"] == "RUNNING":
+                    return [{"jobSummaryList": [{"jobId": "j1", "jobName": "run-1-worker-0000", "status": "RUNNING"}]}]
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [], "IsTruncated": False}
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                if service == "s3":
+                    return FakeS3()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.Session", FakeSession),
+                patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+            self.assertTrue((artifact_dir / "finish_report.json").exists())
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["blocked"])
+        self.assertEqual(report["blockers"][0]["code"], "batch_jobs_active")
+
+    def test_finish_from_state_rejects_unscoped_job_name_prefix(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [], "IsTruncated": False}
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "s3":
+                    return FakeS3()
+                if service == "batch":
+                    raise AssertionError("Batch should not be queried with an invalid prefix")
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+                "phases": [{"name": "submit_workers", "job_name_prefix": "other-worker"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.Session", FakeSession),
+                patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["blockers"][0]["code"], "invalid_job_name_prefix")
+
+    def test_finish_from_state_runs_finalizer_after_drain_checks(self) -> None:
+        captured = {}
+
+        def fake_finalizer(args, **kwargs):
+            captured["args"] = args
+            print(json.dumps({"schema": "sweetspot.final_manifest.v1", "run_id": args.run_id, "complete": True, "ready_s3": "s3://bucket/runs/r1/READY"}))
+            return 0
+
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [{"Key": "runs/r1/done/t0.done.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)}], "IsTruncated": False}
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                if service == "s3":
+                    return FakeS3()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), patch("sweetspot.cli._run_finalizer_service", side_effect=fake_finalizer), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--publish-ready"]), 0)
+            self.assertTrue((artifact_dir / "finish_report.json").exists())
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["blocked"])
+        self.assertTrue(report["finalizer"]["complete"])
+        self.assertTrue(captured["args"].upload)
+        self.assertTrue(captured["args"].publish_ready)
+        self.assertTrue(captured["args"].require_complete)
+
+    def test_finish_from_state_blocks_incomplete_finalizer_without_publish_ready(self) -> None:
+        def fake_finalizer(args, **kwargs):
+            self.assertTrue(args.require_complete)
+            print(json.dumps({"schema": "sweetspot.final_manifest.v1", "run_id": args.run_id, "complete": False, "missing_count": 1}))
+            return 2
+
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [], "IsTruncated": False}
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                if service == "s3":
+                    return FakeS3()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), patch("sweetspot.cli._run_finalizer_service", side_effect=fake_finalizer), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["blocked"])
+        self.assertEqual(report["blockers"][0]["code"], "finalizer_failed")
 
 
 class MonitorTests(unittest.TestCase):
@@ -4285,9 +4588,90 @@ class FakeFinalizeS3:
 
 class FinalizeTests(unittest.TestCase):
     def test_publish_ready_requires_upload(self) -> None:
-        args = types.SimpleNamespace(publish_ready=True, upload=False)
+        args = types.SimpleNamespace(run_id="r1", run_id_arg=None, output_prefix="s3://bucket/r1", publish_ready=True, upload=False)
         with self.assertRaisesRegex(SystemExit, "--upload"):
             cmd_finalize(args)
+
+    def test_finalize_from_state_reconstructs_finalizer_args(self) -> None:
+        captured = {}
+
+        def fake_finalizer(args, **kwargs):
+            captured["args"] = args
+            print(json.dumps({"schema": "sweetspot.final_manifest.v1", "run_id": args.run_id, "complete": True}))
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {"production_binding": {"target": {"region": "us-west-2"}}},
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli._run_finalizer_service", side_effect=fake_finalizer), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["finalize", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run"]), 0)
+        args = captured["args"]
+        self.assertEqual(args.run_id, "run-1")
+        self.assertEqual(args.output_prefix, "s3://bucket/runs/r1")
+        self.assertEqual(args.tasks_jsonl, tasks)
+        self.assertEqual(args.artifact_dir, artifact_dir / "finalizer")
+        self.assertEqual(args.region, "us-west-2")
+        self.assertTrue(args.dry_run)
+
+    def test_finalize_from_state_reports_output_prefix_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {"schema": "sweetspot.run.v1", "run_id": "run-1", "artifacts": {"production_tasks_jsonl": str(tasks)}, "plan": {"job": {"output_prefix": "s3://bucket/good"}}}
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["finalize", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--output-prefix", "s3://bucket/bad"]), 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["reason"], "binding_drift")
+        self.assertEqual(report["expected"], "s3://bucket/good")
+        self.assertEqual(report["actual"], "s3://bucket/bad")
+
+    def test_finalize_from_state_reports_tasks_jsonl_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            other_tasks = artifact_dir / "other_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            other_tasks.write_text(json.dumps({"task_id": "other"}) + "\n")
+            state = {"schema": "sweetspot.run.v1", "run_id": "run-1", "artifacts": {"production_tasks_jsonl": str(tasks)}, "plan": {"job": {"output_prefix": "s3://bucket/good"}}}
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["finalize", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--tasks-jsonl", str(other_tasks)]), 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["field"], "tasks_jsonl")
+        self.assertEqual(report["expected"], str(tasks))
+        self.assertEqual(report["actual"], str(other_tasks))
+
+    def test_finalize_from_state_rejects_tasks_s3_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {"schema": "sweetspot.run.v1", "run_id": "run-1", "artifacts": {"production_tasks_jsonl": str(tasks)}, "plan": {"job": {"output_prefix": "s3://bucket/good"}}}
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["finalize", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--tasks-s3", "s3://bucket/other/tasks.jsonl"]), 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["field"], "tasks_s3")
+        self.assertEqual(report["actual"], "s3://bucket/other/tasks.jsonl")
 
     def test_finalize_dry_run_skips_uploads_and_ready_mutations(self) -> None:
         s3 = FakeFinalizeS3()

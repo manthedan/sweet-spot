@@ -298,6 +298,10 @@ def run_finalizer(
         raise SystemExit("--ready-key must not be empty or collide with SweetSpot manifest paths")
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
+    if not getattr(args, "run_id", None):
+        raise SystemExit("finalize requires RUN_ID or --run-id")
+    if not getattr(args, "output_prefix", None):
+        raise SystemExit("finalize requires --output-prefix unless --from-state can recover it")
     s3 = aws_client(args, "s3")
     existence_index = finalizer_existence_index(args, s3)
     artifact_dir = args.artifact_dir or Path("artifacts") / args.run_id / "finalizer"
