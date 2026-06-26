@@ -3338,10 +3338,42 @@ def _finalizer_artifact_dir_from_context(context: RunContext) -> Path:
     return context.artifact_dir / "finalizer"
 
 
+def _finalize_drift_diagnostic(field: str) -> dict[str, str]:
+    diagnostics = {
+        "output_prefix": {
+            "recorded_source": "run_state.plan.job.output_prefix",
+            "override_source": "--output-prefix",
+            "unsafe_reason": "finalizing a different S3 output prefix could validate outputs and publish READY for an artifact tree that is not the controller-recorded run output",
+        },
+        "tasks_jsonl": {
+            "recorded_source": "run_state.artifacts.production_tasks_jsonl",
+            "override_source": "--tasks-jsonl",
+            "unsafe_reason": "finalizing a different task JSONL could change task counts, missing-output detection, and repair-task generation for the controller-recorded run",
+        },
+        "tasks_s3": {
+            "recorded_source": "run_state.artifacts.production_tasks_jsonl",
+            "override_source": "--tasks-s3",
+            "unsafe_reason": "finalize --from-state is bound to the controller-recorded local production task JSONL; replacing it with an untracked remote task source would bypass that run binding",
+        },
+    }
+    return diagnostics.get(
+        field,
+        {
+            "recorded_source": "run_state.json",
+            "override_source": f"--{field.replace('_', '-')}",
+            "unsafe_reason": "the requested override does not match the controller-recorded run binding",
+        },
+    )
+
+
 def _print_finalize_from_state_drift(*, run_id: str, field: str, expected: str | None, actual: str | None, artifact_dir: Path | None) -> int:
     command_parts: list[str | Path | None] = ["sweetspot", "finalize", run_id, "--from-state"]
+    explain_parts: list[str | Path | None] = ["sweetspot", "explain", run_id, "--from-state"]
     if artifact_dir is not None:
         command_parts.extend(["--artifact-dir", artifact_dir])
+        explain_parts.extend(["--artifact-dir", artifact_dir])
+    diagnostic = _finalize_drift_diagnostic(field)
+    recovery_command = _shell_command(command_parts)
     report = {
         "schema": "sweetspot.lifecycle_error.v1",
         "ok": False,
@@ -3350,7 +3382,17 @@ def _print_finalize_from_state_drift(*, run_id: str, field: str, expected: str |
         "field": field,
         "expected": expected,
         "actual": actual,
-        "recovery_command": _shell_command(command_parts),
+        "diagnostic": {
+            "recorded": {"source": diagnostic["recorded_source"], "value": expected},
+            "override": {"source": diagnostic["override_source"], "value": actual},
+            "unsafe_reason": diagnostic["unsafe_reason"],
+        },
+        "recovery": {
+            "command": recovery_command,
+            "explain_command": _shell_command(explain_parts),
+            "message": "Remove the conflicting override and rerun the state-bound command shown in recovery.command.",
+        },
+        "recovery_command": recovery_command,
     }
     print(json.dumps(report, indent=2, sort_keys=True))
     return 2
@@ -3367,7 +3409,8 @@ def _finalize_args_from_state(args: argparse.Namespace) -> argparse.Namespace | 
     explicit_tasks_jsonl = getattr(args, "tasks_jsonl", None)
     explicit_tasks_s3 = getattr(args, "tasks_s3", None)
     if explicit_tasks_s3:
-        return _print_finalize_from_state_drift(run_id=context.run_id, field="tasks_s3", expected=None, actual=str(explicit_tasks_s3), artifact_dir=context.artifact_dir)
+        expected_tasks = str(context.production_tasks_jsonl) if context.production_tasks_jsonl is not None else None
+        return _print_finalize_from_state_drift(run_id=context.run_id, field="tasks_s3", expected=expected_tasks, actual=str(explicit_tasks_s3), artifact_dir=context.artifact_dir)
     if explicit_tasks_jsonl is not None and context.production_tasks_jsonl is not None and explicit_tasks_jsonl.resolve() != context.production_tasks_jsonl.resolve():
         return _print_finalize_from_state_drift(run_id=context.run_id, field="tasks_jsonl", expected=str(context.production_tasks_jsonl), actual=str(explicit_tasks_jsonl), artifact_dir=context.artifact_dir)
     tasks_jsonl = context.production_tasks_jsonl

@@ -4785,6 +4785,12 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(report["reason"], "binding_drift")
         self.assertEqual(report["expected"], "s3://bucket/good")
         self.assertEqual(report["actual"], "s3://bucket/bad")
+        self.assertEqual(report["diagnostic"]["recorded"]["source"], "run_state.plan.job.output_prefix")
+        self.assertEqual(report["diagnostic"]["recorded"]["value"], "s3://bucket/good")
+        self.assertEqual(report["diagnostic"]["override"]["source"], "--output-prefix")
+        self.assertIn("different S3 output prefix", report["diagnostic"]["unsafe_reason"])
+        self.assertIn("sweetspot finalize run-1 --from-state", report["recovery"]["command"])
+        self.assertNotIn("--output-prefix", report["recovery"]["command"])
 
     def test_finalize_from_state_reports_tasks_jsonl_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4803,6 +4809,9 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(report["field"], "tasks_jsonl")
         self.assertEqual(report["expected"], str(tasks))
         self.assertEqual(report["actual"], str(other_tasks))
+        self.assertEqual(report["diagnostic"]["recorded"]["source"], "run_state.artifacts.production_tasks_jsonl")
+        self.assertEqual(report["diagnostic"]["override"]["source"], "--tasks-jsonl")
+        self.assertIn("different task JSONL", report["diagnostic"]["unsafe_reason"])
 
     def test_finalize_from_state_rejects_tasks_s3_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4817,7 +4826,11 @@ class FinalizeTests(unittest.TestCase):
                 self.assertEqual(main(["finalize", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--tasks-s3", "s3://bucket/other/tasks.jsonl"]), 2)
         report = json.loads(out.getvalue())
         self.assertEqual(report["field"], "tasks_s3")
+        self.assertEqual(report["expected"], str(tasks))
         self.assertEqual(report["actual"], "s3://bucket/other/tasks.jsonl")
+        self.assertEqual(report["diagnostic"]["recorded"]["source"], "run_state.artifacts.production_tasks_jsonl")
+        self.assertEqual(report["diagnostic"]["override"]["source"], "--tasks-s3")
+        self.assertIn("untracked remote task source", report["diagnostic"]["unsafe_reason"])
 
     def test_finalize_dry_run_skips_uploads_and_ready_mutations(self) -> None:
         s3 = FakeFinalizeS3()

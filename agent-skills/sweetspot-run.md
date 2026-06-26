@@ -115,7 +115,7 @@ Dedicated-queue top-up submits are persisted as in-flight before each Batch muta
 
 - `sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command` is the preferred way to generate non-blocking scheduler/CI checkpoint commands.
 - `sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state` reconstructs queue, DLQ, Batch queue, job-name prefix, output prefix, and task artifacts from `run_state.json`; it calls AWS only for the recovered queue/Batch/S3 checks.
-- `sweetspot finalize RUN_ID --artifact-dir artifacts/RUN_ID --from-state` is the explicit state-driven finalizer path when you do not want the full finish checklist.
+- `sweetspot finalize RUN_ID --artifact-dir artifacts/RUN_ID --from-state` is the explicit state-driven finalizer path when you do not want the full finish checklist. If an operator passes a conflicting `--output-prefix`, `--tasks-jsonl`, or `--tasks-s3`, SweetSpot returns a structured `binding_drift` report with the recorded value, override value, unsafe reason, and recovery command; follow the recovery command instead of forcing overrides.
 - `sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready` runs the production drain checks before finalization/READY and writes `finish_report.json`.
 - `sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state` explains the reconstructed lifecycle state and next actions without mutating AWS.
 - `sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state` writes a JSON or Markdown closeout report from state/finalizer/finish artifacts.
