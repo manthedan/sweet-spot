@@ -161,6 +161,7 @@ See `infra/opentofu/README.md` for details.
 - `CONTRIBUTING.md` -- contributor workflow, trust boundary, release hygiene
 - `SECURITY.md` -- trusted-workload threat model
 - `docs/reliability_contract.md` -- full worker/done-marker protocol
+- `docs/lifecycle_reports.md` -- lifecycle closeout report schemas and error payloads
 - `docs/cost_model.md` -- expected-total-cost pool ranking formulas
 - `docs/release_checklist.md` -- release/tag hygiene
 - `CHANGELOG.md` -- unreleased changes

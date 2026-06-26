@@ -119,7 +119,7 @@ Dedicated-queue top-up submits are persisted as in-flight before each Batch muta
 - `sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready` runs the production drain checks before finalization/READY and writes `finish_report.json`.
 - `sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state` explains the reconstructed lifecycle state and next actions without mutating AWS.
 - `sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state` writes a JSON or Markdown closeout report from state/finalizer/finish artifacts.
-- `sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run` writes `cleanup_report.json`; it is conservative/report-only and leaves destructive SQS/DLQ/S3/Batch capacity mutations as explicit admin/operator actions.
+- `sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run` writes `cleanup_report.json`; it is conservative/report-only and leaves destructive SQS/DLQ/S3/Batch capacity mutations as explicit admin/operator actions. See `docs/lifecycle_reports.md` for `status`, `finish`, `explain`, `postmortem`, `cleanup`, and lifecycle-error schemas.
 - `sweetspot repair RUN_ID ...` builds a run-scoped repair plan. Add `--apply` only after reviewing the repair JSON.
 - `sweetspot cancel RUN_ID ...` is run-scoped. Broad regex cancellation belongs to the advanced `cancel-jobs` command.
 
