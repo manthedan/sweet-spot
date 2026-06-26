@@ -1,6 +1,6 @@
 ---
 name: sweetspot-run
-description: 'Use the simplified SweetSpot planner/controller workflow: JobSpec, plan, run, status, finish, explain/postmortem, repair, and cancel. Prefer this over lower-level phase commands for new runs.'
+description: 'Use the simplified SweetSpot planner/controller workflow: JobSpec, plan, run, status, finish, explain/postmortem, cleanup, repair, and cancel. Prefer this over lower-level phase commands for new runs.'
 ---
 
 # Skill: sweetspot-run
@@ -21,6 +21,7 @@ sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state
 sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready
 sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format text
 sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format markdown
+sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run
 sweetspot repair RUN_ID --tasks-jsonl artifacts/RUN_ID/production_tasks.jsonl \
   --task-status-jsonl artifacts/RUN_ID/finalizer/task_status.jsonl \
   --job-queue batch-queue
@@ -118,6 +119,7 @@ Dedicated-queue top-up submits are persisted as in-flight before each Batch muta
 - `sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready` runs the production drain checks before finalization/READY and writes `finish_report.json`.
 - `sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state` explains the reconstructed lifecycle state and next actions without mutating AWS.
 - `sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state` writes a JSON or Markdown closeout report from state/finalizer/finish artifacts.
+- `sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run` writes `cleanup_report.json`; it is conservative/report-only and leaves destructive SQS/DLQ/S3/Batch capacity mutations as explicit admin/operator actions.
 - `sweetspot repair RUN_ID ...` builds a run-scoped repair plan. Add `--apply` only after reviewing the repair JSON.
 - `sweetspot cancel RUN_ID ...` is run-scoped. Broad regex cancellation belongs to the advanced `cancel-jobs` command.
 

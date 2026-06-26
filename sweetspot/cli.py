@@ -2700,6 +2700,85 @@ def cmd_postmortem(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    if not bool(getattr(args, "from_state", False)):
+        raise SystemExit("cleanup currently requires --from-state")
+    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    region = getattr(args, "region", None) or context.region
+    session = boto3.Session(profile_name=getattr(args, "profile", None), region_name=region)
+    blockers: list[dict[str, Any]] = []
+    observations: dict[str, Any] = {}
+    recommendations: list[str] = []
+    if context.queue_url:
+        sqs = session.client("sqs", region_name=region)
+        depth = queue_depth(sqs, context.queue_url)
+        observations["source_queue"] = {"queue_url": context.queue_url, "depth": depth}
+        if _queue_depth_is_zero(depth):
+            recommendations.append("Source queue is drained; no SQS purge/delete is recommended.")
+        else:
+            blockers.append({"code": "source_queue_not_empty", "details": observations["source_queue"]})
+            recommendations.append(
+                _shell_command(
+                    [
+                        "sweetspot",
+                        "admin",
+                        "cleanup-stale-messages",
+                        "--queue-url",
+                        context.queue_url,
+                        "--run-id",
+                        context.run_id,
+                        "--max-messages",
+                        str(getattr(args, "max_messages", 100)),
+                    ]
+                )
+            )
+    if context.dlq_url:
+        sqs = session.client("sqs", region_name=region)
+        depth = queue_depth(sqs, context.dlq_url)
+        observations["dlq"] = {"queue_url": context.dlq_url, "depth": depth}
+        if not _queue_depth_is_zero(depth):
+            blockers.append({"code": "dlq_not_empty", "details": observations["dlq"]})
+            recommendations.append("Inspect DLQ messages and repair/re-drive intentionally; lifecycle cleanup will not purge DLQ messages.")
+    job_name_prefix = context.job_name_prefix or f"{context.run_id}-"
+    if context.job_name_prefix and not _is_run_scoped_job_prefix(context.run_id, context.job_name_prefix):
+        blockers.append({"code": "invalid_job_name_prefix", "expected_prefix": f"{context.run_id}-", "actual": context.job_name_prefix})
+    elif context.batch_job_queue:
+        batch = session.client("batch", region_name=region)
+        active = active_jobs(batch, context.batch_job_queue, job_name_prefix)
+        observations["batch"] = {
+            "job_queue": context.batch_job_queue,
+            "job_name_prefix": job_name_prefix,
+            "active_count": len(active),
+            "active_by_status": dict(Counter(str(job.get("status")) for job in active).most_common()),
+            "active_examples": active[:20],
+        }
+        if active:
+            blockers.append({"code": "batch_jobs_active", "details": observations["batch"]})
+            recommendations.append("Wait for run-scoped Batch jobs to finish or use `sweetspot cancel RUN_ID --job-queue ... --apply` after review.")
+    recommendations.append("Do not restore or resize Batch compute capacity unless run_state.json records a reviewed pre-run capacity baseline.")
+    report = {
+        "schema": "sweetspot.cleanup_plan.v1",
+        "checked_at": iso_now(),
+        "run_id": context.run_id,
+        "apply_requested": bool(getattr(args, "apply", False)),
+        "dry_run": not bool(getattr(args, "apply", False)),
+        "ok": not blockers,
+        "blocked": bool(blockers),
+        "run_context": context.as_report(),
+        "region": region,
+        "observations": observations,
+        "blockers": blockers,
+        "recommendations": recommendations,
+        "applied_actions": [],
+        "note": "This lifecycle cleanup layer is conservative and report-only; destructive queue, DLQ, S3, and Batch capacity mutations remain explicit admin/operator actions.",
+    }
+    report_path = context.artifact_dir / "cleanup_report.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report["cleanup_report_json"] = str(report_path)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if not blockers else 2
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     status_parts: list[str | Path | None] = ["sweetspot", "status", args.run_id]
     if args.profile:
@@ -4401,11 +4480,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "explain", "finalize", "finish", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "explain", "finalize", "finish", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,explain,finalize,finish,postmortem,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
@@ -4417,6 +4496,7 @@ def _print_primary_help() -> None:
     print("  finish    Run the production closeout checklist from run_state.json")
     print("  explain   Explain reconstructed lifecycle state and next actions")
     print("  postmortem Write a state-driven lifecycle postmortem")
+    print("  cleanup   Plan conservative state-driven lifecycle cleanup")
     print("  repair    Dry-run/apply run-scoped repair planning")
     print("  cancel    Dry-run/apply run-scoped Batch job cancellation")
     print("  admin     List and run advanced/operator commands")
@@ -4453,6 +4533,7 @@ ADMIN_COMMANDS = frozenset(
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "cancel": {"apply", "job_name_prefix", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cancel-jobs": {"apply", "format", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
+    "cleanup": {"apply", "artifact_dir", "from_state", "max_messages", "profile", "region"},
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
     "dlq": {"apply", "dlq_url", "format", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
@@ -5101,6 +5182,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--format", choices=["json", "markdown"], default="json")
     p.add_argument("--out", type=Path, help="Output path; defaults to postmortem.json or postmortem.md in the artifact dir")
     p.set_defaults(func=cmd_postmortem)
+
+    p = _add_parser_with_examples(
+        sub,
+        "cleanup",
+        help="Plan conservative state-driven lifecycle cleanup from run_state.json",
+        examples="  sweetspot cleanup run-1 --from-state --dry-run\n  sweetspot cleanup run-1 --from-state --apply",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory containing run_state.json; defaults to artifacts/RUN_ID")
+    p.add_argument("--from-state", action="store_true", help="Load cleanup targets from run_state.json")
+    p.add_argument("--dry-run", action="store_true", help="Preview cleanup recommendations; this is the default")
+    p.add_argument("--apply", action="store_true", help="Request cleanup application; currently emits an evidence report and keeps destructive admin actions explicit")
+    p.add_argument("--max-messages", type=int, default=100, help="Suggested scan limit for generated stale-message cleanup command")
+    p.set_defaults(func=cmd_cleanup)
 
     p = sub.add_parser("worker", help=argparse.SUPPRESS)
     p.add_argument("--profile")

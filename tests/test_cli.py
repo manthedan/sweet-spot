@@ -116,7 +116,7 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,plan,run,monitor,status,explain,finalize,finish,postmortem,repair,cancel,admin}", text)
+        self.assertIn("{version,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -2576,6 +2576,78 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
         self.assertEqual(written["schema"], "sweetspot.postmortem.v1")
         self.assertEqual(written["outcome"], "finished")
         self.assertEqual(written["run_context"]["final_manifest_json"].endswith("final_manifest.json"), True)
+
+    def test_cleanup_from_state_writes_conservative_dry_run_plan(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            self._write_finished_run(artifact_dir)
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["cleanup", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run"]), 0)
+            self.assertTrue((artifact_dir / "cleanup_report.json").exists())
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.cleanup_plan.v1")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["applied_actions"], [])
+        self.assertIn("report-only", report["note"])
+
+    def test_cleanup_from_state_blocks_non_empty_dlq(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                visible = "1" if kwargs["QueueUrl"] == "dlq" else "0"
+                return {"Attributes": {"ApproximateNumberOfMessages": visible, "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            self._write_finished_run(artifact_dir)
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["cleanup", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["blocked"])
+        self.assertEqual(report["blockers"][0]["code"], "dlq_not_empty")
 
 
 class MonitorTests(unittest.TestCase):
