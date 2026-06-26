@@ -132,7 +132,7 @@ The primary agent interface uses a high-level controller workflow. Lower-level o
 | `sweetspot admin scout` | Rank Spot pools by expected total cost (read-only). | `--preset mixed`, `--observed-summaries`, `--regions` |
 | `sweetspot admin lane-manager` | Multi-region cost-aware lane allocation. | `--config lanes.json` |
 
-> Always use `sweetspot admin scout --preset mixed` before large runs to compare x86 vs ARM/Graviton cost efficiency based on canary telemetry.
+> Always use `sweetspot admin scout --preset smallest` or `--preset mixed` before large runs to compare cheap x86 and ARM/Graviton lanes from canary telemetry. For 2 GiB medium instances, reserve less than the full host memory (for example 1536 MiB) so Batch/ECS can schedule the job.
 
 Config files (`--config` or `SWEETSPOT_CONFIG`) can pre-populate common flags. All mutating commands are dry-run by default.
 

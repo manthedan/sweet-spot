@@ -32,6 +32,10 @@ from botocore.exceptions import ClientError
 from .cost_model import expected_cost_per_1m_units
 
 X86_CPU_TYPES = [
+    # Include the smallest practical EC2 Spot shapes first.  For 2 GiB
+    # instances, Batch/ECS workers must reserve less than full host memory
+    # (for example 1536 MiB) because host memory is not fully schedulable.
+    "c7a.medium",
     "c5.large",
     "c5.xlarge",
     "c5.2xlarge",
@@ -99,6 +103,11 @@ X86_CPU_TYPES = [
 ]
 
 ARM_CPU_TYPES = [
+    # Keep Graviton medium shapes in the default ARM/mixed scout universe so
+    # canary-backed planning can discover cheap 1 vCPU lanes instead of
+    # defaulting to larger "safe" instances.
+    "c7g.medium",
+    "c6g.medium",
     "c6g.large",
     "c6g.xlarge",
     "c6g.2xlarge",
@@ -125,7 +134,10 @@ ARM_CPU_TYPES = [
     "m8g.4xlarge",
 ]
 
+SMALLEST_CPU_TYPES = ["c7a.medium", "c7g.medium", "c6g.medium"]
+
 PRESETS = {
+    "smallest": SMALLEST_CPU_TYPES,
     "x86": X86_CPU_TYPES,
     "arm": ARM_CPU_TYPES,
     "mixed": X86_CPU_TYPES + ARM_CPU_TYPES,
@@ -246,6 +258,10 @@ def s3_get_text(s3, uri: str) -> str:
     return body.decode("utf-8")
 
 
+def _looks_like_summary_path(path: str) -> bool:
+    return path.endswith(".summary.json") or path.endswith("/summary.json")
+
+
 def iter_summary_jsons(session: boto3.Session, refs: list[str], max_files: int) -> Iterable[dict[str, Any]]:
     seen = 0
     s3_clients: dict[str, Any] = {}
@@ -259,7 +275,7 @@ def iter_summary_jsons(session: boto3.Session, refs: list[str], max_files: int) 
             for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    if not key.endswith(".summary.json"):
+                    if not _looks_like_summary_path(key):
                         continue
                     try:
                         yield json.loads(s3_get_text(s3, f"s3://{bucket}/{key}"))
@@ -270,7 +286,7 @@ def iter_summary_jsons(session: boto3.Session, refs: list[str], max_files: int) 
                         return
         else:
             p = Path(ref)
-            paths = [p] if p.is_file() else sorted(p.rglob("*.summary.json"))
+            paths = [p] if p.is_file() else sorted(path for path in p.rglob("*.json") if _looks_like_summary_path(path.as_posix()))
             for path in paths:
                 if seen >= max_files:
                     return
@@ -490,7 +506,7 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
     ap.add_argument("--worker-memory", "--worker-memory-mib", dest="worker_memory_mib", type=int, default=0, help="Optional worker memory request in MiB for memory-aware instance packing")
     ap.add_argument("--instance-memory-reserve-mib", type=int, default=512, help="Conservative per-instance memory reserve subtracted before Batch worker packing")
     ap.add_argument("--default-units-per-s", type=float, default=27.0, help="Fallback units/sec for one worker job")
-    ap.add_argument("--observed-summaries", nargs="*", default=[], help="Local dirs/files or s3:// prefixes containing *.summary.json")
+    ap.add_argument("--observed-summaries", nargs="*", default=[], help="Local dirs/files or s3:// prefixes containing *.summary.json or attempt-scoped */summary.json files")
     ap.add_argument("--max-observed-files", type=int, default=5000)
     ap.add_argument("--top-instance-rows", type=int, default=20)
     ap.add_argument("--expected-replay-fraction", type=float, default=None, help="Override observed discarded/useful compute fraction for retries/interruption replay")

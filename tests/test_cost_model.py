@@ -15,6 +15,31 @@ from sweetspot.scout import expected_cost_per_1m_units, noncompute_cost_per_1m_u
 
 
 class CostModelTests(unittest.TestCase):
+    def test_scout_presets_include_smallest_medium_lanes(self) -> None:
+        self.assertEqual(scout.PRESETS["smallest"], ["c7a.medium", "c7g.medium", "c6g.medium"])
+        self.assertIn("c7a.medium", scout.PRESETS["mixed"])
+        self.assertIn("c7g.medium", scout.PRESETS["mixed"])
+
+    def test_scout_reads_attempt_scoped_summary_json_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "summaries" / "task.summary.json.attempts" / "attempt" / "summary.json"
+            p.parent.mkdir(parents=True)
+            p.write_text(
+                json.dumps(
+                    {
+                        "schema": "sweetspot.task_summary.v2",
+                        "telemetry": {
+                            "instance_type": "c7g.medium",
+                            "completed_units": 1,
+                            "useful_compute_seconds": 2,
+                        },
+                    }
+                )
+            )
+            obs = observed_perf(mock.Mock(), [tmp], max_files=10)
+        self.assertEqual(obs["count"], 1)
+        self.assertEqual(obs["by_instance_type"]["c7g.medium"]["median_units_per_s"], 0.5)
+
     def test_observed_perf_reads_worker_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "a.summary.json"

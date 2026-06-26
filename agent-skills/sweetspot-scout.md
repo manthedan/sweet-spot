@@ -56,7 +56,8 @@ Read-only Spot pool ranking tool. Does not submit jobs or mutate resources. Pref
 
 ```bash
 sweetspot scout \
-  --preset mixed \
+  --preset smallest \
+  --worker-memory-mib 1536 \
   --regions us-west-2 us-east-2 eu-north-1 \
   --target-vcpus 256 512 \
   --bucket my-data-bucket \
@@ -68,13 +69,15 @@ sweetspot scout \
 ```
 
 Key arguments:
-- `--preset x86|arm|mixed`: Instance type preset to evaluate. The CLI default remains `x86` for compatibility safety; use `mixed` during scouting to surface ARM/Graviton savings before deciding whether to opt in.
-  - `x86`: c5/c5a/c6i/c6a/c7i/c7a/c8i/c8a/m5/m5a/m6i/m6a/m7i/m7a/m8i/m8a families
-  - `arm`: c6g/c7g/c8g/m6g/m7g/m8g families (Graviton)
+- `--preset smallest|x86|arm|mixed`: Instance type preset to evaluate. The CLI default remains `x86` for compatibility safety. Start with `smallest` to test cheap 1 vCPU lanes before broadening to `mixed`.
+  - `smallest`: c7a.medium, c7g.medium, c6g.medium
+  - `x86`: c5/c5a/c6i/c6a/c7i/c7a/c8i/c8a/m5/m5a/m6i/m6a/m7i/m7a/m8i/m8a families, including c7a.medium
+  - `arm`: c6g/c7g/c8g/m6g/m7g/m8g families (Graviton), including c7g.medium/c6g.medium
 - `--regions`: AWS regions to evaluate, repeatable
 - `--target-vcpus`: vCPU targets for placement score queries, repeatable
 - `--bucket`: S3 bucket for cross-region transfer cost estimation
 - `--observed-summaries`: Directory of summary JSON files from prior runs
+- `--worker-memory-mib`: Requested Batch worker memory; use ~1536 MiB, not 2048 MiB, when testing 2 GiB medium instances because ECS/Batch needs host headroom
 - `--startup-overhead-seconds`: Per-task overhead assumption
 - `--cross-region-gb-per-1m-units`: Cross-region transfer cost per 1M units
 - `--nat-gb-per-1m-units`: NAT data processing cost per 1M units

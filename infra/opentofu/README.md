@@ -42,7 +42,7 @@ tofu apply -var-file=example.tfvars
 ## Notes
 
 - Default Spot allocation strategy is `SPOT_PRICE_CAPACITY_OPTIMIZED`.
-- Default Spot instance types are x86-only for workload compatibility. To evaluate ARM/Graviton savings, run `sweetspot scout --preset mixed --observed-summaries ...`, then opt into the separate ARM queue only after a canary proves the worker image and native dependencies are compatible.
+- Default Spot instance types are x86-only for workload compatibility, but include small x86 shapes such as `c7a.medium` so cheap lanes are visible during scouting. To evaluate ARM/Graviton savings, run `sweetspot scout --preset smallest --observed-summaries ...` or `sweetspot scout --preset mixed --observed-summaries ...`, then opt into the separate ARM queue only after a canary proves the worker image and native dependencies are compatible.
 - The committed `.terraform.lock.hcl` is part of the reproducibility contract; CI runs `tofu init -lockfile=readonly`, `tofu fmt`, and `tofu validate`.
 - For production, pass explicit private `subnet_ids` and set `require_explicit_subnets = true` so the module does not silently use every subnet in the selected/default VPC.
 - If `security_group_ids` is empty, the module creates a dedicated no-ingress security group. Set `create_no_ingress_security_group = false` only when intentionally falling back to the VPC default security group.
@@ -69,6 +69,7 @@ create_arm_spot_queue = true
 worker_image_uri_arm = "ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/my-sweetspot-worker-arm64:latest"
 
 spot_arm_instance_types = [
+  "c7g.medium", "c6g.medium",
   "c7g.large", "c7g.xlarge", "c7g.2xlarge",
   "m7g.large", "m7g.xlarge", "m7g.2xlarge",
 ]
@@ -76,3 +77,5 @@ max_vcpus_spot_arm = 64
 ```
 
 The existing `batch_spot_queue` / `worker_job_definition` outputs remain the default x86 lane. Use `batch_spot_arm_queue` and `worker_arm_job_definition` for ARM canaries or ARM production lanes, then model x86 and ARM as separate `sweetspot lane-manager` lanes with per-lane `instance_types`. Only place x86 and ARM types in the same Batch compute environment when the worker image is verified multi-arch and all native dependencies work on both architectures.
+
+For 1 vCPU / 2 GiB medium lanes (`c7a.medium`, `c7g.medium`, `c6g.medium`), do not request the full 2048 MiB in the Batch job definition: ECS/Batch needs host memory headroom. Start canaries around 1536 MiB and raise only if workload telemetry proves it is safe.

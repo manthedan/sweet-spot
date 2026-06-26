@@ -113,6 +113,9 @@ variable "spot_instance_types" {
   type        = list(string)
   description = "Broad x86-compatible instance list for the default Spot queue. Keep this x86-only unless your worker image and dependencies are verified multi-arch."
   default = [
+    # c7a.medium is a cheap 1 vCPU / 2 GiB x86 lane. Workers on 2 GiB
+    # instances must request less than full host memory, for example 1536 MiB.
+    "c7a.medium",
     "c5.large", "c5.xlarge", "c5.2xlarge", "c5.4xlarge",
     "c6i.large", "c6i.xlarge", "c6i.2xlarge", "c6i.4xlarge",
     "c6a.large", "c6a.xlarge", "c6a.2xlarge", "c6a.4xlarge",
@@ -133,6 +136,9 @@ variable "spot_arm_instance_types" {
   type        = list(string)
   description = "Broad ARM/Graviton instance list for the optional ARM Spot queue. Used only when create_arm_spot_queue=true."
   default = [
+    # Medium Graviton lanes are often the cheapest useful first canaries.
+    # Use a multi-arch/ARM-verified image and reserve less than 2 GiB memory.
+    "c7g.medium", "c6g.medium",
     "c6g.large", "c6g.xlarge", "c6g.2xlarge", "c6g.4xlarge",
     "c7g.large", "c7g.xlarge", "c7g.2xlarge", "c7g.4xlarge",
     "m6g.large", "m6g.xlarge", "m6g.2xlarge", "m6g.4xlarge",
