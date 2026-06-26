@@ -1817,7 +1817,33 @@ class InitCommandTests(unittest.TestCase):
             example["aws"]["auth"]["profile"],
         ]
 
-    def test_init_config_writes_project_context_only(self) -> None:
+    def _starter_bundle_paths(self) -> list[str]:
+        return [
+            SWEETSPOT_CONFIG_PATH,
+            SWEETSPOT_DOC_PATH,
+            JOB_SPEC_PATH,
+            DEPLOYMENT_TEMPLATE_PATH,
+            WORKER_NOTES_PATH,
+            WORKER_SCAFFOLD_PATH,
+            INFRA_VARS_STUB_PATH,
+            NEXT_STEPS_PATH,
+        ]
+
+    def _assert_init_created_starter_bundle(self, project_dir: Path, output: str) -> None:
+        self.assertIn("created: ", output)
+        for relative_path in self._starter_bundle_paths():
+            artifact = project_dir / relative_path
+            self.assertTrue(artifact.exists(), f"expected generated artifact {relative_path}")
+            self.assertIn(relative_path, output)
+
+        plan_out = io.StringIO()
+        with contextlib.redirect_stdout(plan_out):
+            self.assertEqual(main(["plan", str(project_dir / JOB_SPEC_PATH)]), 0)
+        plan = json.loads(plan_out.getvalue())
+        self.assertEqual(plan["schema"], "sweetspot.plan.v1")
+        self.assertEqual(plan["status"], "blocked")
+
+    def test_init_config_writes_starter_bundle_and_plan_compatible_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             out = io.StringIO()
@@ -1829,44 +1855,37 @@ class InitCommandTests(unittest.TestCase):
                 self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)]), 0)
 
             self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), load_setup(ROOT / "examples" / "setup.example.yaml"))
-            self.assertTrue((project_dir / SWEETSPOT_DOC_PATH).exists())
-            self.assertFalse((project_dir / JOB_SPEC_PATH).exists())
-            self.assertFalse((project_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
-            self.assertFalse((project_dir / WORKER_NOTES_PATH).exists())
-            self.assertFalse((project_dir / WORKER_SCAFFOLD_PATH).exists())
-            self.assertFalse((project_dir / INFRA_VARS_STUB_PATH).exists())
-            self.assertFalse((project_dir / NEXT_STEPS_PATH).exists())
-
-        stdout = out.getvalue()
-        self.assertIn("SweetSpot project context initialized", stdout)
-        self.assertIn(SWEETSPOT_CONFIG_PATH, stdout)
-        self.assertIn(SWEETSPOT_DOC_PATH, stdout)
-        self.assertIn("no AWS resources or secrets were created", stdout)
+            self._assert_init_created_starter_bundle(project_dir, out.getvalue())
 
     def test_init_interactive_converges_with_config_output(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_dir = Path(tmpdir)
-            interactive_dir = base_dir / "interactive"
-            config_dir = base_dir / "config"
+        with tempfile.TemporaryDirectory() as config_tmp, tempfile.TemporaryDirectory() as prompt_tmp:
+            config_dir = Path(config_tmp)
+            prompt_dir = Path(prompt_tmp)
+            config_out = io.StringIO()
+            prompt_out = io.StringIO()
 
             with (
                 patch("sweetspot.cli.boto3.client", side_effect=AssertionError("init must not call AWS clients")),
                 patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("init must not create AWS sessions")),
-                contextlib.redirect_stdout(io.StringIO()),
-                patch("builtins.input", side_effect=self._example_prompt_answers()),
+                contextlib.redirect_stdout(config_out),
             ):
-                self.assertEqual(main(["init", "--project-dir", str(interactive_dir)]), 0)
-            with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(config_dir)]), 0)
 
-            self.assertEqual(setup_to_dict(load_setup(interactive_dir / SWEETSPOT_CONFIG_PATH)), setup_to_dict(load_setup(config_dir / SWEETSPOT_CONFIG_PATH)))
-            self.assertEqual((interactive_dir / SWEETSPOT_DOC_PATH).read_text(), (config_dir / SWEETSPOT_DOC_PATH).read_text())
-            self.assertFalse((interactive_dir / JOB_SPEC_PATH).exists())
-            self.assertFalse((interactive_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
-            self.assertFalse((interactive_dir / WORKER_NOTES_PATH).exists())
-            self.assertFalse((interactive_dir / WORKER_SCAFFOLD_PATH).exists())
-            self.assertFalse((interactive_dir / INFRA_VARS_STUB_PATH).exists())
-            self.assertFalse((interactive_dir / NEXT_STEPS_PATH).exists())
+            answers = iter(self._example_prompt_answers())
+            with (
+                patch("builtins.input", side_effect=lambda _prompt="": next(answers)),
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("init must not call AWS clients")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("init must not create AWS sessions")),
+                contextlib.redirect_stdout(prompt_out),
+            ):
+                self.assertEqual(main(["init", "--project-dir", str(prompt_dir)]), 0)
+
+            self._assert_init_created_starter_bundle(config_dir, config_out.getvalue())
+            self._assert_init_created_starter_bundle(prompt_dir, prompt_out.getvalue())
+            self.assertEqual(
+                {relative_path: (config_dir / relative_path).read_text() for relative_path in self._starter_bundle_paths()},
+                {relative_path: (prompt_dir / relative_path).read_text() for relative_path in self._starter_bundle_paths()},
+            )
 
     def test_init_interactive_missing_required_value_fails_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1913,16 +1932,34 @@ class InitCommandTests(unittest.TestCase):
             self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
             self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
 
-    def test_init_existing_project_context_conflict_names_blocked_files(self) -> None:
+    def test_init_existing_generated_starter_artifact_conflict_names_blocked_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)]), 0)
-
-            with self.assertRaisesRegex(SystemExit, r"\.sweetspot/sweetspot\.yaml") as ctx:
+            blocked = project_dir / DEPLOYMENT_TEMPLATE_PATH
+            blocked.parent.mkdir(parents=True, exist_ok=True)
+            blocked.write_text("existing deployment template\n")
+            with self.assertRaisesRegex(SystemExit, DEPLOYMENT_TEMPLATE_PATH) as ctx:
                 main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)])
 
-        self.assertIn(".sweetspot/SWEETSPOT.md", str(ctx.exception))
+            self.assertIn("project context files already exist", str(ctx.exception))
+            self.assertIn(DEPLOYMENT_TEMPLATE_PATH, str(ctx.exception))
+            self.assertEqual(blocked.read_text(), "existing deployment template\n")
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+
+    def test_init_existing_generated_starter_artifact_overwrite_allows_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            blocked = project_dir / DEPLOYMENT_TEMPLATE_PATH
+            blocked.parent.mkdir(parents=True, exist_ok=True)
+            blocked.write_text("existing deployment template\n")
+            out = io.StringIO()
+
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir), "--overwrite"]), 0)
+
+            self._assert_init_created_starter_bundle(project_dir, out.getvalue())
+            self.assertNotEqual(blocked.read_text(), "existing deployment template\n")
+
 
 
 class ConfigTests(unittest.TestCase):
