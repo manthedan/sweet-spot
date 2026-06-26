@@ -24,7 +24,7 @@ Repository = "https://github.com/manthedan/sweet-spot"
 Issues = "https://github.com/manthedan/sweet-spot/issues"
 
 [project.optional-dependencies]
-dev = ["mypy==1.14.1", "ruff==0.8.6"]
+dev = ["mypy==1.14.1", "ruff==0.8.6", "types-PyYAML==6.0.12.20260518"]
 
 [project.scripts]
 sweetspot = "sweetspot.cli:main"

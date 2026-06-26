@@ -158,7 +158,9 @@ def validate_setup(data: Any) -> SweetSpotProject:
         raise SetupSpecError("schema", f"must be {SETUP_SCHEMA_V1!r}")
 
     _required_mapping(data, "project")
-    project = ProjectInfo(name=_required_str(data, "project.name"), description=_optional_str(data, "project.description", default=""))
+    project_description = _optional_str(data, "project.description", default="")
+    assert project_description is not None
+    project = ProjectInfo(name=_required_str(data, "project.name"), description=project_description)
 
     _required_mapping(data, "workload")
     input_manifest = _required_s3_uri(data, "workload.input_manifest")
