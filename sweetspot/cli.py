@@ -72,7 +72,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_join, s3_upload_text
-from .setup import SetupSpecError, load_setup, validate_setup, write_project_context
+from .setup import SetupSpecError, doctor_project, load_setup, validate_setup, write_project_context
 from .task_model import default_done_s3, parse_allowed_s3_prefixes
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_worker_timing
 
@@ -4618,15 +4618,22 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
+def cmd_doctor_project(args: argparse.Namespace) -> int:
+    report = doctor_project(args.project_dir)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,init,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,init,doctor,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
     print("  init      Initialize local SweetSpot project context from setup YAML")
+    print("  doctor    Validate local generated .sweetspot project context")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")
     print("  monitor   Emit non-blocking status/finalize checkpoint commands")
@@ -5124,6 +5131,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--project-dir", type=Path, default=Path("."), help="Project root where .sweetspot/ files will be written")
     p.add_argument("--overwrite", action="store_true", help="Replace existing .sweetspot/sweetspot.yaml and .sweetspot/SWEETSPOT.md")
     p.set_defaults(func=cmd_init)
+
+    if prog == "sweetspot":
+        p = _add_parser_with_examples(
+            sub,
+            "doctor",
+            help="Validate local generated .sweetspot project context",
+            examples="  sweetspot doctor project --project-dir .sweetspot --format json",
+        )
+        doctor_sub = p.add_subparsers(dest="doctor_cmd", required=True)
+        project = doctor_sub.add_parser("project", help="Validate a local generated .sweetspot setup bundle")
+        project.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
+        project.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported in this milestone")
+        project.set_defaults(func=cmd_doctor_project)
 
     p = _add_parser_with_examples(
         sub,
@@ -5650,31 +5670,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--completion-marker-s3")
     p.set_defaults(func=cmd_s3_delete_prefix)
 
-    p = _add_parser_with_examples(
-        sub,
-        "doctor",
-        help=argparse.SUPPRESS,
-        examples="  sweetspot admin doctor --profile prod --region us-west-2 --queue-url https://sqs... --job-queue jq --job-definition jd --s3-prefix s3://bucket/run",
-    )
-    p.add_argument("--profile")
-    p.add_argument("--region")
-    p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
-    p.add_argument("--dlq-url")
-    p.add_argument("--job-queue")
-    p.add_argument("--job-definition")
-    p.add_argument("--log-group")
-    p.add_argument("--validate-batch-metrics", action="store_true", help="Check CloudWatch AWS/Batch JobQueue metric dimensions for this account/Region")
-    p.add_argument("--check-run-queue-create", action="store_true", help="Use IAM simulation to preflight permissions needed for controller-created per-run SQS queues")
-    p.add_argument("--run-queue-name", help="Queue name to use with --check-run-queue-create")
-    p.add_argument("--run-queue-dlq-url", help="DLQ URL whose redrive allow policy may need updates for a controller-created run queue")
-    p.add_argument("--s3-prefix", action="append", default=[], help="S3 prefix to validate with ListBucket; repeatable")
-    p.add_argument("--write-probe", action="store_true", help="Also write/delete a tiny object under each --s3-prefix")
-    p.add_argument("--visibility-timeout", type=int, default=1800)
-    p.add_argument("--heartbeat-seconds", type=int, default=300)
-    p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS)
-    p.add_argument("--redact-regex", action="append", default=[], help="Validate worker log redaction regexes")
-    p.add_argument("--format", choices=["json", "table"], default="json")
-    p.set_defaults(func=cmd_doctor)
+    if prog == "sweetspot admin":
+        p = _add_parser_with_examples(
+            sub,
+            "doctor",
+            help=argparse.SUPPRESS,
+            examples="  sweetspot admin doctor --profile prod --region us-west-2 --queue-url https://sqs... --job-queue jq --job-definition jd --s3-prefix s3://bucket/run",
+        )
+        p.add_argument("--profile")
+        p.add_argument("--region")
+        p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+        p.add_argument("--dlq-url")
+        p.add_argument("--job-queue")
+        p.add_argument("--job-definition")
+        p.add_argument("--log-group")
+        p.add_argument("--validate-batch-metrics", action="store_true", help="Check CloudWatch AWS/Batch JobQueue metric dimensions for this account/Region")
+        p.add_argument("--check-run-queue-create", action="store_true", help="Use IAM simulation to preflight permissions needed for controller-created per-run SQS queues")
+        p.add_argument("--run-queue-name", help="Queue name to use with --check-run-queue-create")
+        p.add_argument("--run-queue-dlq-url", help="DLQ URL whose redrive allow policy may need updates for a controller-created run queue")
+        p.add_argument("--s3-prefix", action="append", default=[], help="S3 prefix to validate with ListBucket; repeatable")
+        p.add_argument("--write-probe", action="store_true", help="Also write/delete a tiny object under each --s3-prefix")
+        p.add_argument("--visibility-timeout", type=int, default=1800)
+        p.add_argument("--heartbeat-seconds", type=int, default=300)
+        p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS)
+        p.add_argument("--redact-regex", action="append", default=[], help="Validate worker log redaction regexes")
+        p.add_argument("--format", choices=["json", "table"], default="json")
+        p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("dlq", help=argparse.SUPPRESS)
     p.add_argument("--profile")

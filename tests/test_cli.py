@@ -132,9 +132,11 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,init,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
+        self.assertIn("{version,init,doctor,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
         self.assertIn("init", text)
         self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
+        self.assertIn("doctor", text)
+        self.assertIn("Validate local generated .sweetspot project context", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -168,6 +170,57 @@ class AdminCommandAliasTests(unittest.TestCase):
             main(["admin", "enqueue-jsonl", "--help"])
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("usage: sweetspot admin enqueue-jsonl", out.getvalue())
+
+
+class ProjectDoctorCliTests(unittest.TestCase):
+    def test_doctor_project_valid_init_outputs_json_without_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("project doctor must not call boto3.client")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("project doctor must not call boto3.Session")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["doctor", "project", "--project-dir", str(project_root / ".sweetspot"), "--format", "json"]), 0)
+
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.project.doctor.v1")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "warning")
+        self.assertEqual(report["summary"]["checks"]["fail"], 0)
+        self.assertGreater(report["summary"]["checks"]["pass"], 0)
+        self.assertEqual({check["name"] for check in report["checks"]}, {"setup_config", "generated_artifacts", "planner_job", "secret_scan", "placeholder_review"})
+
+    def test_doctor_project_invalid_state_exits_nonzero_with_json_without_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / ".sweetspot"
+            project_dir.mkdir()
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("project doctor must not call boto3.client")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("project doctor must not call boto3.Session")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["doctor", "project", "--project-dir", str(project_dir), "--format", "json"]), 1)
+
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "fail")
+        codes = {finding["code"] for check in report["checks"] for finding in check["findings"]}
+        self.assertIn("missing_setup_config", codes)
+        self.assertIn("missing_job_artifact", codes)
+
+    def test_admin_doctor_remains_live_aws_command(self) -> None:
+        with (
+            patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("admin doctor still constructs a boto3 session")),
+            self.assertRaisesRegex(AssertionError, "admin doctor still constructs a boto3 session"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            main(["admin", "doctor", "--format", "json"])
 
 
 class PlanCommandTests(unittest.TestCase):
