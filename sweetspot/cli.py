@@ -72,7 +72,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_join, s3_upload_text
-from .setup import JOB_SPEC_PATH, DEPLOYMENT_TEMPLATE_PATH, INFRA_VARS_STUB_PATH, NEXT_STEPS_PATH, SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH, WORKER_NOTES_PATH, WORKER_SCAFFOLD_PATH, SetupSpecError, load_setup, validate_setup, write_project_context
+from .setup import SetupSpecError, load_setup, validate_setup, write_project_context
 from .task_model import default_done_s3, parse_allowed_s3_prefixes
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_worker_timing
 

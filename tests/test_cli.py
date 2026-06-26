@@ -133,6 +133,8 @@ class AdminCommandAliasTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
         self.assertIn("{version,init,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
+        self.assertIn("init", text)
+        self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -1819,7 +1821,11 @@ class InitCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("init must not call AWS clients")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("init must not create AWS sessions")),
+                contextlib.redirect_stdout(out),
+            ):
                 self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)]), 0)
 
             self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), load_setup(ROOT / "examples" / "setup.example.yaml"))
@@ -1843,7 +1849,12 @@ class InitCommandTests(unittest.TestCase):
             interactive_dir = base_dir / "interactive"
             config_dir = base_dir / "config"
 
-            with contextlib.redirect_stdout(io.StringIO()), patch("builtins.input", side_effect=self._example_prompt_answers()):
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("init must not call AWS clients")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("init must not create AWS sessions")),
+                contextlib.redirect_stdout(io.StringIO()),
+                patch("builtins.input", side_effect=self._example_prompt_answers()),
+            ):
                 self.assertEqual(main(["init", "--project-dir", str(interactive_dir)]), 0)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(config_dir)]), 0)
