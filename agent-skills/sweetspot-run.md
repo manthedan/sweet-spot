@@ -1,6 +1,6 @@
 ---
 name: sweetspot-run
-description: 'Use the simplified SweetSpot planner/controller workflow: JobSpec, plan, run, status, repair, and cancel. Prefer this over lower-level phase commands for new runs.'
+description: 'Use the simplified SweetSpot planner/controller workflow: JobSpec, plan, run, status, finish, explain/postmortem, repair, and cancel. Prefer this over lower-level phase commands for new runs.'
 ---
 
 # Skill: sweetspot-run
@@ -17,7 +17,10 @@ sweetspot run job.json --artifact-dir artifacts/RUN_ID \
   --input-manifest-jsonl manifest.jsonl \
   --apply
 sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command
-sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --output-prefix s3://bucket/runs/RUN_ID
+sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state
+sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready
+sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format text
+sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format markdown
 sweetspot repair RUN_ID --tasks-jsonl artifacts/RUN_ID/production_tasks.jsonl \
   --task-status-jsonl artifacts/RUN_ID/finalizer/task_status.jsonl \
   --job-queue batch-queue
@@ -105,12 +108,16 @@ Legacy `--queue-url`/`--batch-job-queue`/`--job-definition` production targets r
 
 For production, prefer a run-owned queue: pass `--dedicated-run-queue --create-run-queue` to let the controller create/verify a tagged per-run SQS queue and bind production workers to that run-owned URL, so SQS depth is a valid run-specific backlog signal. Preflight operator IAM with `sweetspot admin doctor --check-run-queue-create --run-queue-name NAME` for `sqs:CreateQueue`, queue tagging, redrive-policy updates, and any DLQ redrive-allow-policy changes. If the operator cannot create queues, stop and use a pre-provisioned empty run-scoped queue; document the fallback explicitly, set the visibility timeout from the Plan, and do not silently reuse a canary/shared queue with stale messages.
 
-Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. For interactive agent sessions, use `--kickoff-only` for production launch after the initial Plan-sized worker wave, then hand monitoring to `sweetspot monitor RUN_ID --emit-command` / `sweetspot status RUN_ID --output-prefix ...` plus a scheduled/CI checkpoint. Do not keep the foreground agent blocked in a long poll unless actively diagnosing. For unattended operators, `--reconcile-until-drained --reconcile-rounds N --reconcile-interval-seconds S` turns bounded reconciliation into a watch loop that stops early only after run-scoped backlog and active workers both drain; rerun with a larger round limit to extend an already-completed watch. After workers have had time to finish, rerun the same production apply command with `--finalize` to stream done-marker validation into `artifacts/RUN_ID/finalizer/` and update the `finalize` phase in `run_state.json`; uploading manifests/READY remains explicit with `--finalize-upload` and `--finalize-publish-ready`.
+Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. For interactive agent sessions, use `--kickoff-only` for production launch after the initial Plan-sized worker wave, then hand monitoring to `sweetspot monitor RUN_ID --emit-command` / `sweetspot status RUN_ID --from-state` plus a scheduled/CI checkpoint. Do not keep the foreground agent blocked in a long poll unless actively diagnosing. For unattended operators, `--reconcile-until-drained --reconcile-rounds N --reconcile-interval-seconds S` turns bounded reconciliation into a watch loop that stops early only after run-scoped backlog and active workers both drain; rerun with a larger round limit to extend an already-completed watch. After workers have had time to finish, use `sweetspot finish RUN_ID --from-state --publish-ready` to run the drain checks, finalizer, manifest upload, and READY publish from persisted `run_state.json`; use `sweetspot explain RUN_ID --from-state` / `sweetspot postmortem RUN_ID --from-state` for closeout reporting.
 
-## Status, repair, and cancel
+## Status, closeout, repair, and cancel
 
 - `sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command` is the preferred way to generate non-blocking scheduler/CI checkpoint commands.
-- `sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID` is safe and local by default. It calls AWS when AWS flags are provided; with explicit `--output-prefix`, it counts S3 done markers and reports completion fraction/ETA.
+- `sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state` reconstructs queue, DLQ, Batch queue, job-name prefix, output prefix, and task artifacts from `run_state.json`; it calls AWS only for the recovered queue/Batch/S3 checks.
+- `sweetspot finalize RUN_ID --artifact-dir artifacts/RUN_ID --from-state` is the explicit state-driven finalizer path when you do not want the full finish checklist.
+- `sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready` runs the production drain checks before finalization/READY and writes `finish_report.json`.
+- `sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state` explains the reconstructed lifecycle state and next actions without mutating AWS.
+- `sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state` writes a JSON or Markdown closeout report from state/finalizer/finish artifacts.
 - `sweetspot repair RUN_ID ...` builds a run-scoped repair plan. Add `--apply` only after reviewing the repair JSON.
 - `sweetspot cancel RUN_ID ...` is run-scoped. Broad regex cancellation belongs to the advanced `cancel-jobs` command.
 

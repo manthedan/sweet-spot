@@ -2505,6 +2505,201 @@ def _shell_command(parts: Iterable[str | Path | None]) -> str:
     return " ".join(shlex.quote(str(p)) for p in parts if p not in (None, ""))
 
 
+def _load_optional_json(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    return loaded if isinstance(loaded, dict) else {"value": loaded}
+
+
+def _phase_digest(phase: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "name",
+        "status",
+        "task_count",
+        "sent",
+        "remaining",
+        "submitted_count",
+        "raw_desired_workers",
+        "active_matching_workers",
+        "job_name_prefix",
+        "batch_job_queue",
+        "queue_url",
+        "submission_stamp",
+        "finalizer_return_code",
+    )
+    return {key: phase.get(key) for key in keys if key in phase}
+
+
+def _lifecycle_outcome(*, run_status: dict[str, Any] | None, final_manifest: dict[str, Any] | None, finish_report: dict[str, Any] | None) -> str:
+    if finish_report is not None:
+        if finish_report.get("ok") is True:
+            return "finished"
+        if finish_report.get("blocked"):
+            return "blocked"
+    if final_manifest is not None:
+        return "finalized_complete" if final_manifest.get("complete") is True else "repair_needed"
+    status = str((run_status or {}).get("status") or "unknown")
+    if status == "complete":
+        return "ready_to_finish"
+    if status in {"repair_needed", "invalid_artifacts"}:
+        return status
+    return "in_progress" if status in {"incomplete", "empty"} else status
+
+
+def _lifecycle_next_actions(context: RunContext, outcome: str) -> list[str]:
+    base: list[str | Path | None] = ["sweetspot", "status", context.run_id, "--from-state", "--artifact-dir", context.artifact_dir]
+    actions = [_shell_command(base)]
+    if outcome in {"ready_to_finish", "in_progress", "blocked", "unknown"}:
+        actions.append(_shell_command(["sweetspot", "finish", context.run_id, "--from-state", "--artifact-dir", context.artifact_dir, "--dry-run"]))
+    if outcome in {"repair_needed", "invalid_artifacts"}:
+        actions.append("Inspect finalizer repair_tasks_jsonl, then run `sweetspot repair` with the run-scoped queue/job settings.")
+    if outcome in {"finished", "finalized_complete"}:
+        actions.append("Run conservative cleanup review before deleting messages or changing Batch capacity; do not restore compute limits unless a pre-run baseline was recorded.")
+    return actions
+
+
+def _build_lifecycle_report(context: RunContext) -> dict[str, Any]:
+    run_report = _run_status_report(context.run_id, context.artifact_dir)
+    final_manifest = _load_optional_json(context.final_manifest_json)
+    finish_report = _load_optional_json(context.finish_report_json)
+    phases_raw = context.run_state.get("phases")
+    phases = [_phase_digest(phase) for phase in phases_raw if isinstance(phase, dict)] if isinstance(phases_raw, list) else []
+    finalizer = None
+    if final_manifest is not None:
+        finalizer = {
+            "final_manifest_json": str(context.final_manifest_json) if context.final_manifest_json else None,
+            "finalized_at": final_manifest.get("finalized_at"),
+            "task_count": final_manifest.get("task_count"),
+            "done_count": final_manifest.get("done_count"),
+            "output_count": final_manifest.get("output_count"),
+            "missing_count": final_manifest.get("missing_count"),
+            "repair_task_count": final_manifest.get("repair_task_count"),
+            "complete": final_manifest.get("complete"),
+            "ready_s3": final_manifest.get("ready_s3"),
+            "final_manifest_s3": final_manifest.get("final_manifest_s3"),
+        }
+    finish = None
+    if finish_report is not None:
+        finish = {
+            "finish_report_json": str(context.finish_report_json) if context.finish_report_json else None,
+            "checked_at": finish_report.get("checked_at"),
+            "ok": finish_report.get("ok"),
+            "blocked": finish_report.get("blocked"),
+            "blockers": finish_report.get("blockers") or [],
+            "cleanup_recommendation": finish_report.get("cleanup_recommendation"),
+        }
+    outcome = _lifecycle_outcome(run_status=run_report, final_manifest=final_manifest, finish_report=finish_report)
+    return {
+        "schema": "sweetspot.lifecycle_explain.v1",
+        "generated_at": iso_now(),
+        "run_id": context.run_id,
+        "outcome": outcome,
+        "run_context": context.as_report(),
+        "run": run_report,
+        "phases": phases,
+        "finalizer": finalizer,
+        "finish": finish,
+        "warnings": context.warnings,
+        "next_actions": _lifecycle_next_actions(context, outcome),
+    }
+
+
+def _print_lifecycle_text(report: dict[str, Any]) -> None:
+    print(f"SweetSpot lifecycle: {report['run_id']}")
+    print(f"outcome: {report['outcome']}")
+    run = report.get("run") or {}
+    if run.get("status"):
+        print(f"artifact status: {run['status']}")
+    finalizer = report.get("finalizer") or {}
+    if finalizer:
+        print(
+            "finalizer: "
+            f"complete={finalizer.get('complete')} "
+            f"tasks={finalizer.get('task_count')} "
+            f"done={finalizer.get('done_count')} "
+            f"outputs={finalizer.get('output_count')} "
+            f"missing={finalizer.get('missing_count')}"
+        )
+        if finalizer.get("ready_s3"):
+            print(f"ready: {finalizer['ready_s3']}")
+    finish = report.get("finish") or {}
+    if finish:
+        print(f"finish: ok={finish.get('ok')} blocked={finish.get('blocked')}")
+        for blocker in finish.get("blockers") or []:
+            print(f"  blocker: {blocker.get('code')}")
+    print("next actions:")
+    for action in report.get("next_actions") or []:
+        print(f"- {action}")
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    if not bool(getattr(args, "from_state", False)):
+        raise SystemExit("explain currently requires --from-state")
+    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    report = _build_lifecycle_report(context)
+    if args.format == "text":
+        _print_lifecycle_text(report)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _postmortem_markdown(report: dict[str, Any]) -> str:
+    finalizer = report.get("finalizer") or {}
+    finish = report.get("finish") or {}
+    run = report.get("run") or {}
+    lines = [
+        f"# SweetSpot postmortem: {report['run_id']}",
+        "",
+        f"- Outcome: `{report['outcome']}`",
+        f"- Generated at: `{report['generated_at']}`",
+        f"- Artifact status: `{run.get('status')}`",
+    ]
+    if finalizer:
+        lines.extend(
+            [
+                f"- Finalizer complete: `{finalizer.get('complete')}`",
+                f"- Tasks / done / outputs / missing: `{finalizer.get('task_count')} / {finalizer.get('done_count')} / {finalizer.get('output_count')} / {finalizer.get('missing_count')}`",
+            ]
+        )
+        if finalizer.get("ready_s3"):
+            lines.append(f"- READY: `{finalizer['ready_s3']}`")
+    if finish:
+        lines.append(f"- Finish ok: `{finish.get('ok')}`")
+        blockers = finish.get("blockers") or []
+        if blockers:
+            lines.append("- Blockers: " + ", ".join(str(blocker.get("code")) for blocker in blockers))
+    lines.extend(["", "## Phases", ""])
+    for phase in report.get("phases") or []:
+        lines.append(f"- `{phase.get('name')}`: `{phase.get('status')}`")
+    lines.extend(["", "## Next actions", ""])
+    for action in report.get("next_actions") or []:
+        lines.append(f"- {action}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_postmortem(args: argparse.Namespace) -> int:
+    if not bool(getattr(args, "from_state", False)):
+        raise SystemExit("postmortem currently requires --from-state")
+    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    report = _build_lifecycle_report(context)
+    report["schema"] = "sweetspot.postmortem.v1"
+    out_path = getattr(args, "out", None)
+    if out_path is None:
+        out_path = context.artifact_dir / ("postmortem.md" if args.format == "markdown" else "postmortem.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.format == "markdown":
+        text = _postmortem_markdown(report)
+        out_path.write_text(text, encoding="utf-8")
+        print(text)
+    else:
+        out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps({**report, "postmortem_json": str(out_path)}, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     status_parts: list[str | Path | None] = ["sweetspot", "status", args.run_id]
     if args.profile:
@@ -4206,11 +4401,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "finalize", "finish", "monitor", "plan", "repair", "run", "status", "version"})
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "explain", "finalize", "finish", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,finalize,finish,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,explain,finalize,finish,postmortem,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
@@ -4220,6 +4415,8 @@ def _print_primary_help() -> None:
     print("  status    Show run artifacts, queue depth, DLQ depth, active workers, and S3 progress")
     print("  finalize  Reconstruct finalization from run_state.json or explicit finalizer inputs")
     print("  finish    Run the production closeout checklist from run_state.json")
+    print("  explain   Explain reconstructed lifecycle state and next actions")
+    print("  postmortem Write a state-driven lifecycle postmortem")
     print("  repair    Dry-run/apply run-scoped repair planning")
     print("  cancel    Dry-run/apply run-scoped Batch job cancellation")
     print("  admin     List and run advanced/operator commands")
@@ -4302,6 +4499,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     },
     "enqueue-jsonl": {"allowed_s3_prefix", "artifact_dir", "profile", "queue_url", "region", "run_id", "sqs_queue_url", "submit", "tasks_jsonl"},
     "finalize": {"allow_legacy_done_markers", "artifact_dir", "dry_run", "from_state", "output_prefix", "profile", "publish_ready", "region", "run_id", "tasks_jsonl", "upload"},
+    "explain": {"artifact_dir", "format", "from_state"},
     "finish": {
         "allow_legacy_done_markers",
         "artifact_dir",
@@ -4352,6 +4550,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "visibility_timeout",
         "worker_job_name_prefix",
     },
+    "postmortem": {"artifact_dir", "format", "from_state", "out"},
     "monitor": {
         "artifact_dir",
         "canary_summary_jsonl",
@@ -4510,6 +4709,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "min_workers": ("--min-workers", False),
     "only_known_failed": ("--only-known-failed", False),
     "out_dir": ("--out-dir", False),
+    "out": ("--out", False),
     "out_jsonl": ("--out-jsonl", False),
     "out_production_tasks_jsonl": ("--out-production-tasks-jsonl", False),
     "output_prefix": ("--output-prefix", False),
@@ -4876,6 +5076,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--use-listing-index", action="store_true")
     p.add_argument("--preload-s3-prefix", action="append", default=[])
     p.set_defaults(func=cmd_finish)
+
+    p = _add_parser_with_examples(
+        sub,
+        "explain",
+        help="Explain reconstructed lifecycle state and next actions from run_state.json",
+        examples="  sweetspot explain run-1 --from-state\n  sweetspot explain run-1 --from-state --format text",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory containing run_state.json; defaults to artifacts/RUN_ID")
+    p.add_argument("--from-state", action="store_true", help="Load lifecycle facts from run_state.json")
+    p.add_argument("--format", choices=["json", "text"], default="json")
+    p.set_defaults(func=cmd_explain)
+
+    p = _add_parser_with_examples(
+        sub,
+        "postmortem",
+        help="Write a state-driven lifecycle postmortem from run_state.json and finalizer/finish artifacts",
+        examples="  sweetspot postmortem run-1 --from-state\n  sweetspot postmortem run-1 --from-state --format markdown",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory containing run_state.json; defaults to artifacts/RUN_ID")
+    p.add_argument("--from-state", action="store_true", help="Load lifecycle facts from run_state.json")
+    p.add_argument("--format", choices=["json", "markdown"], default="json")
+    p.add_argument("--out", type=Path, help="Output path; defaults to postmortem.json or postmortem.md in the artifact dir")
+    p.set_defaults(func=cmd_postmortem)
 
     p = sub.add_parser("worker", help=argparse.SUPPRESS)
     p.add_argument("--profile")

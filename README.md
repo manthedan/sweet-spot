@@ -122,7 +122,11 @@ The primary agent interface uses a high-level controller workflow. Lower-level o
 | `sweetspot plan` | Generate canary and production plans from a JobSpec. | `--input-manifest-jsonl`, `--out-canary-tasks-jsonl`, `--canary-summary-jsonl` |
 | `sweetspot run` | Execute canaries, submit production workers, reconcile. | `--deployment`, `--apply`, `--kickoff-only`, `--reconcile-until-drained`, `--finalize` |
 | `sweetspot monitor RUN_ID` | Emit non-blocking scheduler/CI status and finalize checkpoint commands. | `--emit-command`, `--interval`, `--output-prefix` |
-| `sweetspot status RUN_ID` | Summarize run artifacts, S3 done-marker progress, and active Batch workers. | `--format table`, `--queue-url`, `--job-queue`, `--output-prefix` |
+| `sweetspot status RUN_ID` | Summarize run artifacts, S3 done-marker progress, and active Batch workers. | `--from-state`, `--format table`, `--queue-url`, `--job-queue`, `--output-prefix` |
+| `sweetspot finalize RUN_ID` | Reconstruct finalization from `run_state.json` and persisted production tasks. | `--from-state`, `--upload`, `--publish-ready`, `--dry-run` |
+| `sweetspot finish RUN_ID` | Run the drain → finalizer → READY closeout checklist from `run_state.json`. | `--from-state`, `--publish-ready`, `--dry-run` |
+| `sweetspot explain RUN_ID` | Explain reconstructed lifecycle state and next actions without mutating AWS. | `--from-state`, `--format text` |
+| `sweetspot postmortem RUN_ID` | Write a JSON or Markdown postmortem from state/finalizer/finish artifacts. | `--from-state`, `--format markdown`, `--out` |
 | `sweetspot repair RUN_ID` | Build and optionally apply run-scoped repair plans. | `--task-status-jsonl`, `--apply` |
 | `sweetspot cancel RUN_ID` | Safely cancel run-scoped Batch jobs (dry-run by default). | `--apply` |
 | `sweetspot admin enqueue-jsonl` | Validate and submit tasks to SQS. | `--queue-url`, `--tasks-jsonl`, `--submit` |
@@ -135,7 +139,7 @@ The primary agent interface uses a high-level controller workflow. Lower-level o
 
 > Always use `sweetspot admin scout --preset smallest` or `--preset mixed` before large runs to compare cheap x86 and ARM/Graviton lanes from canary telemetry. For 2 GiB medium instances, reserve less than the full host memory (for example 1536 MiB) so Batch/ECS can schedule the job. Do not steer users to `t3*`/`t4g*` small or micro lanes for managed AWS Batch: Batch rejects those burstable instance types before workers can run.
 
-Config files (`--config` or `SWEETSPOT_CONFIG`) can pre-populate common flags. All mutating commands are dry-run by default. For production launches from an interactive coding agent, prefer `sweetspot run ... --apply --kickoff-only` and then monitor with `sweetspot monitor RUN_ID --emit-command` / `sweetspot status RUN_ID --output-prefix ...` from a scheduled/CI checkpoint; reserve `--reconcile-until-drained` foreground watch loops for unattended shells or active diagnostics. Production queue creation requires `sqs:CreateQueue`/tagging/redrive permissions; preflight with `sweetspot admin doctor --check-run-queue-create --run-queue-name NAME`; if those are unavailable, use a pre-provisioned empty run-scoped queue and document the fallback before enqueueing.
+Config files (`--config` or `SWEETSPOT_CONFIG`) can pre-populate common flags. All mutating commands are dry-run by default. For production launches from an interactive coding agent, prefer `sweetspot run ... --apply --kickoff-only` and then monitor with `sweetspot monitor RUN_ID --emit-command` / `sweetspot status RUN_ID --from-state` from a scheduled/CI checkpoint; use `sweetspot finish RUN_ID --from-state --publish-ready` after queues/DLQ/Batch drain, then `sweetspot explain RUN_ID --from-state` or `sweetspot postmortem RUN_ID --from-state` for closeout reporting. Reserve `--reconcile-until-drained` foreground watch loops for unattended shells or active diagnostics. Production queue creation requires `sqs:CreateQueue`/tagging/redrive permissions; preflight with `sweetspot admin doctor --check-run-queue-create --run-queue-name NAME`; if those are unavailable, use a pre-provisioned empty run-scoped queue and document the fallback before enqueueing.
 
 ## Infrastructure
 

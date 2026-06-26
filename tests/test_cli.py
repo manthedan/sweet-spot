@@ -116,7 +116,7 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,plan,run,monitor,status,finalize,finish,repair,cancel,admin}", text)
+        self.assertIn("{version,plan,run,monitor,status,explain,finalize,finish,postmortem,repair,cancel,admin}", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -2502,6 +2502,80 @@ class FinishTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertTrue(report["blocked"])
         self.assertEqual(report["blockers"][0]["code"], "finalizer_failed")
+
+
+class LifecycleExplainPostmortemTests(unittest.TestCase):
+    def _write_finished_run(self, artifact_dir: Path) -> None:
+        artifact_dir.mkdir(parents=True)
+        tasks = artifact_dir / "production_tasks.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t0", "run_id": "run-1"}) + "\n")
+        finalizer_dir = artifact_dir / "finalizer"
+        finalizer_dir.mkdir()
+        task_status = finalizer_dir / "task_status.jsonl"
+        task_status.write_text(json.dumps({"task_id": "t0", "status": "done", "run_id": "run-1"}) + "\n")
+        final_manifest = finalizer_dir / "final_manifest.json"
+        final_manifest.write_text(
+            json.dumps(
+                {
+                    "schema": "sweetspot.final_manifest.v1",
+                    "run_id": "run-1",
+                    "finalized_at": "2026-01-01T00:00:00Z",
+                    "task_count": 1,
+                    "done_count": 1,
+                    "output_count": 1,
+                    "missing_count": 0,
+                    "repair_task_count": 0,
+                    "complete": True,
+                    "ready_s3": "s3://bucket/run-1/READY",
+                    "final_manifest_s3": "s3://bucket/run-1/manifests/final_manifest.json",
+                }
+            )
+            + "\n"
+        )
+        finish_report = artifact_dir / "finish_report.json"
+        finish_report.write_text(json.dumps({"schema": "sweetspot.finish.v1", "checked_at": "2026-01-01T00:01:00Z", "ok": True, "blocked": False, "blockers": []}) + "\n")
+        state = {
+            "schema": "sweetspot.run.v1",
+            "run_id": "run-1",
+            "status": "finalized_complete",
+            "artifacts": {
+                "production_tasks_jsonl": str(tasks),
+                "task_status_jsonl": str(task_status),
+                "final_manifest": str(final_manifest),
+            },
+            "plan": {"job": {"output_prefix": "s3://bucket/run-1"}},
+            "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+            "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker"}],
+        }
+        (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+
+    def test_explain_from_state_reports_finished_lifecycle_without_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            self._write_finished_run(artifact_dir)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["explain", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_explain.v1")
+        self.assertEqual(report["outcome"], "finished")
+        self.assertEqual(report["finalizer"]["missing_count"], 0)
+        self.assertEqual(report["finish"]["ok"], True)
+        self.assertIn("conservative cleanup review", report["next_actions"][-1])
+
+    def test_postmortem_from_state_writes_json_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            self._write_finished_run(artifact_dir)
+            out_path = artifact_dir / "pm.json"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["postmortem", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--out", str(out_path)]), 0)
+            self.assertTrue(out_path.exists())
+            written = json.loads(out_path.read_text())
+        self.assertEqual(written["schema"], "sweetspot.postmortem.v1")
+        self.assertEqual(written["outcome"], "finished")
+        self.assertEqual(written["run_context"]["final_manifest_json"].endswith("final_manifest.json"), True)
 
 
 class MonitorTests(unittest.TestCase):

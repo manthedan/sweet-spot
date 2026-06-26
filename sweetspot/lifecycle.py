@@ -18,6 +18,9 @@ class RunContext:
     production_tasks_jsonl: Path | None
     task_status_jsonl: Path | None
     repair_tasks_jsonl: Path | None
+    outputs_manifest_jsonl: Path | None
+    final_manifest_json: Path | None
+    finish_report_json: Path | None
     deployment_sha256: str | None
     region: str | None
     queue_url: str | None
@@ -37,6 +40,9 @@ class RunContext:
             "production_tasks_jsonl": str(self.production_tasks_jsonl) if self.production_tasks_jsonl else None,
             "task_status_jsonl": str(self.task_status_jsonl) if self.task_status_jsonl else None,
             "repair_tasks_jsonl": str(self.repair_tasks_jsonl) if self.repair_tasks_jsonl else None,
+            "outputs_manifest_jsonl": str(self.outputs_manifest_jsonl) if self.outputs_manifest_jsonl else None,
+            "final_manifest_json": str(self.final_manifest_json) if self.final_manifest_json else None,
+            "finish_report_json": str(self.finish_report_json) if self.finish_report_json else None,
             "region": self.region,
             "queue_url": self.queue_url,
             "dlq_url": self.dlq_url,
@@ -156,6 +162,13 @@ def load_run_context(run_id: str | None, artifact_dir: Path | None) -> RunContex
     repair_tasks = _resolve_existing_path(artifacts.get("repair_tasks_jsonl"), artifact_dir=artifact_dir)
     if repair_tasks is None:
         repair_tasks = _first_existing_path([artifact_dir / "repair_tasks.jsonl", artifact_dir / "finalizer" / "repair_tasks.jsonl", artifact_dir / "repair" / "repair_tasks.jsonl"])
+    outputs_manifest = _resolve_existing_path(artifacts.get("outputs_manifest"), artifact_dir=artifact_dir)
+    if outputs_manifest is None:
+        outputs_manifest = _first_existing_path([artifact_dir / "outputs.jsonl", artifact_dir / "finalizer" / "outputs.jsonl"])
+    final_manifest = _resolve_existing_path(artifacts.get("final_manifest"), artifact_dir=artifact_dir)
+    if final_manifest is None:
+        final_manifest = _first_existing_path([artifact_dir / "final_manifest.json", artifact_dir / "finalizer" / "final_manifest.json"])
+    finish_report = _first_existing_path([artifact_dir / "finish_report.json"])
 
     warnings: list[dict[str, Any]] = []
     if production_tasks is None:
@@ -172,6 +185,9 @@ def load_run_context(run_id: str | None, artifact_dir: Path | None) -> RunContex
         production_tasks_jsonl=production_tasks,
         task_status_jsonl=task_status,
         repair_tasks_jsonl=repair_tasks,
+        outputs_manifest_jsonl=outputs_manifest,
+        final_manifest_json=final_manifest,
+        finish_report_json=finish_report,
         deployment_sha256=_first_str(production_binding.get("deployment_sha256"), controller.get("deployment_sha256")),
         region=_first_str(target.get("region"), _nested(production_binding, "selected", "region"), submit_phase.get("region"), job.get("region")),
         queue_url=_first_str(run_queue.get("queue_url"), target.get("sqs_queue_url"), enqueue_phase.get("queue_url"), submit_phase.get("queue_url")),
