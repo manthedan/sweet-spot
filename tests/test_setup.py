@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from sweetspot.planner import FORBIDDEN_PRIMARY_JOB_SPEC_KEYS, load_job_spec
 from sweetspot.setup import (
     ARCHITECTURES,
     DEPLOYMENT_TEMPLATE_PATH,
@@ -19,6 +21,7 @@ from sweetspot.setup import (
     SetupSpecError,
     dump_setup,
     load_setup,
+    render_starter_job_spec,
     render_sweetspot_doc,
     scan_for_secrets,
     setup_to_dict,
@@ -182,7 +185,7 @@ class SetupModelTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 load_setup(path)
 
-    def test_write_project_context_round_trips_and_renders_sweetspot_doc_only(self) -> None:
+    def test_write_project_context_round_trips_and_renders_sweetspot_doc_and_job_spec(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -191,10 +194,9 @@ class SetupModelTests(unittest.TestCase):
 
             self.assertEqual(
                 written,
-                [project_dir / SWEETSPOT_CONFIG_PATH, project_dir / SWEETSPOT_DOC_PATH],
+                [project_dir / SWEETSPOT_CONFIG_PATH, project_dir / SWEETSPOT_DOC_PATH, project_dir / JOB_SPEC_PATH],
             )
             self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), config)
-            self.assertFalse((project_dir / JOB_SPEC_PATH).exists())
             self.assertFalse((project_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
             self.assertFalse((project_dir / WORKER_NOTES_PATH).exists())
             self.assertFalse((project_dir / WORKER_SCAFFOLD_PATH).exists())
@@ -202,8 +204,24 @@ class SetupModelTests(unittest.TestCase):
             self.assertFalse((project_dir / NEXT_STEPS_PATH).exists())
 
             doc = (project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8")
+            job_path = project_dir / JOB_SPEC_PATH
+            job_text = job_path.read_text(encoding="utf-8")
+            loaded_job = load_job_spec(job_path)
 
         self.assertEqual(doc, render_sweetspot_doc(config))
+        self.assertEqual(job_text, render_starter_job_spec(config))
+        self.assertTrue(job_text.endswith("\n"))
+        self.assertEqual(json.loads(job_text), loaded_job)
+        self.assertEqual(loaded_job["schema"], "sweetspot.job.v1")
+        self.assertEqual(loaded_job["run_id"], "example-batch-project-starter-run")
+        self.assertEqual(loaded_job["command"], ["python", "worker.py", "--task", "{task_json}"])
+        self.assertEqual(loaded_job["input_manifest"], "s3://example-sweetspot-input/manifests/tasks.jsonl")
+        self.assertEqual(loaded_job["output_prefix"], "s3://example-sweetspot-output/runs/example/")
+        self.assertEqual(loaded_job["constraints"]["architectures"], ["x86_64"])
+        self.assertEqual(loaded_job["constraints"]["regions"], ["us-west-2"])
+        self.assertEqual(loaded_job["validation"], {"output_check": "done_marker"})
+        self.assertFalse(FORBIDDEN_PRIMARY_JOB_SPEC_KEYS.intersection(loaded_job))
+        self.assertEqual(scan_for_secrets(loaded_job), ())
         self.assertIn("example-batch-project", doc)
         self.assertIn("s3://example-sweetspot-input/manifests/tasks.jsonl", doc)
         self.assertIn("s3://example-sweetspot-output/runs/example/", doc)
@@ -234,12 +252,13 @@ class SetupModelTests(unittest.TestCase):
                 write_project_context(config, project_dir)
 
             self.assertIn(".sweetspot/SWEETSPOT.md", str(ctx.exception))
+            self.assertIn(".sweetspot/job.json", str(ctx.exception))
             self.assertEqual((project_dir / SWEETSPOT_CONFIG_PATH).read_text(encoding="utf-8"), original_config_text)
             self.assertEqual((project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8"), original_doc_text)
 
             written = write_project_context(config, project_dir, overwrite=True)
 
-        self.assertEqual([path.relative_to(project_dir).as_posix() for path in written], [SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH])
+        self.assertEqual([path.relative_to(project_dir).as_posix() for path in written], [SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH, JOB_SPEC_PATH])
 
     def test_write_project_context_rejects_secret_bearing_config_without_writes(self) -> None:
         data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
@@ -252,6 +271,7 @@ class SetupModelTests(unittest.TestCase):
 
             self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
             self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
+            self.assertFalse((project_dir / JOB_SPEC_PATH).exists())
 
 
 if __name__ == "__main__":
