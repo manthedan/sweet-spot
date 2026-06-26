@@ -87,6 +87,7 @@ from sweetspot.setup import (
     WORKER_NOTES_PATH,
     WORKER_SCAFFOLD_PATH,
     load_setup,
+    setup_to_dict,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1800,6 +1801,20 @@ class RunCommandTests(unittest.TestCase):
 
 
 class InitCommandTests(unittest.TestCase):
+    def _example_prompt_answers(self) -> list[str]:
+        example = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        return [
+            example["project"]["name"],
+            example["project"]["description"],
+            example["workload"]["input_manifest"],
+            example["workload"]["output_prefix"],
+            " ".join(example["workload"]["command"]),
+            example["workload"]["architecture"],
+            example["aws"]["region"],
+            example["aws"]["auth"]["method"],
+            example["aws"]["auth"]["profile"],
+        ]
+
     def test_init_config_writes_project_context_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -1821,6 +1836,50 @@ class InitCommandTests(unittest.TestCase):
         self.assertIn(SWEETSPOT_CONFIG_PATH, stdout)
         self.assertIn(SWEETSPOT_DOC_PATH, stdout)
         self.assertIn("no AWS resources or secrets were created", stdout)
+
+    def test_init_interactive_converges_with_config_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            interactive_dir = base_dir / "interactive"
+            config_dir = base_dir / "config"
+
+            with contextlib.redirect_stdout(io.StringIO()), patch("builtins.input", side_effect=self._example_prompt_answers()):
+                self.assertEqual(main(["init", "--project-dir", str(interactive_dir)]), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(config_dir)]), 0)
+
+            self.assertEqual(setup_to_dict(load_setup(interactive_dir / SWEETSPOT_CONFIG_PATH)), setup_to_dict(load_setup(config_dir / SWEETSPOT_CONFIG_PATH)))
+            self.assertEqual((interactive_dir / SWEETSPOT_DOC_PATH).read_text(), (config_dir / SWEETSPOT_DOC_PATH).read_text())
+            self.assertFalse((interactive_dir / JOB_SPEC_PATH).exists())
+            self.assertFalse((interactive_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
+            self.assertFalse((interactive_dir / WORKER_NOTES_PATH).exists())
+            self.assertFalse((interactive_dir / WORKER_SCAFFOLD_PATH).exists())
+            self.assertFalse((interactive_dir / INFRA_VARS_STUB_PATH).exists())
+            self.assertFalse((interactive_dir / NEXT_STEPS_PATH).exists())
+
+    def test_init_interactive_missing_required_value_fails_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            answers = self._example_prompt_answers()
+            answers[0] = ""
+
+            with patch("builtins.input", side_effect=answers), self.assertRaisesRegex(SystemExit, "invalid setup config at project.name"):
+                main(["init", "--project-dir", str(project_dir)])
+
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+            self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
+
+    def test_init_interactive_secret_like_auth_reference_fails_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            answers = self._example_prompt_answers()
+            answers[-1] = "AKIAIOSFODNN7EXAMPLE"
+
+            with patch("builtins.input", side_effect=answers), self.assertRaisesRegex(SystemExit, "invalid setup config at aws.auth.profile: secret_value_aws_access_key_id"):
+                main(["init", "--project-dir", str(project_dir)])
+
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+            self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
 
     def test_init_config_flag_is_not_treated_as_global_json_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
