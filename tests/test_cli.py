@@ -3855,12 +3855,7 @@ class DoctorTests(unittest.TestCase):
 
             def simulate_principal_policy(self, **kwargs):
                 self.calls.append(kwargs)
-                return {
-                    "EvaluationResults": [
-                        {"EvalActionName": action, "EvalResourceName": kwargs["ResourceArns"][0], "EvalDecision": "allowed"}
-                        for action in kwargs["ActionNames"]
-                    ]
-                }
+                return {"EvaluationResults": [{"EvalActionName": action, "EvalResourceName": kwargs["ResourceArns"][0], "EvalDecision": "allowed"} for action in kwargs["ActionNames"]]}
 
         fake_iam = FakeIAM()
 

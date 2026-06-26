@@ -4531,7 +4531,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait-interval-seconds", type=float, default=1.0)
     p.add_argument("--dedicated-run-queue", action="store_true", help="Allow reconciliation to treat SQS depth as run-specific backlog; use only with a fresh/dedicated queue")
     p.add_argument("--create-run-queue", action="store_true", help="With --deployment and --dedicated-run-queue, create or verify a controller-owned per-run SQS queue and bind production workers to it")
-    p.add_argument("--kickoff-only", action="store_true", help="Submit the initial Plan-sized worker wave and return immediately; useful for interactive agents/CI when external or scheduled status checks handle monitoring")
+    p.add_argument(
+        "--kickoff-only", action="store_true", help="Submit the initial Plan-sized worker wave and return immediately; useful for interactive agents/CI when external or scheduled status checks handle monitoring"
+    )
     p.add_argument("--reconcile-rounds", type=int, default=1, help="Bounded controller observation rounds after initial submission (default: 1)")
     p.add_argument("--reconcile-interval-seconds", type=float, default=0.0, help="Sleep between reconciliation rounds")
     p.add_argument("--reconcile-until-drained", action="store_true", help="With --dedicated-run-queue, continue reconciliation rounds until queue backlog and active workers drain or --reconcile-rounds is reached")
