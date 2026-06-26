@@ -4633,7 +4633,7 @@ def _print_primary_help() -> None:
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
     print("  init      Initialize local SweetSpot project context from setup YAML")
-    print("  doctor    Validate local generated .sweetspot project context")
+    print("  doctor    Validate local .sweetspot context with `doctor project`; legacy AWS checks require explicit AWS flags")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")
     print("  monitor   Emit non-blocking status/finalize checkpoint commands")
@@ -4975,8 +4975,27 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
 }
 
 
+def _first_command_for_config_extraction(argv: list[str]) -> str | None:
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--":
+            return None
+        if arg == "--config":
+            skip_next = True
+            continue
+        if arg.startswith("--config=") or arg.startswith("-"):
+            continue
+        return arg
+    return None
+
+
 def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
     config_path: Path | None = Path(os.environ["SWEETSPOT_CONFIG"]) if os.environ.get("SWEETSPOT_CONFIG") else None
+    target_command = _first_command_for_config_extraction(argv)
+    init_config_args: list[str] = []
     stripped: list[str] = []
     command: str | None = None
     i = 0
@@ -4987,12 +5006,21 @@ def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
             break
         if command is None and not arg.startswith("-"):
             command = arg
+            stripped.append(arg)
+            if command == "init" and init_config_args:
+                stripped.extend(init_config_args)
+            i += 1
+            continue
         if command == "lane-manager" or (command == "admin" and arg == "lane-manager"):
             stripped.extend(argv[i:])
             break
         if arg == "--config":
             if i + 1 >= len(argv):
                 raise SystemExit("--config requires a path")
+            if target_command == "init" and command is None:
+                init_config_args = [arg, argv[i + 1]]
+                i += 2
+                continue
             if command == "init":
                 stripped.extend([arg, argv[i + 1]])
                 i += 2
@@ -5001,6 +5029,10 @@ def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
             i += 2
             continue
         if arg.startswith("--config="):
+            if target_command == "init" and command is None:
+                init_config_args = [arg]
+                i += 1
+                continue
             if command == "init":
                 stripped.append(arg)
                 i += 1
@@ -5136,10 +5168,29 @@ def main(argv: list[str] | None = None) -> int:
         p = _add_parser_with_examples(
             sub,
             "doctor",
-            help="Validate local generated .sweetspot project context",
-            examples="  sweetspot doctor project --project-dir .sweetspot --format json",
+            help="Validate local .sweetspot context with `doctor project`; legacy AWS checks require explicit AWS flags",
+            examples="  sweetspot doctor project --project-dir .sweetspot --format json\n  sweetspot doctor --queue-url https://sqs... --job-queue jq --job-definition jd --format json",
         )
-        doctor_sub = p.add_subparsers(dest="doctor_cmd", required=True)
+        p.add_argument("--profile")
+        p.add_argument("--region")
+        p.add_argument("--queue-url", default=os.environ.get("SWEETSPOT_SQS_QUEUE_URL", ""))
+        p.add_argument("--dlq-url")
+        p.add_argument("--job-queue")
+        p.add_argument("--job-definition")
+        p.add_argument("--log-group")
+        p.add_argument("--validate-batch-metrics", action="store_true", help="Check CloudWatch AWS/Batch JobQueue metric dimensions for this account/Region")
+        p.add_argument("--check-run-queue-create", action="store_true", help="Use IAM simulation to preflight permissions needed for controller-created per-run SQS queues")
+        p.add_argument("--run-queue-name", help="Queue name to use with --check-run-queue-create")
+        p.add_argument("--run-queue-dlq-url", help="DLQ URL whose redrive allow policy may need updates for a controller-created run queue")
+        p.add_argument("--s3-prefix", action="append", default=[], help="S3 prefix to validate with ListBucket; repeatable")
+        p.add_argument("--write-probe", action="store_true", help="Also write/delete a tiny object under each --s3-prefix")
+        p.add_argument("--visibility-timeout", type=int, default=1800)
+        p.add_argument("--heartbeat-seconds", type=int, default=300)
+        p.add_argument("--task-timeout-seconds", type=float, default=SAFE_TASK_TIMEOUT_SECONDS)
+        p.add_argument("--redact-regex", action="append", default=[], help="Validate worker log redaction regexes")
+        p.add_argument("--format", choices=["json", "table"], default="json")
+        p.set_defaults(func=cmd_doctor)
+        doctor_sub = p.add_subparsers(dest="doctor_cmd", required=False)
         project = doctor_sub.add_parser("project", help="Validate a local generated .sweetspot setup bundle")
         project.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
         project.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported in this milestone")
