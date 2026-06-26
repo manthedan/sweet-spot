@@ -5727,5 +5727,121 @@ class FinalizeTests(unittest.TestCase):
             self.assertIn("s3://bucket/runs/r1/done/", manifest["existence_index_prefixes"])
 
 
+class ProjectDoctorCliIntegrationTests(unittest.TestCase):
+    def _run_main(self, argv: list[str]) -> tuple[int | str | None, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                rc = main(argv)
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def _init_project(self, tmpdir: str) -> Path:
+        project_dir = Path(tmpdir) / "project"
+        rc, stdout, stderr = self._run_main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)])
+        self.assertEqual(rc, 0, stderr or stdout)
+        return project_dir
+
+    def _doctor_report(self, project_dir: Path, *, expected_rc: int = 0) -> dict[str, object]:
+        rc, stdout, stderr = self._run_main(["doctor", "project", "--project-dir", str(project_dir / ".sweetspot"), "--format", "json"])
+        self.assertEqual(rc, expected_rc, stderr or stdout)
+        return json.loads(stdout)
+
+    def _assert_report_does_not_echo(self, report: dict[str, object], secret_text: str) -> None:
+        self.assertNotIn(secret_text, json.dumps(report, sort_keys=True))
+
+    def test_generated_bundle_smoke_plans_and_doctor_project_reports_warning_only_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = self._init_project(tmpdir)
+
+            plan_rc, plan_stdout, plan_stderr = self._run_main(["plan", str(project_dir / ".sweetspot" / "job.json")])
+            self.assertEqual(plan_rc, 0, plan_stderr or plan_stdout)
+            report = self._doctor_report(project_dir)
+
+        self.assertEqual(report["schema"], "sweetspot.project.doctor.v1")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "warning")
+        self.assertIn("project_dir", report)
+        self.assertIn("root_dir", report)
+        self.assertEqual(report["summary"]["checks"], {"pass": 4, "warning": 1, "fail": 0})
+        self.assertEqual(report["summary"]["findings"]["error"], 0)
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertEqual(set(checks), {"setup_config", "generated_artifacts", "planner_job", "secret_scan", "placeholder_review"})
+        self.assertEqual(checks["planner_job"]["status"], "pass")
+        self.assertEqual(checks["secret_scan"]["status"], "pass")
+        self.assertEqual(checks["placeholder_review"]["status"], "warning")
+        self.assertTrue(checks["placeholder_review"]["findings"])
+        self.assertTrue(all(finding["severity"] == "warning" for finding in checks["placeholder_review"]["findings"]))
+        self.assertTrue(all(finding["code"] == "review_placeholder" for finding in checks["placeholder_review"]["findings"]))
+        forbidden = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "BEGIN PRIVATE KEY"]
+        rendered_report = json.dumps(report, sort_keys=True)
+        for value in forbidden:
+            self.assertNotIn(value, rendered_report)
+
+    def test_init_rerun_without_overwrite_fails_closed_and_preserves_existing_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = self._init_project(tmpdir)
+            job_path = project_dir / ".sweetspot" / "job.json"
+            original_job = job_path.read_text(encoding="utf-8")
+
+            rc, stdout, stderr = self._run_main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)])
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("already exist", str(rc) or stderr or stdout)
+            self.assertEqual(job_path.read_text(encoding="utf-8"), original_job)
+
+    def test_doctor_project_reports_missing_artifact_invalid_job_and_sanitized_secret_findings(self) -> None:
+        secret_text = "Bearer abcdefghijklmnopqrstuvwxyz123456"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = self._init_project(tmpdir)
+            (project_dir / ".sweetspot" / "worker" / "README.md").unlink()
+            report = self._doctor_report(project_dir, expected_rc=1)
+            missing_checks = {check["name"]: check for check in report["checks"]}
+
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(missing_checks["generated_artifacts"]["status"], "fail")
+            self.assertIn("missing_generated_artifact", {finding["code"] for finding in missing_checks["generated_artifacts"]["findings"]})
+
+            self._run_main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir), "--overwrite"])
+            job_path = project_dir / ".sweetspot" / "job.json"
+            job_data = json.loads(job_path.read_text(encoding="utf-8"))
+            job_data["constraints"]["architectures"] = ["gpu"]
+            job_path.write_text(json.dumps(job_data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            invalid_report = self._doctor_report(project_dir, expected_rc=1)
+            invalid_checks = {check["name"]: check for check in invalid_report["checks"]}
+
+            self.assertFalse(invalid_report["ok"])
+            self.assertEqual(invalid_checks["planner_job"]["status"], "fail")
+            self.assertEqual(invalid_checks["planner_job"]["findings"][0]["code"], "planner_incompatible_job")
+
+            self._run_main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir), "--overwrite"])
+            notes_path = project_dir / ".sweetspot" / "worker" / "README.md"
+            notes_path.write_text(notes_path.read_text(encoding="utf-8") + f"\n{secret_text}\n", encoding="utf-8")
+            secret_report = self._doctor_report(project_dir, expected_rc=1)
+            secret_checks = {check["name"]: check for check in secret_report["checks"]}
+
+        self.assertFalse(secret_report["ok"])
+        self.assertEqual(secret_checks["secret_scan"]["status"], "fail")
+        self.assertTrue(any(finding["code"] == "secret_value_bearer_token" for finding in secret_checks["secret_scan"]["findings"]))
+        self._assert_report_does_not_echo(secret_report, secret_text)
+
+    def test_doctor_project_sanitizes_secret_bearing_setup_config_errors(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = self._init_project(tmpdir)
+            setup_path = project_dir / ".sweetspot" / "sweetspot.yaml"
+            setup_path.write_text(setup_path.read_text(encoding="utf-8") + f"aws_access_key_id: {secret_text}\n", encoding="utf-8")
+            report = self._doctor_report(project_dir, expected_rc=1)
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["setup_config"]["status"], "fail")
+        self.assertEqual(checks["setup_config"]["findings"][0]["code"], "invalid_setup_config")
+        self._assert_report_does_not_echo(report, secret_text)
+
+
 if __name__ == "__main__":
     unittest.main()
