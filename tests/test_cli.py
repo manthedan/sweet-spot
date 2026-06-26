@@ -45,6 +45,7 @@ from sweetspot.cli import (
     _job_log_stream,
     _extract_task_id_from_log_message,
     _parse_index_selection,
+    _prepare_controller_run_queue,
     _redact_env,
     _sample_from_runtime_obj,
     _sha256_json_obj,
@@ -73,6 +74,7 @@ from sweetspot.cli import (
     main,
 )
 from sweetspot.canary_service import collect_canary_summaries
+from sweetspot.deployment import DeploymentTarget
 from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
 
@@ -603,6 +605,42 @@ class RunCommandTests(unittest.TestCase):
             self.assertEqual(production["controller"]["run_queue"]["created_or_existing"], "created")
             self.assertIn(production["controller"]["run_queue"]["queue_url"], sqs.sent_by_queue)
             self.assertNotIn("https://sqs.us-west-2.amazonaws.com/123456789012/prod", sqs.sent_by_queue)
+
+    def test_create_run_queue_access_denied_gives_operator_recovery_guidance(self) -> None:
+        class DeniedSQS:
+            def get_queue_attributes(self, **kwargs):
+                queue_name = kwargs["QueueUrl"].rstrip("/").rsplit("/", 1)[-1]
+                return {"Attributes": {"QueueArn": f"arn:aws:sqs:us-west-2:123456789012:{queue_name}"}}
+
+            def create_queue(self, **kwargs):
+                raise ClientError({"Error": {"Code": "AccessDenied", "Message": "not authorized"}}, "CreateQueue")
+
+        args = types.SimpleNamespace(create_run_queue=True, dedicated_run_queue=True, deployment=Path("deployment.json"))
+        target = DeploymentTarget(
+            region="us-west-2",
+            architecture="arm64",
+            sqs_queue_url="https://sqs.us-west-2.amazonaws.com/123456789012/deployment-prod",
+            dlq_url="https://sqs.us-west-2.amazonaws.com/123456789012/deployment-dlq",
+            batch_job_queue="jq",
+            job_definition="jd:1",
+            image="image@sha256:abc",
+        )
+        with self.assertRaises(SystemExit) as cm:
+            _prepare_controller_run_queue(
+                args,
+                sqs=DeniedSQS(),
+                target=target,
+                run_id="run-1",
+                previous_state={},
+                runtime_settings={"visibility_timeout": 1234},
+            )
+        message = str(cm.exception)
+        self.assertIn("run_queue_create_denied", message)
+        self.assertIn("sweetspot admin doctor --check-run-queue-create --run-queue-name sweetspot-run-1-arm64", message)
+        self.assertIn("--run-queue-dlq-url https://sqs.us-west-2.amazonaws.com/123456789012/deployment-dlq", message)
+        self.assertIn("VisibilityTimeout=1234", message)
+        self.assertIn("DEPLOYMENT.with-empty-run-queue.json", message)
+        self.assertIn("Do not silently reuse a shared/canary queue", message)
 
     def test_run_writes_state_and_default_production_tasks_in_artifact_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

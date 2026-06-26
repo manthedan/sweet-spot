@@ -586,6 +586,40 @@ def _maybe_queue_arn(sqs: Any, queue_url: str) -> str | None:
     return str(arn) if arn else None
 
 
+def _aws_error_code(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict) and error.get("Code"):
+            return str(error["Code"])
+    return exc.__class__.__name__
+
+
+def _is_access_denied(exc: BaseException) -> bool:
+    code = _aws_error_code(exc).lower()
+    text = str(exc).lower()
+    return "accessdenied" in code or "access_denied" in code or "access denied" in text or "not authorized" in text
+
+
+def _run_queue_create_denied_message(*, run_id: str, queue_name: str, target: DeploymentTarget, visibility_timeout: int | float, exc: BaseException) -> str:
+    doctor_parts: list[str | Path | None] = ["sweetspot", "admin", "doctor", "--check-run-queue-create", "--run-queue-name", queue_name]
+    if target.dlq_url:
+        doctor_parts.extend(["--run-queue-dlq-url", target.dlq_url])
+    if target.region:
+        doctor_parts.extend(["--region", target.region])
+    fallback_parts = ["sweetspot", "run", "JOB.json", "--deployment", "DEPLOYMENT.with-empty-run-queue.json", "--dedicated-run-queue", "--kickoff-only", "--apply"]
+    return (
+        "run_queue_create_denied: SweetSpot could not create the controller-owned SQS run queue "
+        f"{queue_name!r} for run_id={run_id!r} ({_aws_error_code(exc)}: {exc}). "
+        "Ask an AWS admin to grant sqs:CreateQueue, sqs:TagQueue, sqs:SetQueueAttributes, and sqs:GetQueueAttributes for that run-queue ARN/prefix, then rerun: "
+        f"{_shell_command(doctor_parts)}. "
+        "If queue creation cannot be granted, pre-provision an empty run-scoped queue with "
+        f"VisibilityTimeout={int(visibility_timeout)} and the deployment DLQ/redrive policy, update the deployment target to that queue URL, "
+        f"then rerun without --create-run-queue, for example: {_shell_command(fallback_parts)}. "
+        "Do not silently reuse a shared/canary queue with stale messages."
+    )
+
+
 def _prepare_controller_run_queue(
     args: argparse.Namespace,
     *,
@@ -617,11 +651,16 @@ def _prepare_controller_run_queue(
         }
         if dlq_arn:
             attributes["RedrivePolicy"] = json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": 5}, sort_keys=True)
-        resp = sqs.create_queue(
-            QueueName=queue_name,
-            Attributes=attributes,
-            tags={"SweetSpotOwner": "controller", "SweetSpotRunId": run_id, "SweetSpotArchitecture": target.architecture},
-        )
+        try:
+            resp = sqs.create_queue(
+                QueueName=queue_name,
+                Attributes=attributes,
+                tags={"SweetSpotOwner": "controller", "SweetSpotRunId": run_id, "SweetSpotArchitecture": target.architecture},
+            )
+        except Exception as exc:  # noqa: BLE001 - convert IAM denial into operator recovery guidance; unexpected errors still propagate.
+            if not _is_access_denied(exc):
+                raise
+            raise SystemExit(_run_queue_create_denied_message(run_id=run_id, queue_name=queue_name, target=target, visibility_timeout=runtime_settings["visibility_timeout"], exc=exc)) from exc
         queue_url = str(resp.get("QueueUrl") or "")
         created = True
     if not queue_url:
