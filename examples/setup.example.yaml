@@ -1,0 +1,25 @@
+schema: sweetspot.project.v1
+project:
+  name: example-batch-project
+  description: Noninteractive SweetSpot setup example for an AWS Batch workload.
+workload:
+  input_manifest: s3://example-sweetspot-input/manifests/tasks.jsonl
+  output_prefix: s3://example-sweetspot-output/runs/example/
+  command:
+    - python
+    - worker.py
+    - --task
+    - "{task_json}"
+  architecture: x86_64
+aws:
+  region: us-west-2
+  auth:
+    method: profile
+    profile: sweetspot-dev
+bootstrap:
+  job: .sweetspot/job.json
+  deployment_template: .sweetspot/deployment.template.json
+  worker_notes: .sweetspot/worker/README.md
+  worker_scaffold: .sweetspot/worker/worker.py
+  infra_vars_stub: .sweetspot/infra/terraform.tfvars.json
+  next_steps: .sweetspot/next_steps.md
