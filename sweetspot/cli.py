@@ -72,7 +72,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_join, s3_upload_text
-from .setup import JOB_SPEC_PATH, DEPLOYMENT_TEMPLATE_PATH, INFRA_VARS_STUB_PATH, NEXT_STEPS_PATH, SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH, WORKER_NOTES_PATH, WORKER_SCAFFOLD_PATH, SetupSpecError, load_setup, write_project_context
+from .setup import JOB_SPEC_PATH, DEPLOYMENT_TEMPLATE_PATH, INFRA_VARS_STUB_PATH, NEXT_STEPS_PATH, SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH, WORKER_NOTES_PATH, WORKER_SCAFFOLD_PATH, SetupSpecError, load_setup, validate_setup, write_project_context
 from .task_model import default_done_s3, parse_allowed_s3_prefixes
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_worker_timing
 
@@ -4563,9 +4563,39 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def _prompt_setup_data() -> dict[str, Any]:
+    project_name = input("Project name: ")
+    project_description = input("Project description: ")
+    input_manifest = input("Workload input manifest (s3://bucket/key): ")
+    output_prefix = input("Workload output prefix (s3://bucket/prefix/): ")
+    raw_command = input("Workload command: ")
+    architecture = input("Workload architecture (x86_64 or arm64): ")
+    region = input("AWS region: ")
+    auth_method = input("AWS auth method (profile, sso, env, or role): ")
+    auth: dict[str, Any] = {"method": auth_method}
+    normalized_method = auth_method.strip()
+    if normalized_method == "profile":
+        auth["profile"] = input("AWS profile name: ")
+    elif normalized_method == "role":
+        auth["role_arn"] = input("AWS role ARN: ")
+
+    return {
+        "schema": "sweetspot.project.v1",
+        "project": {"name": project_name, "description": project_description},
+        "workload": {
+            "input_manifest": input_manifest,
+            "output_prefix": output_prefix,
+            "command": shlex.split(raw_command),
+            "architecture": architecture,
+        },
+        "aws": {"region": region, "auth": auth},
+        "bootstrap": {},
+    }
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     try:
-        config = load_setup(args.config)
+        config = load_setup(args.config) if args.config else validate_setup(_prompt_setup_data())
         written = write_project_context(config, args.project_dir, overwrite=args.overwrite)
     except SetupSpecError as exc:
         raise SystemExit(f"invalid setup config at {exc.field_path}: {exc.message}") from exc
@@ -5087,10 +5117,10 @@ def main(argv: list[str] | None = None) -> int:
     p = _add_parser_with_examples(
         sub,
         "init",
-        help="Initialize local SweetSpot project context from setup YAML",
-        examples="  sweetspot init --config examples/setup.example.yaml\n  sweetspot init --config examples/setup.example.yaml --project-dir ./my-project",
+        help="Initialize local SweetSpot project context interactively or from setup YAML",
+        examples="  sweetspot init\n  sweetspot init --config examples/setup.example.yaml --project-dir ./my-project",
     )
-    p.add_argument("--config", type=Path, required=True, help="sweetspot.project.v1 setup YAML for this project")
+    p.add_argument("--config", type=Path, help="sweetspot.project.v1 setup YAML for this project")
     p.add_argument("--project-dir", type=Path, default=Path("."), help="Project root where .sweetspot/ files will be written")
     p.add_argument("--overwrite", action="store_true", help="Replace existing .sweetspot/sweetspot.yaml and .sweetspot/SWEETSPOT.md")
     p.set_defaults(func=cmd_init)
