@@ -2587,6 +2587,241 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
         }
         (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
 
+    def _write_tiny_leela_like_finished_run(self, root: Path) -> Path:
+        run_id = "sweetspot-firsttime-stockfish-10m-d10-mpv1-c7g-prod-20260626"
+        run_root = root / "artifacts" / "sweetspot_first_time" / run_id
+        artifact_dir = run_root / "controller"
+        finalizer_dir = artifact_dir / "finalizer"
+        finalizer_dir.mkdir(parents=True)
+        tasks = run_root / "production_tasks.c7g-prod.jsonl"
+        tasks.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "schema": "sweetspot.task.v1",
+                        "run_id": run_id,
+                        "task_id": f"prod-{index:06d}",
+                        "command": ["python3", "/work/cloud/aws/sweetspot_stockfish_task.py"],
+                        "done_s3": f"s3://example-sweetspot-bucket/{run_id}/done/prod-{index:06d}.done.json",
+                    }
+                )
+                + "\n"
+                for index in range(2)
+            )
+        )
+        task_status = finalizer_dir / "task_status.jsonl"
+        task_status.write_text("".join(json.dumps({"run_id": run_id, "task_id": f"prod-{index:06d}", "status": "done"}) + "\n" for index in range(2)))
+        repair_tasks = finalizer_dir / "repair_tasks.jsonl"
+        repair_tasks.write_text("")
+        outputs = finalizer_dir / "outputs.jsonl"
+        outputs.write_text("".join(json.dumps({"task_id": f"prod-{index:06d}", "output_s3": f"s3://example-sweetspot-bucket/{run_id}/outputs/prod-{index:06d}.json"}) + "\n" for index in range(2)))
+        final_manifest = finalizer_dir / "final_manifest.json"
+        final_manifest.write_text(
+            json.dumps(
+                {
+                    "schema": "sweetspot.final_manifest.v1",
+                    "run_id": run_id,
+                    "finalized_at": "2026-06-26T05:38:00Z",
+                    "task_count": 2,
+                    "done_count": 2,
+                    "output_count": 2,
+                    "missing_count": 0,
+                    "repair_task_count": 0,
+                    "complete": True,
+                    "ready_s3": f"s3://example-sweetspot-bucket/{run_id}/READY",
+                    "final_manifest_s3": f"s3://example-sweetspot-bucket/{run_id}/manifests/final_manifest.json",
+                }
+            )
+            + "\n"
+        )
+        finish_report = artifact_dir / "finish_report.json"
+        finish_report.write_text(
+            json.dumps(
+                {
+                    "schema": "sweetspot.finish.v1",
+                    "checked_at": "2026-06-26T05:39:00Z",
+                    "ok": True,
+                    "blocked": False,
+                    "blockers": [],
+                    "cleanup_recommendation": f"sweetspot cleanup {run_id} --from-state --dry-run",
+                }
+            )
+            + "\n"
+        )
+
+        def rel(path: Path) -> str:
+            return path.relative_to(root).as_posix()
+
+        state = {
+            "schema": "sweetspot.run.v1",
+            "run_id": run_id,
+            "status": "finalized_complete",
+            "job_spec_sha256": "5d02ff438620448688fc93577c658e811d6b81fca6213d7cc020c4a5ff379ff6",
+            "artifacts": {
+                "production_task_count": 2,
+                "production_tasks_jsonl": rel(tasks),
+                "task_status_jsonl": rel(task_status),
+                "repair_tasks_jsonl": rel(repair_tasks),
+                "outputs_manifest": rel(outputs),
+                "final_manifest": rel(final_manifest),
+                "run_state_json": rel(artifact_dir / "run_state.json"),
+            },
+            "controller": {
+                "binding_kind": "production",
+                "production_binding": {
+                    "deployment_sha256": "9d1ff6ec839907901937b04de16af934b65ddb00e54dd82ece513c5864eef2db",
+                    "selected": {"architecture": "arm64", "region": "us-west-2", "estimated_workers": 44, "vcpus": 1.0, "memory_mib": 1536},
+                    "target": {
+                        "region": "us-west-2",
+                        "batch_job_queue": "sweetspot-c7g-medium-spot-queue",
+                        "job_definition": "sweetspot-stockfish-worker-c7g-medium:2",
+                        "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-c7g-medium",
+                        "dlq_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-work-dlq",
+                    },
+                },
+            },
+            "phases": [
+                {"name": "plan", "status": "completed"},
+                {"name": "materialize_production_tasks", "status": "completed", "task_count": 2, "artifact": rel(tasks)},
+                {
+                    "name": "enqueue_tasks",
+                    "status": "completed",
+                    "task_count": 2,
+                    "sent": 2,
+                    "remaining": 0,
+                    "queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-c7g-medium",
+                },
+                {
+                    "name": "submit_workers",
+                    "status": "completed",
+                    "job_name_prefix": f"{run_id}-worker",
+                    "batch_job_queue": "sweetspot-c7g-medium-spot-queue",
+                    "queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/sweetspot-canary-c7g-medium",
+                    "submitted_count": 44,
+                    "raw_desired_workers": 44,
+                    "active_matching_workers": 0,
+                    "submission_stamp": "20260626T030128Z",
+                },
+                {
+                    "name": "finalize",
+                    "status": "completed",
+                    "task_count": 2,
+                    "done_count": 2,
+                    "missing_count": 0,
+                    "return_code": 0,
+                    "publish_ready": True,
+                    "ready_s3": f"s3://example-sweetspot-bucket/{run_id}/READY",
+                    "final_manifest": rel(final_manifest),
+                },
+            ],
+            "plan": {
+                "schema": "sweetspot.plan.v1",
+                "run_id": run_id,
+                "status": "ready",
+                "selected": {"architecture": "arm64", "region": "us-west-2", "estimated_workers": 44, "vcpus": 1.0, "memory_mib": 1536},
+                "job": {
+                    "command": ["python3", "/work/cloud/aws/sweetspot_stockfish_task.py"],
+                    "input_manifest": "s3://example-sweetspot-bucket/sweetspot_first_time/input_manifest.jsonl",
+                    "output_prefix": f"s3://example-sweetspot-bucket/{run_id}",
+                },
+                "artifacts": {"production_task_count": 2, "production_tasks_jsonl": rel(tasks)},
+            },
+        }
+        (artifact_dir / "run_state.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        return artifact_dir
+
+    def test_tiny_leela_like_from_state_drives_lifecycle_closeout_commands(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/sweetspot-operator", "UserId": "AIDATINY"}
+
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                if name != "list_jobs":
+                    raise AssertionError(name)
+                return FakePaginator()
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                prefix = kwargs["Prefix"]
+                return {
+                    "Contents": [
+                        {"Key": f"{prefix}done/prod-000000.done.json", "LastModified": datetime(2026, 6, 26, 4, 13, 44, tzinfo=timezone.utc)},
+                        {"Key": f"{prefix}worker-0000/done/prod-000001.done.json", "LastModified": datetime(2026, 6, 26, 4, 13, 45, tzinfo=timezone.utc)},
+                    ],
+                    "IsTruncated": False,
+                }
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                if service == "s3":
+                    return FakeS3()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = self._write_tiny_leela_like_finished_run(root)
+            run_id = artifact_dir.parent.name
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                status_out = io.StringIO()
+                with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(status_out):
+                    self.assertEqual(main(["status", run_id, "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+                status = json.loads(status_out.getvalue())
+
+                explain_out = io.StringIO()
+                with contextlib.redirect_stdout(explain_out):
+                    self.assertEqual(main(["explain", run_id, "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+                explain = json.loads(explain_out.getvalue())
+
+                postmortem_out = io.StringIO()
+                with contextlib.redirect_stdout(postmortem_out):
+                    self.assertEqual(main(["postmortem", run_id, "--artifact-dir", str(artifact_dir), "--from-state", "--format", "markdown"]), 0)
+
+                cleanup_out = io.StringIO()
+                with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(cleanup_out):
+                    self.assertEqual(main(["cleanup", run_id, "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run"]), 0)
+                cleanup = json.loads(cleanup_out.getvalue())
+            finally:
+                os.chdir(old_cwd)
+
+            postmortem_md = (artifact_dir / "postmortem.md").read_text(encoding="utf-8")
+
+        self.assertEqual(status["schema"], "sweetspot.status.v1")
+        self.assertEqual(status["run"]["status"], "complete")
+        self.assertEqual(status["run"]["production_task_count"], 2)
+        self.assertEqual(status["run_context"]["region"], "us-west-2")
+        self.assertEqual(status["run_context"]["deployment_sha256"], "9d1ff6ec839907901937b04de16af934b65ddb00e54dd82ece513c5864eef2db")
+        self.assertEqual(status["queues"]["source"]["depth"]["visible"], 0)
+        self.assertEqual(status["batch"]["active_count"], 0)
+        self.assertEqual(status["output_s3"]["done_markers"]["count"], 2)
+        self.assertEqual(explain["outcome"], "finished")
+        self.assertEqual(explain["finalizer"]["ready_s3"], f"s3://example-sweetspot-bucket/{run_id}/READY")
+        self.assertIn("materialize_production_tasks", [phase["name"] for phase in explain["phases"]])
+        self.assertIn("Tasks / done / outputs / missing: `2 / 2 / 2 / 0`", postmortem_md)
+        self.assertEqual(cleanup["schema"], "sweetspot.cleanup_plan.v1")
+        self.assertTrue(cleanup["ok"])
+        self.assertFalse(cleanup["blocked"])
+        self.assertEqual(cleanup["applied_actions"], [])
+
     def test_explain_from_state_reports_finished_lifecycle_without_aws(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "artifacts" / "run-1"
