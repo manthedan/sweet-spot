@@ -44,7 +44,10 @@ LAYOUT_FILES = {
 
 ARCHITECTURES = {"x86_64", "arm64"}
 AWS_AUTH_METHODS = {"profile", "sso", "env", "role"}
-_SECRET_KEY_RE = re.compile(r"(access.?key|secret|session.?token|password|credential)", re.IGNORECASE)
+_SECRET_KEY_RE = re.compile(r"(access.?key|secret|session.?token|password|credential|token|private.?key)", re.IGNORECASE)
+_AWS_ACCESS_KEY_ID_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b", re.IGNORECASE)
+_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d$|^[a-z]{2}-gov-[a-z]+-\d$")
 _PLACEHOLDER_RE = re.compile(r"(<[^>]+>|TODO|TBD|REPLACE_ME|changeme)", re.IGNORECASE)
 
@@ -56,6 +59,14 @@ class SetupSpecError(ValueError):
         self.field_path = field_path
         self.message = message
         super().__init__(f"{field_path}: {message}")
+
+
+@dataclass(frozen=True)
+class SecretFinding:
+    path: str
+    code: str
+    severity: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -137,7 +148,10 @@ def setup_to_dict(config: SweetSpotProject) -> dict[str, Any]:
 def validate_setup(data: Any) -> SweetSpotProject:
     if not isinstance(data, dict):
         raise SetupSpecError("$", "setup document must be a mapping")
-    _reject_secret_keys(data, "$", allow_bootstrap=False)
+    secret_findings = scan_for_secrets(data)
+    if secret_findings:
+        finding = secret_findings[0]
+        raise SetupSpecError(finding.path, f"{finding.code}: {finding.message}")
 
     schema = _required_str(data, "schema")
     if schema != SETUP_SCHEMA_V1:
@@ -186,6 +200,65 @@ def validate_setup(data: Any) -> SweetSpotProject:
     )
 
     return SweetSpotProject(schema=schema, project=project, workload=workload, aws=aws, bootstrap=bootstrap)
+
+
+def scan_for_secrets(value: Any, field_path: str = "$") -> tuple[SecretFinding, ...]:
+    """Return sanitized findings for secret-like keys or scalar values.
+
+    The scanner is pure and deterministic so CLI init and project-doctor flows can
+    reuse the same no-secret contract without risking diagnostic leakage.
+    """
+    findings: list[SecretFinding] = []
+    _scan_for_secrets(value, field_path, findings)
+    return tuple(findings)
+
+
+def _scan_for_secrets(value: Any, field_path: str, findings: list[SecretFinding]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            child_path = f"{field_path}.{key_text}" if field_path != "$" else key_text
+            if _SECRET_KEY_RE.search(key_text):
+                findings.append(
+                    SecretFinding(
+                        path=child_path,
+                        code="secret_key_name",
+                        severity="error",
+                        message="field name is not allowed; store auth intent references only",
+                    )
+                )
+            _scan_for_secrets(child, child_path, findings)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _scan_for_secrets(child, f"{field_path}[{index}]", findings)
+    elif isinstance(value, str):
+        if _AWS_ACCESS_KEY_ID_RE.search(value):
+            findings.append(
+                SecretFinding(
+                    path=field_path,
+                    code="secret_value_aws_access_key_id",
+                    severity="error",
+                    message="value looks like an AWS access key id; store auth intent references only",
+                )
+            )
+        if _BEARER_TOKEN_RE.search(value):
+            findings.append(
+                SecretFinding(
+                    path=field_path,
+                    code="secret_value_bearer_token",
+                    severity="error",
+                    message="value looks like a bearer token; store auth intent references only",
+                )
+            )
+        if _PRIVATE_KEY_RE.search(value):
+            findings.append(
+                SecretFinding(
+                    path=field_path,
+                    code="secret_value_private_key",
+                    severity="error",
+                    message="value looks like a private key; store auth intent references only",
+                )
+            )
 
 
 def _without_none(values: dict[str, str | None]) -> dict[str, str]:
@@ -260,16 +333,3 @@ def _lookup(data: dict[str, Any], field_path: str, *, missing: Any = None) -> An
         else:
             return missing
     return current
-
-
-def _reject_secret_keys(value: Any, field_path: str, *, allow_bootstrap: bool) -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            key_text = str(key)
-            child_path = f"{field_path}.{key_text}" if field_path != "$" else key_text
-            if not (allow_bootstrap and child_path.startswith("bootstrap")) and _SECRET_KEY_RE.search(key_text):
-                raise SetupSpecError(child_path, "must reference AWS auth intent only; do not store credentials or secrets")
-            _reject_secret_keys(child, child_path, allow_bootstrap=allow_bootstrap)
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            _reject_secret_keys(child, f"{field_path}[{index}]", allow_bootstrap=allow_bootstrap)
