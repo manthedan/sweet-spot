@@ -3850,13 +3850,19 @@ class DoctorTests(unittest.TestCase):
                 return {"Account": "123", "Arn": "arn:aws:iam::123:user/operator", "UserId": "u"}
 
         class FakeIAM:
+            def __init__(self) -> None:
+                self.calls = []
+
             def simulate_principal_policy(self, **kwargs):
+                self.calls.append(kwargs)
                 return {
                     "EvaluationResults": [
                         {"EvalActionName": action, "EvalResourceName": kwargs["ResourceArns"][0], "EvalDecision": "allowed"}
                         for action in kwargs["ActionNames"]
                     ]
                 }
+
+        fake_iam = FakeIAM()
 
         class FakeSession:
             region_name = "us-west-2"
@@ -3865,7 +3871,7 @@ class DoctorTests(unittest.TestCase):
                 if service == "sts":
                     return FakeSTS()
                 if service == "iam":
-                    return FakeIAM()
+                    return fake_iam
                 raise AssertionError(service)
 
         args = types.SimpleNamespace(
@@ -3895,6 +3901,12 @@ class DoctorTests(unittest.TestCase):
         check = next(c for c in report["checks"] if c["name"] == "run_queue_create_permissions")
         self.assertTrue(check["ok"])
         self.assertEqual(check["details"]["run_queue_arn"], "arn:aws:sqs:us-west-2:123:sweetspot-run-1")
+        self.assertEqual(check["details"]["dlq_arn"], "arn:aws:sqs:us-west-2:123:dlq")
+        self.assertEqual(len(fake_iam.calls), 2)
+        self.assertEqual(fake_iam.calls[0]["ResourceArns"], ["arn:aws:sqs:us-west-2:123:sweetspot-run-1"])
+        self.assertEqual(set(fake_iam.calls[0]["ActionNames"]), {"sqs:CreateQueue", "sqs:TagQueue", "sqs:SetQueueAttributes", "sqs:GetQueueAttributes"})
+        self.assertEqual(fake_iam.calls[1]["ResourceArns"], ["arn:aws:sqs:us-west-2:123:dlq"])
+        self.assertEqual(fake_iam.calls[1]["ActionNames"], ["sqs:GetQueueAttributes"])
 
 
 class ReadCommandTableTests(unittest.TestCase):

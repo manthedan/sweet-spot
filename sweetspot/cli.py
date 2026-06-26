@@ -3972,21 +3972,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if not account_id or not principal_arn or not region:
                 raise ValueError("could not resolve account, principal ARN, or region for IAM simulation")
             run_queue_arn = _sqs_queue_arn(region=region, account_id=account_id, queue_name=args.run_queue_name)
-            resource_arns = [run_queue_arn]
+            run_queue_actions = ["sqs:CreateQueue", "sqs:TagQueue", "sqs:SetQueueAttributes", "sqs:GetQueueAttributes"]
+            simulations = [{"resource_arn": run_queue_arn, "actions": run_queue_actions, "purpose": "run_queue"}]
+            dlq_arn = None
+            dlq_actions = ["sqs:GetQueueAttributes"]
             if args.run_queue_dlq_url:
-                resource_arns.append(_sqs_queue_arn(region=region, account_id=account_id, queue_name=_sqs_queue_name_from_url(args.run_queue_dlq_url)))
-            actions = ["sqs:CreateQueue", "sqs:TagQueue", "sqs:SetQueueAttributes", "sqs:GetQueueAttributes"]
+                dlq_arn = _sqs_queue_arn(region=region, account_id=account_id, queue_name=_sqs_queue_name_from_url(args.run_queue_dlq_url))
+                simulations.append({"resource_arn": dlq_arn, "actions": dlq_actions, "purpose": "dlq"})
             iam = session.client("iam", region_name=args.region)
-            response = iam.simulate_principal_policy(PolicySourceArn=principal_arn, ActionNames=actions, ResourceArns=resource_arns)
-            evaluations = response.get("EvaluationResults", [])
-            denied = [
-                {"action": ev.get("EvalActionName"), "resource": ev.get("EvalResourceName"), "decision": ev.get("EvalDecision")}
-                for ev in evaluations
-                if ev.get("EvalDecision") != "allowed"
-            ]
+            denied = []
+            for simulation in simulations:
+                response = iam.simulate_principal_policy(PolicySourceArn=principal_arn, ActionNames=simulation["actions"], ResourceArns=[simulation["resource_arn"]])
+                denied.extend(
+                    {"action": ev.get("EvalActionName"), "resource": ev.get("EvalResourceName"), "decision": ev.get("EvalDecision"), "purpose": simulation["purpose"]}
+                    for ev in response.get("EvaluationResults", [])
+                    if ev.get("EvalDecision") != "allowed"
+                )
             if denied:
                 raise PermissionError(f"run-queue creation/update permissions are not all allowed: {denied}")
-            return {"principal_arn": principal_arn, "run_queue_arn": run_queue_arn, "resource_arns": resource_arns, "actions": actions}
+            details = {"principal_arn": principal_arn, "run_queue_arn": run_queue_arn, "resource_arns": [s["resource_arn"] for s in simulations], "run_queue_actions": run_queue_actions}
+            if dlq_arn:
+                details.update({"dlq_arn": dlq_arn, "dlq_actions": dlq_actions})
+            return details
 
         checks.append(_doctor_check("run_queue_create_permissions", check_run_queue_create))
 
