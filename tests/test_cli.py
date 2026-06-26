@@ -77,6 +77,19 @@ from sweetspot.canary_service import collect_canary_summaries
 from sweetspot.deployment import DeploymentTarget
 from sweetspot.task_model import validate_task_model
 from sweetspot.worker import task_hash
+from sweetspot.setup import (
+    DEPLOYMENT_TEMPLATE_PATH,
+    INFRA_VARS_STUB_PATH,
+    JOB_SPEC_PATH,
+    NEXT_STEPS_PATH,
+    SWEETSPOT_CONFIG_PATH,
+    SWEETSPOT_DOC_PATH,
+    WORKER_NOTES_PATH,
+    WORKER_SCAFFOLD_PATH,
+    load_setup,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _calibrated_summary_jsonl() -> str:
@@ -118,7 +131,7 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
+        self.assertIn("{version,init,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -1784,6 +1797,62 @@ class RunCommandTests(unittest.TestCase):
                         "--apply",
                     ]
                 )
+
+
+class InitCommandTests(unittest.TestCase):
+    def test_init_config_writes_project_context_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)]), 0)
+
+            self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), load_setup(ROOT / "examples" / "setup.example.yaml"))
+            self.assertTrue((project_dir / SWEETSPOT_DOC_PATH).exists())
+            self.assertFalse((project_dir / JOB_SPEC_PATH).exists())
+            self.assertFalse((project_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
+            self.assertFalse((project_dir / WORKER_NOTES_PATH).exists())
+            self.assertFalse((project_dir / WORKER_SCAFFOLD_PATH).exists())
+            self.assertFalse((project_dir / INFRA_VARS_STUB_PATH).exists())
+            self.assertFalse((project_dir / NEXT_STEPS_PATH).exists())
+
+        stdout = out.getvalue()
+        self.assertIn("SweetSpot project context initialized", stdout)
+        self.assertIn(SWEETSPOT_CONFIG_PATH, stdout)
+        self.assertIn(SWEETSPOT_DOC_PATH, stdout)
+        self.assertIn("no AWS resources or secrets were created", stdout)
+
+    def test_init_config_flag_is_not_treated_as_global_json_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            self.assertEqual(main(["init", f"--config={ROOT / 'examples' / 'setup.example.yaml'}", "--project-dir", str(project_dir)]), 0)
+            self.assertTrue((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+
+    def test_init_invalid_secret_like_setup_config_returns_sanitized_error(self) -> None:
+        secret_value = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bad_config = root / "setup.yaml"
+            bad_config.write_text((ROOT / "examples" / "setup.example.yaml").read_text(encoding="utf-8") + f"\nforbidden: {secret_value}\n", encoding="utf-8")
+            project_dir = root / "project"
+
+            with self.assertRaisesRegex(SystemExit, r"invalid setup config at forbidden: secret_value_aws_access_key_id") as ctx:
+                main(["init", "--config", str(bad_config), "--project-dir", str(project_dir)])
+
+            self.assertNotIn(secret_value, str(ctx.exception))
+            self.assertFalse((project_dir / SWEETSPOT_CONFIG_PATH).exists())
+            self.assertFalse((project_dir / SWEETSPOT_DOC_PATH).exists())
+
+    def test_init_existing_project_context_conflict_names_blocked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)]), 0)
+
+            with self.assertRaisesRegex(SystemExit, r"\.sweetspot/sweetspot\.yaml") as ctx:
+                main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(project_dir)])
+
+        self.assertIn(".sweetspot/SWEETSPOT.md", str(ctx.exception))
 
 
 class ConfigTests(unittest.TestCase):

@@ -72,6 +72,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_join, s3_upload_text
+from .setup import JOB_SPEC_PATH, DEPLOYMENT_TEMPLATE_PATH, INFRA_VARS_STUB_PATH, NEXT_STEPS_PATH, SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH, WORKER_NOTES_PATH, WORKER_SCAFFOLD_PATH, SetupSpecError, load_setup, write_project_context
 from .task_model import default_done_s3, parse_allowed_s3_prefixes
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_worker_timing
 
@@ -4562,14 +4563,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "explain", "finalize", "finish", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
+def cmd_init(args: argparse.Namespace) -> int:
+    try:
+        config = load_setup(args.config)
+        written = write_project_context(config, args.project_dir, overwrite=args.overwrite)
+    except SetupSpecError as exc:
+        raise SystemExit(f"invalid setup config at {exc.field_path}: {exc.message}") from exc
+    except FileExistsError as exc:
+        raise SystemExit(str(exc)) from exc
+    except OSError as exc:
+        raise SystemExit(f"failed to read or write SweetSpot init files: {exc}") from exc
+
+    base_dir = Path(args.project_dir)
+    relative_written = []
+    for path in written:
+        try:
+            relative_written.append(path.relative_to(base_dir).as_posix())
+        except ValueError:
+            relative_written.append(path.as_posix())
+    print("SweetSpot project context initialized")
+    print(f"project_dir: {base_dir}")
+    print("created: " + ", ".join(relative_written))
+    print("no AWS resources or secrets were created")
+    return 0
+
+
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,init,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
+    print("  init      Initialize local SweetSpot project context from setup YAML")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")
     print("  monitor   Emit non-blocking status/finalize checkpoint commands")
@@ -4929,10 +4956,18 @@ def _extract_config_arg(argv: list[str]) -> tuple[Path | None, list[str]]:
         if arg == "--config":
             if i + 1 >= len(argv):
                 raise SystemExit("--config requires a path")
+            if command == "init":
+                stripped.extend([arg, argv[i + 1]])
+                i += 2
+                continue
             config_path = Path(argv[i + 1])
             i += 2
             continue
         if arg.startswith("--config="):
+            if command == "init":
+                stripped.append(arg)
+                i += 1
+                continue
             config_path = Path(arg.split("=", 1)[1])
             i += 1
             continue
@@ -5048,6 +5083,17 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("version", help="Print the installed SweetSpot package version")
     p.set_defaults(func=cmd_version)
+
+    p = _add_parser_with_examples(
+        sub,
+        "init",
+        help="Initialize local SweetSpot project context from setup YAML",
+        examples="  sweetspot init --config examples/setup.example.yaml\n  sweetspot init --config examples/setup.example.yaml --project-dir ./my-project",
+    )
+    p.add_argument("--config", type=Path, required=True, help="sweetspot.project.v1 setup YAML for this project")
+    p.add_argument("--project-dir", type=Path, default=Path("."), help="Project root where .sweetspot/ files will be written")
+    p.add_argument("--overwrite", action="store_true", help="Replace existing .sweetspot/sweetspot.yaml and .sweetspot/SWEETSPOT.md")
+    p.set_defaults(func=cmd_init)
 
     p = _add_parser_with_examples(
         sub,
@@ -5617,7 +5663,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_dlq)
 
     args = ap.parse_args(raw_argv)
-    args.config = config_path
+    if getattr(args, "cmd", None) != "init":
+        args.config = config_path
     if getattr(args, "cmd", None) == "worker" and not args.queue_url:
         raise SystemExit("worker requires --queue-url or SWEETSPOT_SQS_QUEUE_URL")
     return int(args.func(args))
