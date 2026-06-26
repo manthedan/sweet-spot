@@ -3980,7 +3980,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 dlq_arn = _sqs_queue_arn(region=region, account_id=account_id, queue_name=_sqs_queue_name_from_url(args.run_queue_dlq_url))
                 simulations.append({"resource_arn": dlq_arn, "actions": dlq_actions, "purpose": "dlq"})
             iam = session.client("iam", region_name=args.region)
-            denied = []
+            denied: list[dict[str, Any]] = []
             for simulation in simulations:
                 response = iam.simulate_principal_policy(PolicySourceArn=principal_arn, ActionNames=simulation["actions"], ResourceArns=[simulation["resource_arn"]])
                 denied.extend(
