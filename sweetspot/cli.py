@@ -7,10 +7,12 @@ import json
 import math
 import os
 import re
+import shlex
 import statistics
 import sys
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -1945,6 +1947,7 @@ def _cmd_run_apply(
         controller=controller_base,
         next_actions=[
             f"Use `sweetspot status {run_id} --artifact-dir {args.artifact_dir}` to watch local/run-scoped state.",
+            "For interactive agent sessions, prefer `--kickoff-only` plus an external/scheduled status checkpoint instead of keeping the foreground command in a long drain-watch loop.",
             "After workers finish, rerun this command with --finalize or run `sweetspot repair` with the persisted production_tasks.jsonl if repair is needed.",
         ],
     )
@@ -2151,6 +2154,20 @@ def _print_status_table(report: dict[str, Any]) -> None:
             print("status\tcount")
             for status, count in by_status.items():
                 print(f"{_format_table_value(status)}\t{_format_table_value(count)}")
+    output_s3 = report.get("output_s3") or {}
+    if output_s3:
+        print()
+        progress = output_s3.get("done_markers") or {}
+        _print_key_values(
+            "output_s3",
+            {
+                "output_prefix": output_s3.get("output_prefix"),
+                "done_marker_count": progress.get("count"),
+                "expected_count": progress.get("expected_count"),
+                "completion_fraction": progress.get("completion_fraction"),
+                "estimated_remaining_seconds": progress.get("estimated_remaining_seconds"),
+            },
+        )
     queues = report.get("queues") or {}
     if queues:
         print()
@@ -2246,6 +2263,72 @@ def _is_run_scoped_job_prefix(run_id: str, job_name_prefix: str) -> bool:
     return job_name_prefix.startswith(f"{run_id}-")
 
 
+def _extract_state_output_prefix(state: dict[str, Any]) -> str | None:
+    plan = state.get("plan")
+    if isinstance(plan, dict):
+        job = plan.get("job")
+        if isinstance(job, dict) and job.get("output_prefix"):
+            return str(job["output_prefix"])
+    return None
+
+
+def _s3_done_marker_progress(s3: Any, output_prefix: str, expected_count: int | None = None) -> dict[str, Any]:
+    bucket, key_prefix = parse_s3_uri(output_prefix)
+    prefix = key_prefix.rstrip("/")
+    token = None
+    count = 0
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+    sample_keys: list[str] = []
+    while True:
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix + "/" if prefix else ""}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = s3.list_objects_v2(**kwargs)
+        for obj in page.get("Contents", []) or []:
+            key = str(obj.get("Key") or "")
+            rel = key[len(prefix) :].lstrip("/") if prefix and key.startswith(prefix) else key
+            if not (key.endswith(".done.json") and (rel.startswith("done/") or "/done/" in rel)):
+                continue
+            count += 1
+            if len(sample_keys) < 5:
+                sample_keys.append(key)
+            last_modified = obj.get("LastModified")
+            if isinstance(last_modified, datetime):
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=timezone.utc)
+                first_seen = last_modified if first_seen is None or last_modified < first_seen else first_seen
+                last_seen = last_modified if last_seen is None or last_modified > last_seen else last_seen
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+        if not token:
+            break
+    completion_fraction = None
+    remaining = None
+    eta = None
+    if expected_count is not None and expected_count > 0:
+        completion_fraction = min(1.0, count / expected_count)
+        remaining = max(0, expected_count - count)
+        if remaining == 0:
+            eta = 0.0
+        elif count > 0 and first_seen is not None:
+            elapsed = max(1.0, (datetime.now(timezone.utc) - first_seen).total_seconds())
+            rate = count / elapsed
+            if rate > 0:
+                eta = remaining / rate
+    return {
+        "count": count,
+        "expected_count": expected_count,
+        "remaining_count": remaining,
+        "completion_fraction": completion_fraction,
+        "estimated_remaining_seconds": eta,
+        "first_done_at": first_seen.isoformat() if first_seen else None,
+        "last_done_at": last_seen.isoformat() if last_seen else None,
+        "sample_keys": sample_keys,
+    }
+
+
 def _run_status_report(run_id: str | None, artifact_dir: Path | None) -> dict[str, Any] | None:
     if not run_id and artifact_dir is None:
         return None
@@ -2332,6 +2415,7 @@ def _run_status_report(run_id: str | None, artifact_dir: Path | None) -> dict[st
         "status": status,
         "artifacts": artifacts,
         "run_state_status": state.get("status"),
+        "output_prefix": _extract_state_output_prefix(state),
         "production_task_count": production_task_count,
         "duplicate_production_task_count": duplicate_production_task_count,
         "task_status": task_status,
@@ -2352,7 +2436,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     queue_url = args.queue_url
     if queue_url is None and run_id is None and artifact_dir is None:
         queue_url = os.environ.get("SWEETSPOT_SQS_QUEUE_URL", "")
-    needs_aws = bool(queue_url or args.dlq_url or args.job_queue or (run_id is None and artifact_dir is None))
+    output_prefix = getattr(args, "output_prefix", None)
+    needs_aws = bool(queue_url or args.dlq_url or args.job_queue or output_prefix or (run_id is None and artifact_dir is None))
     session = boto3.Session(profile_name=args.profile, region_name=args.region) if needs_aws else None
     identity: dict[str, Any] | None = None
     if session is not None:
@@ -2368,6 +2453,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         assert session is not None
         sqs = session.client("sqs", region_name=args.region)
         queues["dlq"] = {"queue_url": args.dlq_url, "depth": queue_depth(sqs, args.dlq_url)}
+    output_s3: dict[str, Any] | None = None
+    if output_prefix:
+        assert session is not None
+        s3 = session.client("s3", region_name=args.region)
+        expected_count = run_report.get("production_task_count") if run_report else None
+        output_s3 = {"output_prefix": output_prefix, "done_markers": _s3_done_marker_progress(s3, output_prefix, expected_count)}
     batch_status: dict[str, Any] | None = None
     if args.job_queue:
         assert session is not None
@@ -2389,9 +2480,80 @@ def cmd_status(args: argparse.Namespace) -> int:
         "identity": identity,
         "queues": queues,
         "batch": batch_status,
+        "output_s3": output_s3,
     }
     if args.format == "table":
         _print_status_table(report)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _shell_command(parts: Iterable[str | Path | None]) -> str:
+    return " ".join(shlex.quote(str(p)) for p in parts if p not in (None, ""))
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    status_parts: list[str | Path | None] = ["sweetspot", "status", args.run_id]
+    if args.profile:
+        status_parts.extend(["--profile", args.profile])
+    if args.region:
+        status_parts.extend(["--region", args.region])
+    if args.artifact_dir:
+        status_parts.extend(["--artifact-dir", args.artifact_dir])
+    if args.queue_url:
+        status_parts.extend(["--queue-url", args.queue_url])
+    if args.dlq_url:
+        status_parts.extend(["--dlq-url", args.dlq_url])
+    if args.job_queue:
+        status_parts.extend(["--job-queue", args.job_queue])
+    if args.job_name_prefix:
+        status_parts.extend(["--job-name-prefix", args.job_name_prefix])
+    if args.output_prefix:
+        status_parts.extend(["--output-prefix", args.output_prefix])
+    status_parts.extend(["--format", args.format])
+    status_command = _shell_command(status_parts)
+
+    finalize_command = None
+    if args.job_spec:
+        finalize_parts: list[str | Path | None] = ["sweetspot", "run", args.job_spec]
+        if args.profile:
+            finalize_parts.extend(["--profile", args.profile])
+        if args.region:
+            finalize_parts.extend(["--region", args.region])
+        if args.artifact_dir:
+            finalize_parts.extend(["--artifact-dir", args.artifact_dir])
+        if args.deployment:
+            finalize_parts.extend(["--deployment", args.deployment])
+        if args.input_manifest_jsonl:
+            finalize_parts.extend(["--input-manifest-jsonl", args.input_manifest_jsonl])
+        if args.canary_summary_jsonl:
+            finalize_parts.extend(["--canary-summary-jsonl", args.canary_summary_jsonl])
+        finalize_parts.extend(["--apply", "--finalize"])
+        finalize_command = _shell_command(finalize_parts)
+
+    report = {
+        "schema": "sweetspot.monitor.v1",
+        "run_id": args.run_id,
+        "interval": args.interval,
+        "until_complete": bool(args.until_complete),
+        "commands": {
+            "status": status_command,
+            "finalize": finalize_command or "rerun the reviewed production `sweetspot run ... --apply` command with `--finalize` after status shows drained workers/queues",
+        },
+        "completion_condition": "source queue visible=0 and not_visible=0, DLQ=0, and Batch active_count=0; then run finalization/validation",
+        "failure_condition": "DLQ depth > 0 or run-scoped Batch FAILED jobs; stop and diagnose before repair",
+        "notes": [
+            "This command is a non-blocking monitor scaffold; run the status command from cron/CI/Pi scheduled jobs instead of blocking an interactive agent.",
+            "Use `sweetspot status --output-prefix ...` to include S3 done-marker progress when the output prefix is known.",
+        ],
+    }
+    if args.emit_command:
+        print("# SweetSpot monitor checkpoint")
+        print(status_command)
+        if finalize_command:
+            print("# Finalize after completion condition is true")
+            print(finalize_command)
     else:
         print(json.dumps(report, indent=2, sort_keys=True))
     return 0
@@ -3681,6 +3843,14 @@ def _job_definition_log_group(job_def: dict[str, Any]) -> str | None:
     return _container_log_group(container)
 
 
+def _sqs_queue_name_from_url(queue_url: str) -> str:
+    return queue_url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _sqs_queue_arn(*, region: str, account_id: str, queue_name: str) -> str:
+    return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     try:
         validate_worker_timing(visibility_timeout=args.visibility_timeout, heartbeat_seconds=args.heartbeat_seconds, task_timeout_seconds=args.task_timeout_seconds)
@@ -3789,6 +3959,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
         checks.append(_doctor_check("batch_metrics", check_batch_metrics))
 
+    if getattr(args, "check_run_queue_create", False):
+
+        def check_run_queue_create() -> dict[str, Any]:
+            if not args.run_queue_name:
+                raise ValueError("--check-run-queue-create requires --run-queue-name")
+            sts = session.client("sts", region_name=args.region)
+            identity = sts.get_caller_identity()
+            account_id = str(identity.get("Account") or "")
+            principal_arn = str(identity.get("Arn") or "")
+            region = args.region or session.region_name
+            if not account_id or not principal_arn or not region:
+                raise ValueError("could not resolve account, principal ARN, or region for IAM simulation")
+            run_queue_arn = _sqs_queue_arn(region=region, account_id=account_id, queue_name=args.run_queue_name)
+            resource_arns = [run_queue_arn]
+            if args.run_queue_dlq_url:
+                resource_arns.append(_sqs_queue_arn(region=region, account_id=account_id, queue_name=_sqs_queue_name_from_url(args.run_queue_dlq_url)))
+            actions = ["sqs:CreateQueue", "sqs:TagQueue", "sqs:SetQueueAttributes", "sqs:GetQueueAttributes"]
+            iam = session.client("iam", region_name=args.region)
+            response = iam.simulate_principal_policy(PolicySourceArn=principal_arn, ActionNames=actions, ResourceArns=resource_arns)
+            evaluations = response.get("EvaluationResults", [])
+            denied = [
+                {"action": ev.get("EvalActionName"), "resource": ev.get("EvalResourceName"), "decision": ev.get("EvalDecision")}
+                for ev in evaluations
+                if ev.get("EvalDecision") != "allowed"
+            ]
+            if denied:
+                raise PermissionError(f"run-queue creation/update permissions are not all allowed: {denied}")
+            return {"principal_arn": principal_arn, "run_queue_arn": run_queue_arn, "resource_arns": resource_arns, "actions": actions}
+
+        checks.append(_doctor_check("run_queue_create_permissions", check_run_queue_create))
+
     if discovered_log_group:
 
         def check_logs() -> dict[str, Any]:
@@ -3815,17 +4016,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "plan", "repair", "run", "status", "version"})
+PRIMARY_COMMANDS = frozenset({"admin", "cancel", "monitor", "plan", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,plan,run,status,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,plan,run,monitor,status,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")
-    print("  status    Show run artifacts, queue depth, DLQ depth, and active workers")
+    print("  monitor   Emit non-blocking status/finalize checkpoint commands")
+    print("  status    Show run artifacts, queue depth, DLQ depth, active workers, and S3 progress")
     print("  repair    Dry-run/apply run-scoped repair planning")
     print("  cancel    Dry-run/apply run-scoped Batch job cancellation")
     print("  admin     List and run advanced/operator commands")
@@ -3865,7 +4067,22 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
     "dlq": {"apply", "dlq_url", "format", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
-    "doctor": {"dlq_url", "format", "heartbeat_seconds", "job_definition", "job_queue", "profile", "queue_url", "region", "s3_prefix", "task_timeout_seconds", "visibility_timeout"},
+    "doctor": {
+        "check_run_queue_create",
+        "dlq_url",
+        "format",
+        "heartbeat_seconds",
+        "job_definition",
+        "job_queue",
+        "profile",
+        "queue_url",
+        "region",
+        "run_queue_dlq_url",
+        "run_queue_name",
+        "s3_prefix",
+        "task_timeout_seconds",
+        "visibility_timeout",
+    },
     "enqueue-and-submit": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -3928,6 +4145,24 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "visibility_timeout",
         "worker_job_name_prefix",
     },
+    "monitor": {
+        "artifact_dir",
+        "canary_summary_jsonl",
+        "deployment",
+        "dlq_url",
+        "emit_command",
+        "format",
+        "input_manifest_jsonl",
+        "interval",
+        "job_name_prefix",
+        "job_queue",
+        "job_spec",
+        "output_prefix",
+        "profile",
+        "queue_url",
+        "region",
+        "until_complete",
+    },
     "repair-plan": {"job_name_regex", "job_queue", "log_group", "max_jobs", "out_jsonl", "profile", "region", "task_status_jsonl", "tasks_jsonl"},
     "run": {
         "allowed_s3_prefix",
@@ -3975,7 +4210,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "wait_interval_seconds",
     },
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
-    "status": {"artifact_dir", "dlq_url", "format", "job_name_prefix", "job_queue", "profile", "queue_url", "region"},
+    "status": {"artifact_dir", "dlq_url", "format", "job_name_prefix", "job_queue", "output_prefix", "profile", "queue_url", "region"},
     "submit-workers": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -4289,7 +4524,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait-interval-seconds", type=float, default=1.0)
     p.add_argument("--dedicated-run-queue", action="store_true", help="Allow reconciliation to treat SQS depth as run-specific backlog; use only with a fresh/dedicated queue")
     p.add_argument("--create-run-queue", action="store_true", help="With --deployment and --dedicated-run-queue, create or verify a controller-owned per-run SQS queue and bind production workers to it")
-    p.add_argument("--kickoff-only", action="store_true", help="Advanced/debug mode: stop after the initial Plan-sized worker wave and skip reconciliation")
+    p.add_argument("--kickoff-only", action="store_true", help="Submit the initial Plan-sized worker wave and return immediately; useful for interactive agents/CI when external or scheduled status checks handle monitoring")
     p.add_argument("--reconcile-rounds", type=int, default=1, help="Bounded controller observation rounds after initial submission (default: 1)")
     p.add_argument("--reconcile-interval-seconds", type=float, default=0.0, help="Sleep between reconciliation rounds")
     p.add_argument("--reconcile-until-drained", action="store_true", help="With --dedicated-run-queue, continue reconciliation rounds until queue backlog and active workers drain or --reconcile-rounds is reached")
@@ -4307,6 +4542,31 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("lane-manager", help=argparse.SUPPRESS, add_help=False)
     p.add_argument("lane_manager_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_lane_manager)
+
+    p = _add_parser_with_examples(
+        sub,
+        "monitor",
+        help="Emit non-blocking status/finalize checkpoint commands for schedulers or CI",
+        examples="  sweetspot monitor example-run --artifact-dir artifacts/example-run --queue-url https://sqs... --job-queue jq --output-prefix s3://bucket/run --emit-command",
+    )
+    p.add_argument("run_id")
+    p.add_argument("--profile")
+    p.add_argument("--region")
+    p.add_argument("--artifact-dir", type=Path)
+    p.add_argument("--queue-url")
+    p.add_argument("--dlq-url")
+    p.add_argument("--job-queue")
+    p.add_argument("--job-name-prefix")
+    p.add_argument("--output-prefix", help="Optional S3 output prefix to include in the generated status command")
+    p.add_argument("--interval", default="10m", help="Suggested scheduler interval; informational only")
+    p.add_argument("--until-complete", action="store_true", help="Annotate the scaffold as an until-complete checkpoint loop for external schedulers")
+    p.add_argument("--emit-command", action="store_true", help="Print shell commands instead of JSON scaffold")
+    p.add_argument("--format", choices=["json", "table"], default="json", help="Format for generated status command")
+    p.add_argument("--job-spec", type=Path, help="Optional JobSpec path; when provided, emit an exact finalize command")
+    p.add_argument("--deployment", type=Path, help="Optional deployment path for the generated finalize command")
+    p.add_argument("--input-manifest-jsonl", type=Path, help="Optional manifest path for the generated finalize command")
+    p.add_argument("--canary-summary-jsonl", type=Path, help="Optional canary summary path for the generated finalize command")
+    p.set_defaults(func=cmd_monitor)
 
     p = _add_parser_with_examples(
         sub,
@@ -4375,6 +4635,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job-queue")
     p.add_argument("--job-name-prefix", help="Batch job-name prefix to inspect; with RUN_ID it must start with RUN_ID- and defaults to RUN_ID-")
     p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory; defaults to artifacts/RUN_ID when RUN_ID is provided")
+    p.add_argument("--output-prefix", help="Optional S3 output prefix; when set, status counts done markers and estimates remaining work")
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_status)
 
@@ -4683,6 +4944,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job-definition")
     p.add_argument("--log-group")
     p.add_argument("--validate-batch-metrics", action="store_true", help="Check CloudWatch AWS/Batch JobQueue metric dimensions for this account/Region")
+    p.add_argument("--check-run-queue-create", action="store_true", help="Use IAM simulation to preflight permissions needed for controller-created per-run SQS queues")
+    p.add_argument("--run-queue-name", help="Queue name to use with --check-run-queue-create")
+    p.add_argument("--run-queue-dlq-url", help="DLQ URL whose redrive allow policy may need updates for a controller-created run queue")
     p.add_argument("--s3-prefix", action="append", default=[], help="S3 prefix to validate with ListBucket; repeatable")
     p.add_argument("--write-probe", action="store_true", help="Also write/delete a tiny object under each --s3-prefix")
     p.add_argument("--visibility-timeout", type=int, default=1800)

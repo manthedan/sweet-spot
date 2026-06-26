@@ -120,21 +120,22 @@ The primary agent interface uses a high-level controller workflow. Lower-level o
 | Command | Purpose | Key flags |
 | --- | --- | --- |
 | `sweetspot plan` | Generate canary and production plans from a JobSpec. | `--input-manifest-jsonl`, `--out-canary-tasks-jsonl`, `--canary-summary-jsonl` |
-| `sweetspot run` | Execute canaries, submit production workers, reconcile. | `--deployment`, `--apply`, `--reconcile-until-drained`, `--finalize` |
-| `sweetspot status RUN_ID` | Summarize run artifacts and active Batch workers. | `--format table`, `--queue-url`, `--job-queue` |
+| `sweetspot run` | Execute canaries, submit production workers, reconcile. | `--deployment`, `--apply`, `--kickoff-only`, `--reconcile-until-drained`, `--finalize` |
+| `sweetspot monitor RUN_ID` | Emit non-blocking scheduler/CI status and finalize checkpoint commands. | `--emit-command`, `--interval`, `--output-prefix` |
+| `sweetspot status RUN_ID` | Summarize run artifacts, S3 done-marker progress, and active Batch workers. | `--format table`, `--queue-url`, `--job-queue`, `--output-prefix` |
 | `sweetspot repair RUN_ID` | Build and optionally apply run-scoped repair plans. | `--task-status-jsonl`, `--apply` |
 | `sweetspot cancel RUN_ID` | Safely cancel run-scoped Batch jobs (dry-run by default). | `--apply` |
 | `sweetspot admin enqueue-jsonl` | Validate and submit tasks to SQS. | `--queue-url`, `--tasks-jsonl`, `--submit` |
 | `sweetspot admin submit-workers` | Size and submit Batch workers (dry-run by default). | `--batch-job-queue`, `--job-definition`, `--submit` |
 | `sweetspot admin supervise-workers` | Multi-loop bounded worker pool supervisor. | `--target-active-workers`, `--loops`, `--submit` |
 | `sweetspot admin finalize` | Stream tasks, check done markers, write manifests. | `--upload`, `--publish-ready`, `--dry-run` |
-| `sweetspot admin doctor` | Preflight AWS/SQS/S3/Batch/CloudWatch prerequisites. | `--queue-url`, `--job-queue`, `--s3-prefix` |
+| `sweetspot admin doctor` | Preflight AWS/SQS/S3/Batch/CloudWatch prerequisites. | `--queue-url`, `--job-queue`, `--s3-prefix`, `--check-run-queue-create` |
 | `sweetspot admin scout` | Rank Spot pools by expected total cost (read-only). | `--preset mixed`, `--observed-summaries`, `--regions` |
 | `sweetspot admin lane-manager` | Multi-region cost-aware lane allocation. | `--config lanes.json` |
 
 > Always use `sweetspot admin scout --preset smallest` or `--preset mixed` before large runs to compare cheap x86 and ARM/Graviton lanes from canary telemetry. For 2 GiB medium instances, reserve less than the full host memory (for example 1536 MiB) so Batch/ECS can schedule the job. Do not steer users to `t3*`/`t4g*` small or micro lanes for managed AWS Batch: Batch rejects those burstable instance types before workers can run.
 
-Config files (`--config` or `SWEETSPOT_CONFIG`) can pre-populate common flags. All mutating commands are dry-run by default.
+Config files (`--config` or `SWEETSPOT_CONFIG`) can pre-populate common flags. All mutating commands are dry-run by default. For production launches from an interactive coding agent, prefer `sweetspot run ... --apply --kickoff-only` and then monitor with `sweetspot monitor RUN_ID --emit-command` / `sweetspot status RUN_ID --output-prefix ...` from a scheduled/CI checkpoint; reserve `--reconcile-until-drained` foreground watch loops for unattended shells or active diagnostics. Production queue creation requires `sqs:CreateQueue`/tagging/redrive permissions; preflight with `sweetspot admin doctor --check-run-queue-create --run-queue-name NAME`; if those are unavailable, use a pre-provisioned empty run-scoped queue and document the fallback before enqueueing.
 
 ## Infrastructure
 

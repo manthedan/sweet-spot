@@ -16,7 +16,8 @@ sweetspot run job.json --artifact-dir artifacts/RUN_ID \
   --deployment deployment.json \
   --input-manifest-jsonl manifest.jsonl \
   --apply
-sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID
+sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command
+sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --output-prefix s3://bucket/runs/RUN_ID
 sweetspot repair RUN_ID --tasks-jsonl artifacts/RUN_ID/production_tasks.jsonl \
   --task-status-jsonl artifacts/RUN_ID/finalizer/task_status.jsonl \
   --job-queue batch-queue
@@ -100,11 +101,16 @@ sweetspot run job.json \
   --apply
 ```
 
-Legacy `--queue-url`/`--batch-job-queue`/`--job-definition` production targets remain compatibility fallbacks for operator debugging, but they bypass deployment-registry image/job-definition binding and should not be the primary agent path. Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation. Reconciliation is bounded; pass `--dedicated-run-queue --create-run-queue` to let the controller create/verify a tagged per-run SQS queue and bind production workers to that run-owned URL, so SQS depth is a valid run-specific backlog signal. Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. For a production dedicated queue, `--reconcile-until-drained --reconcile-rounds N --reconcile-interval-seconds S` turns bounded reconciliation into a watch loop that stops early only after run-scoped backlog and active workers both drain; rerun with a larger round limit to extend an already-completed watch. After workers have had time to finish, rerun the same production apply command with `--finalize` to stream done-marker validation into `artifacts/RUN_ID/finalizer/` and update the `finalize` phase in `run_state.json`; uploading manifests/READY remains explicit with `--finalize-upload` and `--finalize-publish-ready`.
+Legacy `--queue-url`/`--batch-job-queue`/`--job-definition` production targets remain compatibility fallbacks for operator debugging, but they bypass deployment-registry image/job-definition binding and should not be the primary agent path. Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation.
+
+For production, prefer a run-owned queue: pass `--dedicated-run-queue --create-run-queue` to let the controller create/verify a tagged per-run SQS queue and bind production workers to that run-owned URL, so SQS depth is a valid run-specific backlog signal. Preflight operator IAM with `sweetspot admin doctor --check-run-queue-create --run-queue-name NAME` for `sqs:CreateQueue`, queue tagging, redrive-policy updates, and any DLQ redrive-allow-policy changes. If the operator cannot create queues, stop and use a pre-provisioned empty run-scoped queue; document the fallback explicitly, set the visibility timeout from the Plan, and do not silently reuse a canary/shared queue with stale messages.
+
+Dedicated-queue top-up submits are persisted as in-flight before each Batch mutation; shared queues use conservative observation only. For interactive agent sessions, use `--kickoff-only` for production launch after the initial Plan-sized worker wave, then hand monitoring to `sweetspot monitor RUN_ID --emit-command` / `sweetspot status RUN_ID --output-prefix ...` plus a scheduled/CI checkpoint. Do not keep the foreground agent blocked in a long poll unless actively diagnosing. For unattended operators, `--reconcile-until-drained --reconcile-rounds N --reconcile-interval-seconds S` turns bounded reconciliation into a watch loop that stops early only after run-scoped backlog and active workers both drain; rerun with a larger round limit to extend an already-completed watch. After workers have had time to finish, rerun the same production apply command with `--finalize` to stream done-marker validation into `artifacts/RUN_ID/finalizer/` and update the `finalize` phase in `run_state.json`; uploading manifests/READY remains explicit with `--finalize-upload` and `--finalize-publish-ready`.
 
 ## Status, repair, and cancel
 
-- `sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID` is safe and local by default. It only calls AWS when AWS flags are provided.
+- `sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command` is the preferred way to generate non-blocking scheduler/CI checkpoint commands.
+- `sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID` is safe and local by default. It calls AWS when AWS flags are provided; with explicit `--output-prefix`, it counts S3 done markers and reports completion fraction/ETA.
 - `sweetspot repair RUN_ID ...` builds a run-scoped repair plan. Add `--apply` only after reviewing the repair JSON.
 - `sweetspot cancel RUN_ID ...` is run-scoped. Broad regex cancellation belongs to the advanced `cancel-jobs` command.
 

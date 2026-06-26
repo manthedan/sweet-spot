@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -115,7 +116,7 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,plan,run,status,repair,cancel,admin}", text)
+        self.assertIn("{version,plan,run,monitor,status,repair,cancel,admin}", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -2154,6 +2155,82 @@ class StatusTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "must start with RUN_ID"):
             main(["status", "run-1", "--job-name-prefix", "run-1"])
 
+    def test_status_counts_s3_done_markers_and_eta(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123", "Arn": "arn", "UserId": "u"}
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {
+                    "Contents": [
+                        {"Key": "runs/r1/u000/done/t0.done.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+                        {"Key": "runs/r1/u001/done/t1.done.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+                        {"Key": "runs/r1/u001/summaries/t1.summary.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+                    ],
+                    "IsTruncated": False,
+                }
+
+        class FakeSession:
+            region_name = "us-west-2"
+
+            def __init__(self, profile_name=None, region_name=None):
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "s3":
+                    return FakeS3()
+                raise AssertionError(service)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            (artifact_dir / "run_state.json").write_text(json.dumps({"schema": "sweetspot.run.v1", "run_id": "run-1", "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}}}) + "\n")
+            (artifact_dir / "production_tasks.jsonl").write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t1"}) + "\n" + json.dumps({"task_id": "t2"}) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--output-prefix", "s3://bucket/runs/r1"]), 0)
+        report = json.loads(out.getvalue())
+        progress = report["output_s3"]["done_markers"]
+        self.assertEqual(progress["count"], 2)
+        self.assertEqual(progress["expected_count"], 3)
+        self.assertEqual(progress["remaining_count"], 1)
+        self.assertAlmostEqual(progress["completion_fraction"], 2 / 3)
+        self.assertIsNotNone(progress["estimated_remaining_seconds"])
+
+
+class MonitorTests(unittest.TestCase):
+    def test_monitor_emits_status_and_finalize_commands(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                main(
+                    [
+                        "monitor",
+                        "run-1",
+                        "--artifact-dir",
+                        "artifacts/run-1",
+                        "--queue-url",
+                        "q",
+                        "--job-queue",
+                        "jq",
+                        "--output-prefix",
+                        "s3://bucket/run-1",
+                        "--job-spec",
+                        "job.json",
+                        "--emit-command",
+                    ]
+                ),
+                0,
+            )
+        text = out.getvalue()
+        self.assertIn("sweetspot status run-1", text)
+        self.assertIn("--output-prefix s3://bucket/run-1", text)
+        self.assertIn("sweetspot run job.json", text)
+        self.assertIn("--finalize", text)
+
 
 class HelpExamplesTests(unittest.TestCase):
     def test_high_traffic_help_includes_examples(self) -> None:
@@ -3766,6 +3843,58 @@ class DoctorTests(unittest.TestCase):
         names = [c["name"] for c in report["checks"]]
         self.assertIn("cloudwatch_log_group", names)
         self.assertIn("batch_metrics", names)
+
+    def test_doctor_preflights_run_queue_create_permissions(self) -> None:
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123", "Arn": "arn:aws:iam::123:user/operator", "UserId": "u"}
+
+        class FakeIAM:
+            def simulate_principal_policy(self, **kwargs):
+                return {
+                    "EvaluationResults": [
+                        {"EvalActionName": action, "EvalResourceName": kwargs["ResourceArns"][0], "EvalDecision": "allowed"}
+                        for action in kwargs["ActionNames"]
+                    ]
+                }
+
+        class FakeSession:
+            region_name = "us-west-2"
+
+            def client(self, service: str, region_name=None):
+                if service == "sts":
+                    return FakeSTS()
+                if service == "iam":
+                    return FakeIAM()
+                raise AssertionError(service)
+
+        args = types.SimpleNamespace(
+            profile=None,
+            region="us-west-2",
+            queue_url="",
+            dlq_url=None,
+            job_queue=None,
+            job_definition=None,
+            log_group=None,
+            validate_batch_metrics=False,
+            check_run_queue_create=True,
+            run_queue_name="sweetspot-run-1",
+            run_queue_dlq_url="https://sqs.us-west-2.amazonaws.com/123/dlq",
+            s3_prefix=[],
+            write_probe=False,
+            visibility_timeout=1800,
+            heartbeat_seconds=300,
+            task_timeout_seconds=3600,
+            redact_regex=[],
+            format="json",
+        )
+        out = io.StringIO()
+        with patch("sweetspot.cli.boto3.Session", return_value=FakeSession()), contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_doctor(args), 0)
+        report = json.loads(out.getvalue())
+        check = next(c for c in report["checks"] if c["name"] == "run_queue_create_permissions")
+        self.assertTrue(check["ok"])
+        self.assertEqual(check["details"]["run_queue_arn"], "arn:aws:sqs:us-west-2:123:sweetspot-run-1")
 
 
 class ReadCommandTableTests(unittest.TestCase):

@@ -15,7 +15,7 @@
 | F. Argument duplication | **RESOLVED** | `96181f7` |
 | G. No config file support | **RESOLVED** | `6b4cfb8` |
 | H. finalize --dry-run | **RESOLVED** | `7808fd4` |
-| I. No progress output | **NOT ADDRESSED** | - |
+| I. No progress output | **IMPROVED** | `--kickoff-only`, `sweetspot monitor`, `status --output-prefix` |
 | J. No sweetspot init | **NOT ADDRESSED** | - |
 | K. logs --limit/--tail confusion | **RESOLVED** | `590fee6` |
 | L. No cancel/drain | **PARTIALLY RESOLVED** | `7a78615` (cancel-jobs only) |
@@ -127,11 +127,13 @@ Every other mutating command has dry-run semantics, but `finalize --upload` imme
 
 **Recommendation**: Add `--dry-run` to `finalize` that validates tasks and checks done markers but doesn't write manifests or upload.
 
-### I. No progress output during long operations
+### I. No progress output / non-blocking monitor path during long operations
 
-`finalize` has `--progress-interval` (default 1000) but only prints to stderr. `supervise-workers` writes to JSONL but prints nothing to stdout per loop. For long-running operations, there's no visual feedback.
+`finalize` has `--progress-interval` (default 1000) but only prints to stderr. `supervise-workers` writes to JSONL but prints nothing to stdout per loop. `sweetspot run --reconcile-until-drained` can intentionally run for many rounds; that is appropriate for an unattended shell, but it is a poor default for an interactive coding agent because it ties up the main session while merely polling.
 
-**Recommendation**: Add optional progress bars or at least periodic single-line status updates for `finalize`, `supervise-workers`, `s3-delete-prefix`.
+**Implemented improvement**: `--kickoff-only` is now surfaced as the preferred interactive-agent production launch path; `sweetspot monitor RUN_ID --artifact-dir ... --queue-url ... --job-queue ... --interval 10m --until-complete --emit-command` prints exact status/finalize checkpoint commands; `sweetspot status --output-prefix ...` counts S3 done markers and reports completion fraction/ETA.
+
+**Remaining**: Add optional progress bars or periodic single-line status updates for `finalize`, `supervise-workers`, and `s3-delete-prefix`.
 
 ### J. No `sweetspot init` or guided setup
 
