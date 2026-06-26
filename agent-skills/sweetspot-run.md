@@ -110,7 +110,7 @@ Legacy `--queue-url`/`--batch-job-queue`/`--job-definition` production targets r
 
 ## ARM/Graviton policy
 
-Keep x86 as the safe default, but do not assume larger instances are cheaper. Before production, run or inspect small-lane canaries/scout results for 1 vCPU shapes such as `c7a.medium`, `c7g.medium`, and `c6g.medium`. Include `arm64` in `constraints.architectures` only when the image is multi-arch and you are prepared to canary ARM compatibility. ARM is selected only from successful measured canaries and is rejected on validation/runtime failure or materially worse measured cost per useful unit. Use separate x86/ARM queues and job definitions for mixed-architecture operation. For 2 GiB medium instances, reserve less than 2048 MiB in Batch (start around 1536 MiB) so ECS/Batch can schedule the worker.
+Keep x86 as the safe default, but do not assume larger instances are cheaper. Before production, run or inspect small-lane canaries/scout results for 1 vCPU shapes such as `c7a.medium`, `c7g.medium`, and `c6g.medium`. Include `arm64` in `constraints.architectures` only when the image is multi-arch and you are prepared to canary ARM compatibility. ARM is selected only from successful measured canaries and is rejected on validation/runtime failure or materially worse measured cost per useful unit. Use separate x86/ARM queues and job definitions for mixed-architecture operation. For 2 GiB medium instances, reserve less than 2048 MiB in Batch (start around 1536 MiB) so ECS/Batch can schedule the worker. Do not downshift managed Batch users to `t3*`/`t4g*` small or micro lanes: AWS Batch rejects these burstable instance types at compute-environment creation, before an OOM/failure canary can run.
 
 ## Advanced commands
 
