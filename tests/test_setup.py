@@ -19,6 +19,7 @@ from sweetspot.setup import (
     WORKER_NOTES_PATH,
     WORKER_SCAFFOLD_PATH,
     SetupSpecError,
+    doctor_project,
     dump_setup,
     load_setup,
     render_deployment_template,
@@ -280,6 +281,128 @@ class SetupModelTests(unittest.TestCase):
             self.assertIn(expected, combined_bundle)
         for forbidden in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "BEGIN PRIVATE KEY", "123456789012"]:
             self.assertNotIn(forbidden, combined_bundle)
+
+    def test_doctor_project_accepts_generated_bundle_and_warns_on_review_placeholders(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            report = doctor_project(project_dir / ".sweetspot")
+
+        self.assertEqual(report["schema"], "sweetspot.project.doctor.v1")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "warning")
+        self.assertEqual(report["project_dir"], (project_dir / ".sweetspot").resolve().as_posix())
+        self.assertEqual(report["root_dir"], project_dir.resolve().as_posix())
+        self.assertEqual(report["summary"]["checks"], {"pass": 4, "warning": 1, "fail": 0})
+        self.assertEqual(report["summary"]["findings"]["error"], 0)
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertEqual(set(checks), {"setup_config", "generated_artifacts", "planner_job", "secret_scan", "placeholder_review"})
+        self.assertEqual(checks["setup_config"]["status"], "pass")
+        self.assertEqual(checks["generated_artifacts"]["status"], "pass")
+        self.assertEqual(checks["planner_job"]["status"], "pass")
+        self.assertEqual(checks["secret_scan"]["status"], "pass")
+        self.assertEqual(checks["placeholder_review"]["status"], "warning")
+        self.assertTrue(all(finding["severity"] == "warning" for finding in checks["placeholder_review"]["findings"]))
+        self.assertTrue(all(finding["code"] == "review_placeholder" for finding in checks["placeholder_review"]["findings"]))
+
+    def test_doctor_project_accepts_project_root_containing_sweetspot_directory(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            from_root = doctor_project(project_dir)
+            from_sweetspot = doctor_project(project_dir / ".sweetspot")
+
+        self.assertEqual(from_root["project_dir"], from_sweetspot["project_dir"])
+        self.assertEqual(from_root["root_dir"], from_sweetspot["root_dir"])
+        self.assertEqual(from_root["summary"], from_sweetspot["summary"])
+
+    def test_doctor_project_reports_missing_setup_config_as_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sweetspot_dir = Path(tmpdir) / ".sweetspot"
+            sweetspot_dir.mkdir()
+            report = doctor_project(sweetspot_dir)
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(checks["setup_config"]["status"], "fail")
+        self.assertEqual(checks["setup_config"]["findings"][0]["code"], "missing_setup_config")
+        self.assertEqual(checks["setup_config"]["findings"][0]["severity"], "error")
+
+    def test_doctor_project_reports_missing_job_artifact(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            (project_dir / JOB_SPEC_PATH).unlink()
+            report = doctor_project(project_dir / ".sweetspot")
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["generated_artifacts"]["status"], "fail")
+        self.assertIn("missing_generated_artifact", {finding["code"] for finding in checks["generated_artifacts"]["findings"]})
+        self.assertEqual(checks["planner_job"]["status"], "fail")
+        self.assertEqual(checks["planner_job"]["findings"][0]["code"], "missing_job_artifact")
+
+    def test_doctor_project_reports_malformed_setup_without_throwing(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sweetspot_dir = Path(tmpdir) / ".sweetspot"
+            sweetspot_dir.mkdir()
+            (sweetspot_dir / "sweetspot.yaml").write_text(f"schema: sweetspot.project.v1\naws_access_key_id: {secret_text}\n", encoding="utf-8")
+            report = doctor_project(sweetspot_dir)
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["setup_config"]["status"], "fail")
+        setup_finding = checks["setup_config"]["findings"][0]
+        self.assertEqual(setup_finding["code"], "invalid_setup_config")
+        self.assertNotIn(secret_text, setup_finding["message"])
+        secret_findings = checks["secret_scan"]["findings"]
+        self.assertTrue(secret_findings)
+        self.assertTrue(all(secret_text not in str(finding) for finding in secret_findings))
+
+    def test_doctor_project_reports_planner_incompatible_job_json(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            job_path = project_dir / JOB_SPEC_PATH
+            job_data = json.loads(job_path.read_text(encoding="utf-8"))
+            job_data["constraints"]["architectures"] = ["gpu"]
+            job_path.write_text(json.dumps(job_data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            report = doctor_project(project_dir / ".sweetspot")
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["planner_job"]["status"], "fail")
+        self.assertEqual(checks["planner_job"]["findings"][0]["code"], "planner_incompatible_job")
+        self.assertIn("unsupported architecture", checks["planner_job"]["findings"][0]["message"])
+
+    def test_doctor_project_scans_text_artifacts_for_sanitized_secret_findings(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        secret_text = "Bearer abcdefghijklmnopqrstuvwxyz123456"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            notes_path = project_dir / WORKER_NOTES_PATH
+            notes_path.write_text(notes_path.read_text(encoding="utf-8") + f"\n{secret_text}\n", encoding="utf-8")
+            report = doctor_project(project_dir / ".sweetspot")
+
+        checks = {check["name"]: check for check in report["checks"]}
+        self.assertFalse(report["ok"])
+        self.assertEqual(checks["secret_scan"]["status"], "fail")
+        findings = checks["secret_scan"]["findings"]
+        self.assertTrue(any(finding["code"] == "secret_value_bearer_token" for finding in findings))
+        self.assertTrue(any(finding["path"].startswith(WORKER_NOTES_PATH) for finding in findings))
+        self.assertTrue(all(secret_text not in str(finding) for finding in findings))
 
     def test_write_project_context_conflicts_fail_closed_unless_overwrite_true(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")

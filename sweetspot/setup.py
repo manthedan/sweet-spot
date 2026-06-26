@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .planner import JOB_SPEC_SCHEMA_V1, validate_job_spec
+from .planner import JOB_SPEC_SCHEMA_V1, PlannerSpecError, load_job_spec, validate_job_spec
 
 
 SETUP_SCHEMA_V1 = "sweetspot.project.v1"
@@ -33,6 +33,10 @@ WORKER_NOTES_PATH = f"{SWEETSPOT_DIR}/{WORKER_NOTES}"
 WORKER_SCAFFOLD_PATH = f"{SWEETSPOT_DIR}/{WORKER_SCAFFOLD}"
 INFRA_VARS_STUB_PATH = f"{SWEETSPOT_DIR}/{INFRA_VARS_STUB}"
 NEXT_STEPS_PATH = f"{SWEETSPOT_DIR}/{NEXT_STEPS}"
+
+DOCTOR_SCHEMA_V1 = "sweetspot.project.doctor.v1"
+DOCTOR_STATUSES = {"pass", "warning", "fail"}
+DOCTOR_SEVERITIES = {"info", "warning", "error"}
 
 LAYOUT_FILES = {
     "config": SWEETSPOT_CONFIG_PATH,
@@ -370,6 +374,183 @@ def write_project_context(config: SweetSpotProject | dict[str, Any], project_dir
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     return destinations
+
+
+def doctor_project(project_dir: Path) -> dict[str, Any]:
+    """Return a deterministic, read-only diagnostic report for a generated `.sweetspot/` bundle.
+
+    `project_dir` is expected to be the contained `.sweetspot/` directory.  As a
+    convenience for humans, a project root that already contains `.sweetspot/` is
+    also accepted.  The helper performs local file reads only; it never writes
+    project context, imports AWS SDKs, or contacts AWS.
+    """
+    requested_dir = Path(project_dir).expanduser()
+    sweetspot_dir = _resolve_doctor_sweetspot_dir(requested_dir)
+    root_dir = sweetspot_dir.parent
+    checks: list[dict[str, Any]] = []
+
+    config_path = sweetspot_dir / SWEETSPOT_CONFIG
+    setup_config: SweetSpotProject | None = None
+    setup_data: Any = None
+    if not config_path.exists():
+        checks.append(_doctor_check("setup_config", "fail", config_path, [_doctor_finding("missing_setup_config", "error", "setup config is missing", config_path, root_dir)]))
+    else:
+        try:
+            setup_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            setup_config = validate_setup(setup_data)
+        except (OSError, yaml.YAMLError, SetupSpecError) as exc:
+            checks.append(_doctor_check("setup_config", "fail", config_path, [_doctor_finding("invalid_setup_config", "error", _sanitize_error_message(exc), config_path, root_dir)]))
+        else:
+            checks.append(_doctor_check("setup_config", "pass", config_path, []))
+
+    artifact_paths = _doctor_artifact_paths(root_dir, setup_config)
+    missing_artifacts = [path for path in artifact_paths.values() if not path.exists()]
+    if missing_artifacts:
+        checks.append(
+            _doctor_check(
+                "generated_artifacts",
+                "fail",
+                sweetspot_dir,
+                [_doctor_finding("missing_generated_artifact", "error", "generated artifact is missing", path, root_dir) for path in missing_artifacts],
+            )
+        )
+    else:
+        checks.append(_doctor_check("generated_artifacts", "pass", sweetspot_dir, []))
+
+    job_path = artifact_paths["job"]
+    if job_path.exists():
+        try:
+            load_job_spec(job_path)
+        except PlannerSpecError as exc:
+            checks.append(_doctor_check("planner_job", "fail", job_path, [_doctor_finding("planner_incompatible_job", "error", _sanitize_error_message(exc), job_path, root_dir)]))
+        else:
+            checks.append(_doctor_check("planner_job", "pass", job_path, []))
+    else:
+        checks.append(_doctor_check("planner_job", "fail", job_path, [_doctor_finding("missing_job_artifact", "error", "job artifact is missing", job_path, root_dir)]))
+
+    scannable_paths = _existing_doctor_scan_paths(config_path, artifact_paths)
+    secret_findings = _doctor_secret_findings(scannable_paths, root_dir)
+    checks.append(_doctor_check("secret_scan", "fail" if secret_findings else "pass", sweetspot_dir, secret_findings))
+
+    placeholder_findings = _doctor_placeholder_findings(scannable_paths, root_dir)
+    checks.append(_doctor_check("placeholder_review", "warning" if placeholder_findings else "pass", sweetspot_dir, placeholder_findings))
+
+    return _doctor_report(sweetspot_dir, root_dir, checks)
+
+
+def _resolve_doctor_sweetspot_dir(path: Path) -> Path:
+    if path.name == SWEETSPOT_DIR:
+        return path.resolve()
+    contained = path / SWEETSPOT_DIR
+    if contained.exists():
+        return contained.resolve()
+    return path.resolve()
+
+
+def _doctor_artifact_paths(root_dir: Path, setup_config: SweetSpotProject | None) -> dict[str, Path]:
+    bootstrap = setup_config.bootstrap if setup_config is not None else BootstrapLayout()
+    return {
+        "config": root_dir / SWEETSPOT_CONFIG_PATH,
+        "doc": root_dir / SWEETSPOT_DOC_PATH,
+        "job": root_dir / bootstrap.job,
+        "deployment_template": root_dir / bootstrap.deployment_template,
+        "worker_notes": root_dir / bootstrap.worker_notes,
+        "worker_scaffold": root_dir / bootstrap.worker_scaffold,
+        "infra_vars_stub": root_dir / bootstrap.infra_vars_stub,
+        "next_steps": root_dir / bootstrap.next_steps,
+    }
+
+
+def _existing_doctor_scan_paths(config_path: Path, artifact_paths: dict[str, Path]) -> list[Path]:
+    paths = [config_path, *artifact_paths.values()]
+    unique: dict[str, Path] = {}
+    for path in paths:
+        if path.exists() and path.is_file():
+            unique[path.resolve().as_posix()] = path
+    return [unique[key] for key in sorted(unique)]
+
+
+def _doctor_secret_findings(paths: list[Path], root_dir: Path) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    for path in paths:
+        value = _doctor_load_scannable_value(path)
+        for finding in scan_for_secrets(value):
+            findings.append(
+                {
+                    "path": f"{_display_path(path, root_dir)}:{finding.path}",
+                    "code": finding.code,
+                    "severity": finding.severity,
+                    "message": finding.message,
+                }
+            )
+    return sorted(findings, key=lambda item: (item["path"], item["code"], item["severity"]))
+
+
+def _doctor_load_scannable_value(path: Path) -> Any:
+    text = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".json":
+            return json.loads(text)
+        if suffix in {".yaml", ".yml"}:
+            parsed = yaml.safe_load(text)
+            return parsed if parsed is not None else ""
+    except (json.JSONDecodeError, yaml.YAMLError):
+        return text
+    return text
+
+
+def _doctor_placeholder_findings(paths: list[Path], root_dir: Path) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        if _PLACEHOLDER_RE.search(text):
+            findings.append(_doctor_finding("review_placeholder", "warning", "review-only placeholder material is present", path, root_dir))
+    return sorted(findings, key=lambda item: (item["path"], item["code"], item["severity"]))
+
+
+def _doctor_check(name: str, status: str, path: Path, findings: list[dict[str, str]]) -> dict[str, Any]:
+    if status not in DOCTOR_STATUSES:
+        raise ValueError(f"unknown doctor check status: {status}")
+    return {"name": name, "status": status, "path": path.as_posix(), "findings": findings}
+
+
+def _doctor_finding(code: str, severity: str, message: str, path: Path, root_dir: Path) -> dict[str, str]:
+    if severity not in DOCTOR_SEVERITIES:
+        raise ValueError(f"unknown doctor finding severity: {severity}")
+    return {"path": _display_path(path, root_dir), "code": code, "severity": severity, "message": message}
+
+
+def _doctor_report(sweetspot_dir: Path, root_dir: Path, checks: list[dict[str, Any]]) -> dict[str, Any]:
+    findings = [finding for check in checks for finding in check["findings"]]
+    error_count = sum(1 for finding in findings if finding["severity"] == "error")
+    warning_count = sum(1 for finding in findings if finding["severity"] == "warning")
+    info_count = sum(1 for finding in findings if finding["severity"] == "info")
+    failed_checks = sum(1 for check in checks if check["status"] == "fail")
+    warning_checks = sum(1 for check in checks if check["status"] == "warning")
+    passed_checks = sum(1 for check in checks if check["status"] == "pass")
+    status = "fail" if failed_checks else "warning" if warning_checks or warning_count else "pass"
+    return {
+        "schema": DOCTOR_SCHEMA_V1,
+        "ok": status != "fail",
+        "status": status,
+        "project_dir": sweetspot_dir.as_posix(),
+        "root_dir": root_dir.as_posix(),
+        "summary": {
+            "checks": {"pass": passed_checks, "warning": warning_checks, "fail": failed_checks},
+            "findings": {"error": error_count, "warning": warning_count, "info": info_count},
+            "total_checks": len(checks),
+            "total_findings": len(findings),
+        },
+        "checks": checks,
+    }
+
+
+def _sanitize_error_message(exc: BaseException) -> str:
+    message = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    for pattern in (_AWS_ACCESS_KEY_ID_RE, _BEARER_TOKEN_RE, _PRIVATE_KEY_RE):
+        message = pattern.sub("[redacted]", message)
+    return message
 
 
 def setup_to_dict(config: SweetSpotProject) -> dict[str, Any]:
