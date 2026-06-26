@@ -21,8 +21,13 @@ from sweetspot.setup import (
     SetupSpecError,
     dump_setup,
     load_setup,
+    render_deployment_template,
+    render_infra_vars_stub,
+    render_next_steps,
     render_starter_job_spec,
     render_sweetspot_doc,
+    render_worker_notes,
+    render_worker_scaffold,
     scan_for_secrets,
     setup_to_dict,
     validate_setup,
@@ -185,32 +190,47 @@ class SetupModelTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 load_setup(path)
 
-    def test_write_project_context_round_trips_and_renders_sweetspot_doc_and_job_spec(self) -> None:
+    def test_write_project_context_round_trips_and_renders_full_starter_bundle(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        expected_paths = [
+            SWEETSPOT_CONFIG_PATH,
+            SWEETSPOT_DOC_PATH,
+            JOB_SPEC_PATH,
+            DEPLOYMENT_TEMPLATE_PATH,
+            WORKER_NOTES_PATH,
+            WORKER_SCAFFOLD_PATH,
+            INFRA_VARS_STUB_PATH,
+            NEXT_STEPS_PATH,
+        ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             written = write_project_context(config, project_dir)
 
-            self.assertEqual(
-                written,
-                [project_dir / SWEETSPOT_CONFIG_PATH, project_dir / SWEETSPOT_DOC_PATH, project_dir / JOB_SPEC_PATH],
-            )
+            self.assertEqual([path.relative_to(project_dir).as_posix() for path in written], expected_paths)
             self.assertEqual(load_setup(project_dir / SWEETSPOT_CONFIG_PATH), config)
-            self.assertFalse((project_dir / DEPLOYMENT_TEMPLATE_PATH).exists())
-            self.assertFalse((project_dir / WORKER_NOTES_PATH).exists())
-            self.assertFalse((project_dir / WORKER_SCAFFOLD_PATH).exists())
-            self.assertFalse((project_dir / INFRA_VARS_STUB_PATH).exists())
-            self.assertFalse((project_dir / NEXT_STEPS_PATH).exists())
+            self.assertTrue((project_dir / WORKER_NOTES_PATH).parent.is_dir())
+            self.assertTrue((project_dir / INFRA_VARS_STUB_PATH).parent.is_dir())
+            self.assertTrue(all((project_dir / path).exists() for path in expected_paths))
 
             doc = (project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8")
             job_path = project_dir / JOB_SPEC_PATH
             job_text = job_path.read_text(encoding="utf-8")
             loaded_job = load_job_spec(job_path)
+            deployment_text = (project_dir / DEPLOYMENT_TEMPLATE_PATH).read_text(encoding="utf-8")
+            worker_notes = (project_dir / WORKER_NOTES_PATH).read_text(encoding="utf-8")
+            worker_scaffold = (project_dir / WORKER_SCAFFOLD_PATH).read_text(encoding="utf-8")
+            infra_text = (project_dir / INFRA_VARS_STUB_PATH).read_text(encoding="utf-8")
+            next_steps = (project_dir / NEXT_STEPS_PATH).read_text(encoding="utf-8")
 
         self.assertEqual(doc, render_sweetspot_doc(config))
         self.assertEqual(job_text, render_starter_job_spec(config))
-        self.assertTrue(job_text.endswith("\n"))
+        self.assertEqual(deployment_text, render_deployment_template(config))
+        self.assertEqual(worker_notes, render_worker_notes(config))
+        self.assertEqual(worker_scaffold, render_worker_scaffold(config))
+        self.assertEqual(infra_text, render_infra_vars_stub(config))
+        self.assertEqual(next_steps, render_next_steps(config))
+        self.assertTrue(all(text.endswith("\n") for text in [doc, job_text, deployment_text, worker_notes, worker_scaffold, infra_text, next_steps]))
         self.assertEqual(json.loads(job_text), loaded_job)
         self.assertEqual(loaded_job["schema"], "sweetspot.job.v1")
         self.assertEqual(loaded_job["run_id"], "example-batch-project-starter-run")
@@ -222,43 +242,80 @@ class SetupModelTests(unittest.TestCase):
         self.assertEqual(loaded_job["validation"], {"output_check": "done_marker"})
         self.assertFalse(FORBIDDEN_PRIMARY_JOB_SPEC_KEYS.intersection(loaded_job))
         self.assertEqual(scan_for_secrets(loaded_job), ())
-        self.assertIn("example-batch-project", doc)
-        self.assertIn("s3://example-sweetspot-input/manifests/tasks.jsonl", doc)
-        self.assertIn("s3://example-sweetspot-output/runs/example/", doc)
-        self.assertIn("python worker.py --task {task_json}", doc)
-        self.assertIn("x86_64", doc)
-        self.assertIn("us-west-2", doc)
-        self.assertIn("profile", doc)
-        self.assertIn("sweetspot-dev", doc)
-        self.assertIn(JOB_SPEC_PATH, doc)
-        self.assertIn(DEPLOYMENT_TEMPLATE_PATH, doc)
-        self.assertIn(WORKER_NOTES_PATH, doc)
-        self.assertIn(WORKER_SCAFFOLD_PATH, doc)
-        self.assertIn(INFRA_VARS_STUB_PATH, doc)
-        self.assertIn(NEXT_STEPS_PATH, doc)
-        self.assertIn("No AWS resources have been created", doc)
-        self.assertIn("No secrets or AWS credential values are stored", doc)
+
+        deployment = json.loads(deployment_text)
+        infra = json.loads(infra_text)
+        self.assertEqual(deployment["schema"], "sweetspot.deployment.template.v1")
+        self.assertEqual(deployment["aws"]["region"], "us-west-2")
+        self.assertEqual(deployment["aws"]["auth"], {"method": "profile", "reference": "sweetspot-dev"})
+        self.assertEqual(deployment["resources"]["container"]["architecture"], "x86_64")
+        self.assertFalse(deployment["ready_to_deploy"])
+        self.assertEqual(deployment["status"], "template-review-only")
+        self.assertIn("TODO", deployment["resources"]["batch"]["job_queue"])
+        self.assertFalse(infra["ready_for_apply"])
+        self.assertEqual(infra["review_status"], "template-review-only")
+        self.assertEqual(infra["auth_reference"], "sweetspot-dev")
+        self.assertEqual(infra["architecture"], "x86_64")
+
+        combined_bundle = "\n".join([doc, job_text, deployment_text, worker_notes, worker_scaffold, infra_text, next_steps])
+        for expected in [
+            "example-batch-project",
+            "s3://example-sweetspot-input/manifests/tasks.jsonl",
+            "s3://example-sweetspot-output/runs/example/",
+            "python worker.py --task {task_json}",
+            "x86_64",
+            "us-west-2",
+            "profile",
+            "sweetspot-dev",
+            JOB_SPEC_PATH,
+            DEPLOYMENT_TEMPLATE_PATH,
+            WORKER_NOTES_PATH,
+            WORKER_SCAFFOLD_PATH,
+            INFRA_VARS_STUB_PATH,
+            NEXT_STEPS_PATH,
+            "starter bundle for review/customization",
+            "No AWS resources have been created",
+            "TODO templates, not deployable infrastructure",
+        ]:
+            self.assertIn(expected, combined_bundle)
+        for forbidden in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "BEGIN PRIVATE KEY", "123456789012"]:
+            self.assertNotIn(forbidden, combined_bundle)
 
     def test_write_project_context_conflicts_fail_closed_unless_overwrite_true(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        expected_paths = [
+            SWEETSPOT_CONFIG_PATH,
+            SWEETSPOT_DOC_PATH,
+            JOB_SPEC_PATH,
+            DEPLOYMENT_TEMPLATE_PATH,
+            WORKER_NOTES_PATH,
+            WORKER_SCAFFOLD_PATH,
+            INFRA_VARS_STUB_PATH,
+            NEXT_STEPS_PATH,
+        ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             write_project_context(config, project_dir)
-            original_config_text = (project_dir / SWEETSPOT_CONFIG_PATH).read_text(encoding="utf-8")
-            original_doc_text = (project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8")
+            originals = {path: (project_dir / path).read_text(encoding="utf-8") for path in expected_paths}
 
             with self.assertRaisesRegex(FileExistsError, r"\.sweetspot/sweetspot\.yaml") as ctx:
                 write_project_context(config, project_dir)
 
-            self.assertIn(".sweetspot/SWEETSPOT.md", str(ctx.exception))
-            self.assertIn(".sweetspot/job.json", str(ctx.exception))
-            self.assertEqual((project_dir / SWEETSPOT_CONFIG_PATH).read_text(encoding="utf-8"), original_config_text)
-            self.assertEqual((project_dir / SWEETSPOT_DOC_PATH).read_text(encoding="utf-8"), original_doc_text)
+            for path in expected_paths:
+                self.assertIn(path, str(ctx.exception))
+                self.assertEqual((project_dir / path).read_text(encoding="utf-8"), originals[path])
+
+            (project_dir / WORKER_SCAFFOLD_PATH).write_text("custom local worker\n", encoding="utf-8")
+            with self.assertRaisesRegex(FileExistsError, r"\.sweetspot/worker/worker\.py"):
+                write_project_context(config, project_dir)
+            self.assertEqual((project_dir / WORKER_SCAFFOLD_PATH).read_text(encoding="utf-8"), "custom local worker\n")
 
             written = write_project_context(config, project_dir, overwrite=True)
+            overwritten_worker = (project_dir / WORKER_SCAFFOLD_PATH).read_text(encoding="utf-8")
 
-        self.assertEqual([path.relative_to(project_dir).as_posix() for path in written], [SWEETSPOT_CONFIG_PATH, SWEETSPOT_DOC_PATH, JOB_SPEC_PATH])
+        self.assertEqual([path.relative_to(project_dir).as_posix() for path in written], expected_paths)
+        self.assertEqual(overwritten_worker, render_worker_scaffold(config))
 
     def test_write_project_context_rejects_secret_bearing_config_without_writes(self) -> None:
         data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
