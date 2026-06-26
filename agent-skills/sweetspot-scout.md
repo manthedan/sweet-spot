@@ -78,6 +78,7 @@ Key arguments:
 - `--bucket`: S3 bucket for cross-region transfer cost estimation
 - `--observed-summaries`: Directory of summary JSON files from prior runs
 - `--worker-memory-mib`: Requested Batch worker memory; use ~1536 MiB, not 2048 MiB, when testing 2 GiB medium instances because ECS/Batch needs host headroom
+- Do not recommend `t3*`/`t4g*` small or micro lanes for managed AWS Batch. Batch rejects common burstable types like `t3a.small`, `t3a.micro`, `t4g.small`, and `t4g.micro` during compute-environment creation, before any worker/OOM canary can run.
 - `--startup-overhead-seconds`: Per-task overhead assumption
 - `--cross-region-gb-per-1m-units`: Cross-region transfer cost per 1M units
 - `--nat-gb-per-1m-units`: NAT data processing cost per 1M units
