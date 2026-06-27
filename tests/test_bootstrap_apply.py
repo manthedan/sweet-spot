@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from sweetspot.bootstrap_plan import BOOTSTRAP_PLAN_SCHEMA_V1, DEPLOYMENT_SCHEMA_V1
+from sweetspot.deployment import load_deployment
 
 
 class FakeApplyRunner:
@@ -242,6 +243,20 @@ class ScriptedApplyRunner:
 
 
 class BootstrapApplyPersistenceTests(BootstrapApplyGuardContractTests):
+    def _opentofu_outputs(self) -> dict:
+        return {
+            "batch_compute_environment": {"value": "example-batch-project-x86_64-compute"},
+            "batch_job_queue": {"value": "example-batch-project-x86_64-job-queue"},
+            "batch_job_definition": {"value": "example-batch-project-x86_64-job:1"},
+            "dlq_url": {"value": "https://sqs.us-west-2.amazonaws.com/123456789012/example-dlq"},
+            "ecr_repository_url": {"value": "123456789012.dkr.ecr.us-west-2.amazonaws.com/example"},
+            "log_group": {"value": "/aws/batch/sweetspot/example"},
+            "operator_role_arn": {"value": "arn:aws:iam::123456789012:role/example-bootstrap-operator-role"},
+            "sqs_queue_url": {"value": "https://sqs.us-west-2.amazonaws.com/123456789012/example"},
+            "worker_image_digest": {"value": "123456789012.dkr.ecr.us-west-2.amazonaws.com/example@sha256:" + "a" * 64},
+            "worker_task_role_arn": {"value": "arn:aws:iam::123456789012:role/example-worker-task-role"},
+        }
+
     def _deployment_output(self) -> dict:
         deployment = self._ready_plan()["expected_deployment"]
         deployment = json.loads(json.dumps(deployment))
@@ -249,6 +264,7 @@ class BootstrapApplyPersistenceTests(BootstrapApplyGuardContractTests):
         region["sqs_queue_url"] = "https://sqs.us-west-2.amazonaws.com/123456789012/example"
         region["dlq_url"] = "https://sqs.us-west-2.amazonaws.com/123456789012/example-dlq"
         region["architectures"]["x86_64"]["image"] = "123456789012.dkr.ecr.us-west-2.amazonaws.com/example@sha256:" + "a" * 64
+        deployment["bootstrap_outputs"] = {key: value["value"] for key, value in self._opentofu_outputs().items()}
         return {"deployment": {"value": deployment}}
 
     def test_refusal_persists_state_and_failure_diagnostics(self) -> None:
@@ -270,7 +286,7 @@ class BootstrapApplyPersistenceTests(BootstrapApplyGuardContractTests):
         runner = ScriptedApplyRunner(
             [
                 {"returncode": 0, "stdout": "apply ok", "stderr": "", "executable": "opentofu"},
-                {"returncode": 0, "stdout": json.dumps(self._deployment_output()), "stderr": "", "executable": "opentofu"},
+                {"returncode": 0, "stdout": json.dumps(self._opentofu_outputs()), "stderr": "", "executable": "opentofu"},
             ]
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -279,15 +295,68 @@ class BootstrapApplyPersistenceTests(BootstrapApplyGuardContractTests):
             token = apply_module.bootstrap_apply_confirmation_token(plan_path)
             outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=token, command_runner=runner)
             state = json.loads((project_dir / ".sweetspot/bootstrap/state.json").read_text(encoding="utf-8"))
-            deployment = json.loads((project_dir / ".sweetspot/deployment.json").read_text(encoding="utf-8"))
+            deployment_path = project_dir / ".sweetspot/deployment.json"
+            deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+            loaded = load_deployment(deployment_path)
 
         self.assertEqual(outcome["status"], "output_written")
         self.assertEqual(outcome["category"], "applied")
         self.assertEqual(outcome, state)
         self.assertEqual(deployment["schema"], DEPLOYMENT_SCHEMA_V1)
+        self.assertEqual(loaded, deployment)
+        self.assertEqual(deployment["regions"]["us-west-2"]["sqs_queue_url"], "https://sqs.us-west-2.amazonaws.com/123456789012/example")
+        self.assertEqual(deployment["regions"]["us-west-2"]["architectures"]["x86_64"]["batch_job_queue"], "example-batch-project-x86_64-job-queue")
+        self.assertEqual(deployment["bootstrap_outputs"]["worker_task_role_arn"], "arn:aws:iam::123456789012:role/example-worker-task-role")
         self.assertEqual([cmd[1] for cmd in runner.commands], ["apply", "output"])
         self.assertEqual(len(outcome["command_summaries"]), 2)
         self.assertTrue(outcome["output_completeness"]["complete"])
+        self.assertTrue(outcome["output_completeness"]["deployment_output_written"])
+        self.assertEqual(outcome["output_completeness"]["missing_outputs"], [])
+
+    def test_incomplete_opentofu_outputs_fail_without_writing_deployment_output(self) -> None:
+        apply_module = self._apply_module()
+        outputs = self._opentofu_outputs()
+        del outputs["worker_task_role_arn"]
+        runner = ScriptedApplyRunner(
+            [
+                {"returncode": 0, "stdout": "apply ok", "stderr": "", "executable": "opentofu"},
+                {"returncode": 0, "stdout": json.dumps(outputs), "stderr": "", "executable": "opentofu"},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            plan_path = self._write_ready_artifacts(project_dir)
+            token = apply_module.bootstrap_apply_confirmation_token(plan_path)
+            outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=token, command_runner=runner)
+            failure = json.loads((project_dir / ".sweetspot/bootstrap/failure.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual(outcome["category"], "output_extraction_failed")
+        self.assertEqual(outcome, failure)
+        self.assertFalse((project_dir / ".sweetspot/deployment.json").exists())
+        self.assertIn("worker_task_role_arn", outcome["message"])
+        self.assertIn("worker_task_role_arn", outcome["output_completeness"]["missing_outputs"])
+
+    def test_apply_started_state_does_not_claim_deployment_output_before_extraction_succeeds(self) -> None:
+        apply_module = self._apply_module()
+
+        def inspecting_runner(command, *, cwd, timeout_seconds=30):
+            project_dir = Path(cwd).parents[1]
+            if command[1] == "apply":
+                state = json.loads((project_dir / ".sweetspot/bootstrap/state.json").read_text(encoding="utf-8"))
+                self.assertEqual(state["status"], "applying")
+                self.assertFalse(state["output_completeness"]["deployment_output_written"])
+                self.assertFalse((project_dir / ".sweetspot/deployment.json").exists())
+                return {"returncode": 0, "stdout": "apply ok", "stderr": "", "executable": "opentofu"}
+            return {"returncode": 0, "stdout": json.dumps(self._opentofu_outputs()), "stderr": "", "executable": "opentofu"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            plan_path = self._write_ready_artifacts(project_dir)
+            token = apply_module.bootstrap_apply_confirmation_token(plan_path)
+            outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=token, command_runner=inspecting_runner)
+
+        self.assertEqual(outcome["status"], "output_written")
 
     def test_apply_permission_failure_persists_sanitized_failure_without_outputs(self) -> None:
         apply_module = self._apply_module()
