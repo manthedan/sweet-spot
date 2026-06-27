@@ -414,6 +414,7 @@ class ProjectDoctorCliTests(unittest.TestCase):
             self.assertEqual(saved, report)
             self.assertNotIn("aws_diagnostics", report)
             self.assertTrue((project_root / ".sweetspot" / "infra" / "main.tf").exists())
+            self.assertFalse((project_root / ".sweetspot" / "deployment.json").exists())
 
     def test_bootstrap_plan_incomplete_project_is_nonzero_and_still_writes_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,12 +447,108 @@ class ProjectDoctorCliTests(unittest.TestCase):
             self.assertEqual(report["findings"][0]["code"], "bootstrap_plan_output_path_invalid")
             self.assertFalse((project_root / "bootstrap-plan.json").exists())
 
+    def test_bootstrap_apply_missing_confirmation_is_nonzero_structured_json(self) -> None:
+        from sweetspot.bootstrap_apply import bootstrap_apply_confirmation_token
+        from tests.test_bootstrap_apply import BootstrapApplyGuardContractTests
+
+        helper = BootstrapApplyGuardContractTests(methodName="test_missing_reviewed_plan_blocks_without_invoking_runner")
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            plan_path = helper._write_ready_artifacts(project_root)
+            expected = bootstrap_apply_confirmation_token(plan_path)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["bootstrap", "apply", "--project-dir", str(project_root), "--format", "json"]), 1)
+
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.apply.v1")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["category"], "confirmation_missing")
+        self.assertEqual(report["confirmation"]["expected"], expected)
+        self.assertEqual(report["command_summaries"], [])
+
+    def test_bootstrap_apply_confirmation_mismatch_is_nonzero_structured_json(self) -> None:
+        from tests.test_bootstrap_apply import BootstrapApplyGuardContractTests
+
+        helper = BootstrapApplyGuardContractTests(methodName="test_missing_reviewed_plan_blocks_without_invoking_runner")
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            helper._write_ready_artifacts(project_root)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(["bootstrap", "apply", "--project-dir", str(project_root), "--confirm", "apply:not-the-reviewed-plan", "--format", "json"]),
+                    1,
+                )
+
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["category"], "confirmation_mismatched")
+        self.assertEqual(report["confirmation"]["status"], "mismatched")
+        self.assertEqual(report["command_summaries"], [])
+
+    def test_bootstrap_apply_success_json_uses_guarded_apply_handler(self) -> None:
+        outcome = {
+            "schema": "sweetspot.bootstrap.apply.v1",
+            "status": "output_written",
+            "category": "applied",
+            "message": "Bootstrap apply succeeded and deployment outputs were written.",
+            "recovery_hints": [],
+            "reviewed_plan": {"status": "ready", "path": ".sweetspot/bootstrap-plan.json"},
+            "confirmation": {"status": "accepted", "expected": "apply:abc123"},
+            "output_completeness": {"complete": True, "deployment_output_written": True},
+            "command_summaries": [{"command": "opentofu apply", "returncode": 0}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            out = io.StringIO()
+            with patch("sweetspot.cli.apply_bootstrap_plan", return_value=outcome) as apply_mock, contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(["bootstrap", "apply", "--project-dir", str(project_root), "--confirm", "apply:abc123", "--format", "json"]),
+                    0,
+                )
+
+        apply_mock.assert_called_once()
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "output_written")
+        self.assertEqual(report["category"], "applied")
+
+    def test_bootstrap_apply_rejects_output_path_outside_sweetspot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            out = io.StringIO()
+            with patch("sweetspot.cli.apply_bootstrap_plan", side_effect=AssertionError("invalid output path must not invoke apply")), contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main([
+                        "bootstrap",
+                        "apply",
+                        "--project-dir",
+                        str(project_root),
+                        "--confirm",
+                        "apply:anything",
+                        "--output",
+                        "deployment.json",
+                        "--format",
+                        "json",
+                    ]),
+                    2,
+                )
+
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.apply.v1")
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["category"], "bootstrap_apply_path_invalid")
+        self.assertFalse((project_root / "deployment.json").exists())
+
     def test_bootstrap_plan_namespace_does_not_replace_workload_plan(self) -> None:
         help_out = io.StringIO()
         with contextlib.redirect_stdout(help_out), self.assertRaises(SystemExit) as help_exit:
             main(["bootstrap", "--help"])
         self.assertEqual(help_exit.exception.code, 0)
         self.assertIn("plan", help_out.getvalue())
+        self.assertIn("apply", help_out.getvalue())
 
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

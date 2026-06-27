@@ -59,6 +59,7 @@ from .finalize_service import (
     run_finalizer as _run_finalizer_service,
     run_integrated_finalizer as _run_integrated_finalizer_service,
 )
+from .bootstrap_apply import BOOTSTRAP_PLAN_PATH, DEPLOYMENT_OUTPUT_PATH, apply_bootstrap_plan
 from .bootstrap_plan import render_opentofu_bootstrap_plan
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .planner import PlannerSpecError, initial_blocked_plan, iter_canary_tasks_from_logical_unit_count, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
@@ -4745,6 +4746,53 @@ def cmd_bootstrap_plan(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _bootstrap_apply_error_report(message: str, *, code: str = "bootstrap_apply_path_invalid") -> dict[str, Any]:
+    return {
+        "schema": "sweetspot.bootstrap.apply.v1",
+        "status": "invalid",
+        "category": code,
+        "ok": False,
+        "message": message,
+        "recovery_hints": ["Use the reviewed .sweetspot/bootstrap-plan.json artifact and write deployment output to .sweetspot/deployment.json."],
+        "reviewed_plan": {"status": "not_checked"},
+        "confirmation": {"status": "not_checked"},
+        "output_completeness": {"complete": False, "deployment_output_written": False},
+        "command_summaries": [],
+    }
+
+
+def _bootstrap_apply_required_path(project_root: Path, requested: Path | None, default_relpath: Path, label: str) -> Path:
+    sweetspot_dir = (project_root / ".sweetspot").resolve()
+    candidate = default_relpath if requested is None else Path(requested).expanduser()
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(sweetspot_dir)
+    except ValueError as exc:
+        raise ValueError(f"bootstrap apply {label} path must resolve under .sweetspot/") from exc
+    expected = (project_root / default_relpath).resolve()
+    if resolved != expected:
+        raise ValueError(f"bootstrap apply {label} path must be {default_relpath.as_posix()}")
+    return resolved
+
+
+def cmd_bootstrap_apply(args: argparse.Namespace) -> int:
+    project_root = _bootstrap_plan_project_root(args.project_dir)
+    try:
+        _bootstrap_apply_required_path(project_root, args.plan, BOOTSTRAP_PLAN_PATH, "plan")
+        _bootstrap_apply_required_path(project_root, args.output, DEPLOYMENT_OUTPUT_PATH, "deployment output")
+    except ValueError as exc:
+        report = _bootstrap_apply_error_report(str(exc))
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 2
+
+    outcome = apply_bootstrap_plan(project_root, confirmation=args.confirm, timeout_seconds=args.apply_timeout_seconds)
+    report = {**outcome, "ok": outcome.get("status") == "output_written"}
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
 PRIMARY_COMMANDS = frozenset({"admin", "bootstrap", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
@@ -5325,8 +5373,12 @@ def main(argv: list[str] | None = None) -> int:
         boot = _add_parser_with_examples(
             sub,
             "bootstrap",
-            help="Render reviewable bootstrap infrastructure plans without applying changes",
-            examples="  sweetspot bootstrap plan --project-dir .sweetspot --format json\n  sweetspot bootstrap plan --project-dir . --out .sweetspot/bootstrap-plan.json",
+            help="Render reviewable bootstrap infrastructure plans and guarded apply diagnostics",
+            examples=(
+                "  sweetspot bootstrap plan --project-dir .sweetspot --format json\n"
+                "  sweetspot bootstrap plan --project-dir . --out .sweetspot/bootstrap-plan.json\n"
+                "  sweetspot bootstrap apply --project-dir . --confirm apply:<plan-hash> --format json"
+            ),
         )
         boot_sub = boot.add_subparsers(dest="bootstrap_cmd", required=True)
         boot_plan = boot_sub.add_parser("plan", help="Render and save a local OpenTofu-backed bootstrap plan report")
@@ -5337,6 +5389,14 @@ def main(argv: list[str] | None = None) -> int:
         boot_plan.add_argument("--tofu-executable", default="tofu", help="OpenTofu executable used only with --validate")
         boot_plan.add_argument("--validation-timeout-seconds", type=int, default=30, help="Timeout for each local OpenTofu validation command")
         boot_plan.set_defaults(func=cmd_bootstrap_plan)
+        boot_apply = boot_sub.add_parser("apply", help="Apply a reviewed bootstrap plan only after exact confirmation")
+        boot_apply.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
+        boot_apply.add_argument("--plan", type=Path, help="Reviewed plan artifact path; must be .sweetspot/bootstrap-plan.json")
+        boot_apply.add_argument("--output", type=Path, help="Deployment output path; must be .sweetspot/deployment.json")
+        boot_apply.add_argument("--confirm", help="Exact apply:<plan-hash> confirmation token from the reviewed plan artifact")
+        boot_apply.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported")
+        boot_apply.add_argument("--apply-timeout-seconds", type=int, default=300, help="Timeout for each OpenTofu apply/output command")
+        boot_apply.set_defaults(func=cmd_bootstrap_apply)
 
     p = _add_parser_with_examples(
         sub,
