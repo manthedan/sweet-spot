@@ -16,7 +16,7 @@ from io import StringIO
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 import boto3
 
@@ -4624,10 +4624,45 @@ def cmd_doctor_project(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _skipped_bootstrap_aws_diagnostics(local_report: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "sweetspot.bootstrap.aws_diagnostics.v1",
+        "ok": True,
+        "status": "not_configured",
+        "region": None,
+        "auth": None,
+        "caller_identity": None,
+        "checks": [
+            {
+                "name": "aws_diagnostics",
+                "status": "skipped",
+                "severity": "info",
+                "details": {
+                    "classification": "not_configured",
+                    "reason": "local_bootstrap_not_ready",
+                    "local_status": local_report.get("status"),
+                },
+            }
+        ],
+        "redactions": [],
+    }
+
+
 def cmd_doctor_bootstrap(args: argparse.Namespace) -> int:
     report = json.loads(render_bootstrap_status(args.project_dir))
+    local_exit_code = 0 if report["ok"] else 1
+    if getattr(args, "check_aws", False):
+        if report.get("ok") and report.get("status") == "ready":
+            from .bootstrap_aws import diagnose_bootstrap_aws
+
+            aws_diagnostics = diagnose_bootstrap_aws(project_dir=args.project_dir)
+        else:
+            aws_diagnostics = _skipped_bootstrap_aws_diagnostics(report)
+        report["aws_diagnostics"] = aws_diagnostics
+        if local_exit_code == 0 and aws_diagnostics.get("status") == "blocked":
+            local_exit_code = 1
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["ok"] else 1
+    return local_exit_code
 
 
 PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
@@ -5204,6 +5239,7 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap = doctor_sub.add_parser("bootstrap", help="Render local bootstrap status without contacting AWS")
         bootstrap.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
         bootstrap.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported in this milestone")
+        bootstrap.add_argument("--check-aws", "--aws-diagnostics", action="store_true", dest="check_aws", help="Opt in to read-only AWS bootstrap diagnostics after local bootstrap status is ready")
         bootstrap.set_defaults(func=cmd_doctor_bootstrap)
 
     p = _add_parser_with_examples(

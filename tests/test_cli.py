@@ -224,6 +224,7 @@ class ProjectDoctorCliTests(unittest.TestCase):
             with (
                 patch("sweetspot.cli.boto3.client", side_effect=AssertionError("bootstrap doctor must not call boto3.client")),
                 patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap doctor must not call boto3.Session")),
+                patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", side_effect=AssertionError("default bootstrap doctor must not call AWS diagnostics")),
                 contextlib.redirect_stdout(out),
             ):
                 self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json"]), 0)
@@ -232,9 +233,139 @@ class ProjectDoctorCliTests(unittest.TestCase):
         self.assertEqual(report["schema"], "sweetspot.bootstrap.status.v1")
         self.assertTrue(report["ok"])
         self.assertEqual(report["status"], "ready")
+        self.assertNotIn("aws_diagnostics", report)
         self.assertEqual(report["intent"]["auth"], {"method": "profile", "reference": "sweetspot-dev"})
         self.assertTrue(all(artifact["status"] == "present" for artifact in report["generated_artifacts"]))
         self.assertTrue(report["next_actions"])
+
+    def test_doctor_bootstrap_check_aws_attaches_sanitized_diagnostics(self) -> None:
+        raw_account = "123456789012"
+        raw_arn = f"arn:aws:iam::{raw_account}:role/AdminSecretRole"
+        raw_profile = "prod-admin-profile"
+        raw_error = "Access denied for AdminSecretRole request id req-123"
+        diagnostics = {
+            "schema": "sweetspot.bootstrap.aws_diagnostics.v1",
+            "ok": True,
+            "status": "warning",
+            "region": "us-west-2",
+            "auth": {"method": "profile", "reference": "[REDACTED_AUTH_REFERENCE]"},
+            "caller_identity": {"account": "[REDACTED_ACCOUNT_ID]", "arn": "[REDACTED_ARN]", "user_id": "[REDACTED_USER_ID]"},
+            "checks": [
+                {"name": "auth", "status": "pass", "severity": "info", "details": {"classification": "configured"}},
+                {"name": "sts_get_caller_identity", "status": "pass", "severity": "info", "details": {"classification": "identity_available"}},
+                {
+                    "name": "iam_simulate_principal_policy",
+                    "status": "warn",
+                    "severity": "warning",
+                    "details": {"classification": "simulation_unavailable", "missing_permission": "iam:SimulatePrincipalPolicy"},
+                    "error": {"classification": "simulation_unavailable", "type": "AccessDenied", "message": "[REDACTED_AWS_ERROR]"},
+                },
+            ],
+            "redactions": ["account_id", "arn", "aws_error_message", "profile_or_role_name"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", return_value=diagnostics) as diagnose, contextlib.redirect_stdout(out):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--check-aws"]), 0)
+
+        diagnose.assert_called_once_with(project_dir=project_root)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.status.v1")
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["aws_diagnostics"]["schema"], "sweetspot.bootstrap.aws_diagnostics.v1")
+        self.assertEqual(report["aws_diagnostics"]["status"], "warning")
+        self.assertEqual(
+            {check["name"] for check in report["aws_diagnostics"]["checks"]},
+            {"auth", "sts_get_caller_identity", "iam_simulate_principal_policy"},
+        )
+        rendered = json.dumps(report, sort_keys=True)
+        for raw in (raw_account, raw_arn, raw_profile, raw_error, "AdminSecretRole", "req-123"):
+            self.assertNotIn(raw, rendered)
+        self.assertIn("[REDACTED_AWS_ERROR]", rendered)
+
+    def test_doctor_bootstrap_aws_diagnostics_alias_maps_to_same_behavior(self) -> None:
+        diagnostics = {
+            "schema": "sweetspot.bootstrap.aws_diagnostics.v1",
+            "ok": True,
+            "status": "ready",
+            "region": "us-west-2",
+            "auth": {"method": "profile", "reference": "[REDACTED_AUTH_REFERENCE]"},
+            "caller_identity": {"account": "[REDACTED_ACCOUNT_ID]", "arn": "[REDACTED_ARN]", "user_id": "[REDACTED_USER_ID]"},
+            "checks": [{"name": "sts_get_caller_identity", "status": "pass", "severity": "info", "details": {"classification": "identity_available"}}],
+            "redactions": ["account_id", "arn", "profile_or_role_name"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", return_value=diagnostics) as diagnose, contextlib.redirect_stdout(out):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--aws-diagnostics"]), 0)
+
+        diagnose.assert_called_once_with(project_dir=project_root)
+        self.assertEqual("ready", json.loads(out.getvalue())["aws_diagnostics"]["status"])
+
+    def test_doctor_bootstrap_check_aws_skips_diagnostics_when_local_not_ready(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / ".sweetspot"
+            project_dir.mkdir()
+            (project_dir / "sweetspot.yaml").write_text(f"schema: wrong\nworkload:\n  command: ['python', '{secret_text}']\n", encoding="utf-8")
+            out = io.StringIO()
+            with (
+                patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", side_effect=AssertionError("local invalid bootstrap must skip AWS diagnostics")),
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("bootstrap doctor must not call boto3.client")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap doctor must not call boto3.Session")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json", "--check-aws"]), 1)
+
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["aws_diagnostics"]["status"], "not_configured")
+        self.assertEqual(report["aws_diagnostics"]["checks"][0]["status"], "skipped")
+        self.assertEqual(report["aws_diagnostics"]["checks"][0]["details"]["reason"], "local_bootstrap_not_ready")
+        self.assertNotIn(secret_text, json.dumps(report))
+
+    def test_doctor_bootstrap_check_aws_blocked_diagnostics_sets_nonzero_exit(self) -> None:
+        diagnostics = {
+            "schema": "sweetspot.bootstrap.aws_diagnostics.v1",
+            "ok": False,
+            "status": "blocked",
+            "region": "us-west-2",
+            "auth": {"method": "profile", "reference": "[REDACTED_AUTH_REFERENCE]"},
+            "caller_identity": None,
+            "checks": [
+                {
+                    "name": "sts_get_caller_identity",
+                    "status": "fail",
+                    "severity": "error",
+                    "details": {"classification": "missing_credentials"},
+                    "error": {"classification": "missing_credentials", "type": "NoCredentialsError", "message": "[REDACTED_AWS_ERROR]"},
+                }
+            ],
+            "redactions": ["aws_error_message", "profile_or_role_name"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", return_value=diagnostics), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--check-aws"]), 1)
+
+        report = json.loads(out.getvalue())
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "ready")
+        self.assertFalse(report["aws_diagnostics"]["ok"])
+        self.assertEqual(report["aws_diagnostics"]["status"], "blocked")
 
     def test_doctor_bootstrap_invalid_state_exits_nonzero_with_sanitized_json_without_aws(self) -> None:
         secret_text = "AKIA1234567890ABCDEF"
@@ -246,6 +377,7 @@ class ProjectDoctorCliTests(unittest.TestCase):
             with (
                 patch("sweetspot.cli.boto3.client", side_effect=AssertionError("bootstrap doctor must not call boto3.client")),
                 patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap doctor must not call boto3.Session")),
+                patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", side_effect=AssertionError("default bootstrap doctor must not call AWS diagnostics")),
                 contextlib.redirect_stdout(out),
             ):
                 self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json"]), 1)
@@ -253,6 +385,7 @@ class ProjectDoctorCliTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertFalse(report["ok"])
         self.assertEqual(report["status"], "invalid")
+        self.assertNotIn("aws_diagnostics", report)
         self.assertEqual(report["validation_findings"][0]["code"], "secret_value_aws_access_key_id")
         self.assertNotIn(secret_text, json.dumps(report))
 
