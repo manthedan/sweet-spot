@@ -97,7 +97,91 @@ sweetspot doctor project --format json
 
 `doctor project` is read-only and local. It accepts either the project root or the `.sweetspot/` directory, resolves the contained bundle, reads files, validates schemas, scans local artifacts, and does not contact AWS.
 
-The practical JSON contract is:
+### Bootstrap doctor validation
+
+Run bootstrap doctor when you want to inspect the generated bootstrap intent and artifact state:
+
+```bash
+sweetspot doctor bootstrap --format json
+```
+
+By default, `sweetspot doctor bootstrap` is also read-only and local. Like `sweetspot init`, it does not contact AWS, create resources, validate live credentials, or probe IAM. Use the default command first when you only need to confirm that `.sweetspot/sweetspot.yaml` can be turned into bootstrap-ready local intent.
+
+Use the AWS diagnostics mode only when a human or agent explicitly wants a live, read-only AWS check:
+
+```bash
+sweetspot doctor bootstrap --check-aws --format json
+```
+
+`--check-aws` is opt-in because it may construct a boto3 session and call AWS. It performs only read-only diagnostics: STS `GetCallerIdentity` and best-effort IAM `SimulatePrincipalPolicy`. It does not create queues, buckets, roles, Batch resources, container images, Terraform state, deployments, or write credential material. The diagnostics path is injectable and covered by stdlib unittest mocks, so the contract can be tested without live AWS credentials.
+
+When enabled, the bootstrap report includes an `aws_diagnostics` object with schema `sweetspot.bootstrap.aws_diagnostics.v1`:
+
+```json
+{
+  "schema": "sweetspot.bootstrap.aws_diagnostics.v1",
+  "ok": true,
+  "status": "warning",
+  "region": "us-west-2",
+  "auth": {
+    "method": "profile",
+    "reference": "[REDACTED_AUTH_REFERENCE]",
+    "supported": true
+  },
+  "caller_identity": {
+    "account": "[REDACTED_ACCOUNT_ID]",
+    "arn": "[REDACTED_ARN]",
+    "user_id": "[REDACTED_USER_ID]"
+  },
+  "checks": [
+    {
+      "name": "iam_simulate_principal_policy",
+      "status": "warn",
+      "severity": "warning",
+      "details": {
+        "classification": "simulation_unavailable",
+        "missing_permission": "iam:SimulatePrincipalPolicy"
+      },
+      "error": {
+        "classification": "simulation_unavailable",
+        "type": "AccessDenied",
+        "message": "[REDACTED_AWS_ERROR]"
+      }
+    }
+  ],
+  "required_actions": ["sts:GetCallerIdentity", "iam:SimulatePrincipalPolicy"],
+  "redactions": ["account_id", "arn", "aws_error_message"]
+}
+```
+
+AWS diagnostics fields are designed for cold agents to triage from JSON alone:
+
+- `schema`: must be `sweetspot.bootstrap.aws_diagnostics.v1` for the live read-only diagnostics contract.
+- `ok`: `true` means no failing diagnostics check remains. Warnings can still be present.
+- `status`: aggregate status: `ready` means identity and permission simulation passed, `warning` means the local intent and caller identity are usable but a non-blocking permission or simulation caveat exists, and `blocked` means AWS readiness cannot be established.
+- `region`: the intended AWS region from setup intent, sanitized before output.
+- `auth.method`: one of the supported reference methods (`env`, `profile`, `sso`) when configured.
+- `auth.reference`: always redacted when present. Store and rotate credentials in AWS-supported tooling outside the repository; keep `.sweetspot/` files reference-only.
+- `auth.supported`: `false` means the configured auth method is not one of the supported reference methods.
+- `caller_identity`: sanitized STS identity. Account IDs, ARNs, and user IDs are redacted even on success.
+- `checks`: ordered diagnostic checks. Each check has `name`, `status`, `severity`, sanitized `details`, and, for failures or AWS exceptions, sanitized `error`.
+- `required_actions`: the action names evaluated by the IAM simulation. This list is operational intent only; it is not a permission grant.
+- `redactions`: marker names explaining what sensitive categories were removed from the report.
+
+Current AWS diagnostic checks include:
+
+| Check | Meaning | Status and recovery semantics |
+|---|---|---|
+| `region` | Confirms setup intent includes an AWS region. | `fail` with `missing_region` blocks diagnostics. Add a valid region to `.sweetspot/sweetspot.yaml` through setup input, then rerun. |
+| `auth` | Confirms auth intent is configured, supported, and can construct a session. | `fail` classifications include `missing_auth_method`, `unsupported_auth`, `incomplete_auth`, and `profile_not_found`. Use `env`, `profile`, or `sso` references; configure the named profile or SSO session in normal AWS tooling outside the repo. |
+| `sts_get_caller_identity` | Calls STS to identify the effective caller. | `pass` means identity is available. `fail` classifications include `missing_credentials`, `partial_credentials`, `access_denied`, `throttled`, `endpoint_unavailable`, `client_error`, and `unknown_exception`. Fix AWS credential source, network/endpoint access, or caller policy, then rerun. |
+| `iam_simulate_principal_policy` | Best-effort IAM simulation for the bootstrap action set. | `pass` with `simulation_allowed` means all simulated actions were allowed. `warn` with `simulation_denied` means one or more required actions appear denied. `warn` with `simulation_unavailable` usually means the caller cannot call `iam:SimulatePrincipalPolicy`; grant that diagnostic permission to improve the report or manually review required actions. `skipped` with `simulation_skipped` means the caller identity did not include a principal ARN to simulate. |
+
+Permission simulation is a diagnostic hint, not a deployment guarantee. IAM simulation can be unavailable, can be denied to otherwise valid operators, and may not model every resource condition or future bootstrap action. Treat `status: warning` as "needs review" rather than "ready to deploy" when simulation is denied, skipped, or unavailable.
+
+Redaction is fail-closed: account IDs, ARNs, AWS access key IDs, secret-like strings, request IDs, profile or role names, principal user IDs, and raw AWS error messages are replaced before JSON is returned. If a report contains unexpected sensitive material, treat that as a defect and remove the source material rather than storing it in `.sweetspot/` files.
+
+The project doctor JSON contract is:
 
 ```json
 {
@@ -138,9 +222,9 @@ A useful first-run interpretation is: `ok: true` with `status: warning` is accep
 
 ## M002 boundary
 
-M001 setup stops at local project context, starter artifacts, planner compatibility, and local doctor observability. M002 is the boundary for AWS bootstrap work such as creating or wiring queues, buckets, IAM roles, Batch compute environments, Batch job queues, Batch job definitions, container images, Terraform state, or live AWS validation.
+M001 setup stops at local project context, starter artifacts, planner compatibility, and local doctor observability. M002 adds an explicit read-only AWS diagnostics path for bootstrap review, but provisioning remains future bootstrap work. Creating or wiring queues, buckets, IAM roles, Batch compute environments, Batch job queues, Batch job definitions, container images, Terraform state, or deployments is still not performed by init, project doctor, default bootstrap doctor, or `doctor bootstrap --check-aws`.
 
-Do not infer that init has provisioned infrastructure. It has only captured intent and generated files for review.
+Do not infer that init or diagnostics have provisioned infrastructure. They have only captured intent, generated files for review, and optionally reported sanitized live AWS identity/permission signals.
 
 ## Troubleshooting
 
@@ -207,6 +291,51 @@ What to do:
 2. Replace it with a profile name, role reference, SSO note, or external environment-auth intent as appropriate.
 3. Rotate any real credential that was accidentally written.
 4. Rerun `sweetspot doctor project --format json` and continue only after `secret_scan` passes.
+
+### AWS diagnostics not configured
+
+Symptom: `doctor bootstrap --check-aws --format json` includes `aws_diagnostics.status: "blocked"` with `missing_region`, `missing_auth_method`, `unsupported_auth`, or `incomplete_auth`.
+
+What to do:
+
+1. Keep real credential values out of `.sweetspot/` files.
+2. Update setup intent to use a supported auth reference: `env`, `profile`, or `sso`.
+3. For `profile` or `sso`, configure the named source with AWS CLI or SSO tooling outside this repository.
+4. Rerun default `sweetspot doctor bootstrap --format json` first, then rerun `--check-aws` only when a live read-only check is intentional.
+
+### AWS credentials missing or profile not found
+
+Symptom: `sts_get_caller_identity` fails with `missing_credentials`, `partial_credentials`, or `profile_not_found`.
+
+What to do:
+
+1. Configure the referenced profile, SSO session, or environment credentials in normal AWS tooling outside SweetSpot.
+2. Prefer short-lived credentials, SSO, or role assumption over static access keys.
+3. Do not copy access keys, secret keys, or session tokens into `.sweetspot/sweetspot.yaml`, `.sweetspot/infra/terraform.tfvars.json`, worker files, docs, or local environment files in this project.
+4. Rerun `doctor bootstrap --check-aws --format json` and confirm the report remains redacted.
+
+### AWS identity access denied, throttled, or unreachable
+
+Symptom: `sts_get_caller_identity` fails with `access_denied`, `throttled`, `endpoint_unavailable`, `client_error`, or `unknown_exception`.
+
+What to do:
+
+1. Confirm the selected AWS caller is allowed to call `sts:GetCallerIdentity`.
+2. Confirm local network, proxy, endpoint, and region configuration allow STS calls.
+3. Retry throttled diagnostics later; the command is read-only and safe to rerun.
+4. Use the sanitized `classification`, `type`, and `redactions` fields for triage instead of enabling unsafe debug logs.
+
+### AWS permission simulation denied or unavailable
+
+Symptom: `iam_simulate_principal_policy` returns `simulation_denied`, `simulation_unavailable`, or `simulation_skipped`.
+
+What to do:
+
+1. Review `required_actions` in the diagnostics report to see which bootstrap actions were evaluated.
+2. For `simulation_denied`, inspect the per-action `evaluations` and update the caller's intended bootstrap permissions before provisioning work.
+3. For `simulation_unavailable`, either grant `iam:SimulatePrincipalPolicy` for diagnostics or manually review the listed required actions.
+4. For `simulation_skipped`, rerun with an auth method that yields a principal ARN if IAM simulation is required.
+5. Treat the warning as a review gate, not as proof that provisioning will succeed or fail.
 
 ## Handoff checklist
 
