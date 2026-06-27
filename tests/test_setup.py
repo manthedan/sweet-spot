@@ -280,8 +280,57 @@ class SetupModelTests(unittest.TestCase):
         self.assertEqual(report["status"], "invalid")
         self.assertIsNone(report["resource_names"])
         self.assertIn("workload.command[2]", report["errors"][0]["field_path"])
-        self.assertEqual(report["errors"][0]["code"], "invalid_setup")
+        self.assertEqual(report["errors"][0]["code"], "secret_value_aws_access_key_id")
         self.assertNotIn(secret_text, json.dumps(report))
+
+    def test_bootstrap_intent_reports_missing_inputs_with_field_paths_and_hints(self) -> None:
+        report = bootstrap_intent_to_dict(bootstrap_intent_from_setup({"schema": SETUP_SCHEMA_V1, "project": {}, "workload": {}, "aws": {"auth": {"method": "profile"}}}))
+
+        self.assertEqual(report["status"], "invalid")
+        self.assertIsNone(report["resource_names"])
+        self.assertEqual(report["auth"], {"method": None, "reference": None})
+        errors = {error["field_path"]: error for error in report["errors"]}
+        self.assertEqual(
+            sorted(errors),
+            [
+                "aws.auth.profile",
+                "aws.region",
+                "project.name",
+                "workload.architecture",
+                "workload.input_manifest",
+                "workload.output_prefix",
+            ],
+        )
+        self.assertTrue(all(error["code"] == "missing_bootstrap_input" for error in errors.values()))
+        self.assertTrue(all(".sweetspot/sweetspot.yaml" in error["message"] or "aws.auth.method" not in error["field_path"] for error in errors.values()))
+        self.assertIn("aws.auth.profile", report["missing_inputs"])
+        self.assertIn("workload.input_manifest", report["missing_inputs"])
+
+    def test_load_bootstrap_intent_scans_secrets_before_schema_validation(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            setup_path = Path(tmpdir) / SWEETSPOT_CONFIG_PATH
+            setup_path.parent.mkdir(parents=True)
+            setup_path.write_text(f"schema: wrong\nworkload:\n  command: ['python', '{secret_text}']\n", encoding="utf-8")
+
+            report = bootstrap_intent_to_dict(load_bootstrap_intent(setup_path))
+
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["errors"][0]["field_path"], "workload.command[1]")
+        self.assertEqual(report["errors"][0]["code"], "secret_value_aws_access_key_id")
+        self.assertNotIn(secret_text, json.dumps(report))
+
+    def test_load_bootstrap_intent_reports_yaml_error_without_throwing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            setup_path = Path(tmpdir) / SWEETSPOT_CONFIG_PATH
+            setup_path.parent.mkdir(parents=True)
+            setup_path.write_text("schema: [unterminated\n", encoding="utf-8")
+
+            report = bootstrap_intent_to_dict(load_bootstrap_intent(setup_path))
+
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["errors"][0]["field_path"], SWEETSPOT_CONFIG_PATH)
+        self.assertEqual(report["errors"][0]["code"], "invalid_setup_config")
 
     def test_write_project_context_round_trips_and_renders_full_starter_bundle(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")

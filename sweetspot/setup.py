@@ -479,18 +479,22 @@ def bootstrap_intent_from_setup(config: SweetSpotProject | dict[str, Any]) -> Bo
 
     The result is intentionally limited to sanitized references and deterministic
     resource naming hints so doctor/bootstrap planning can report readiness before
-    any AWS SDK or OpenTofu dependency is imported.
+    any AWS SDK or OpenTofu dependency is imported. Dict inputs are scanned for
+    secret-like material before schema validation so diagnostics can fail closed
+    without echoing values.
     """
-    errors: list[BootstrapIntentError] = []
-    project: SweetSpotProject | None = None
-    try:
-        project = _ensure_valid_project(config)
-    except SetupSpecError as exc:
-        errors.append(BootstrapIntentError(field_path=exc.field_path, code="invalid_setup", message=exc.message))
+    if isinstance(config, SweetSpotProject):
+        return _bootstrap_intent_report(project=_ensure_valid_project(config), errors=[])
 
-    if project is None:
-        return _bootstrap_intent_report(project=None, errors=errors)
-    return _bootstrap_intent_report(project=project, errors=errors)
+    validation_errors = _bootstrap_intent_validation_errors(config)
+    if validation_errors:
+        return _bootstrap_intent_report(project=None, errors=validation_errors)
+
+    try:
+        project = validate_setup(config)
+    except SetupSpecError as exc:
+        return _bootstrap_intent_report(project=None, errors=[BootstrapIntentError(field_path=exc.field_path, code="invalid_setup", message=exc.message)])
+    return _bootstrap_intent_report(project=project, errors=[])
 
 
 def load_bootstrap_intent(path: str | Path) -> BootstrapIntent:
@@ -504,7 +508,8 @@ def load_bootstrap_intent(path: str | Path) -> BootstrapIntent:
     setup_path = Path(path)
     errors: list[BootstrapIntentError] = []
     try:
-        project = load_setup(setup_path)
+        with setup_path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
     except FileNotFoundError:
         errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="missing_setup_config", message="setup config is missing"))
         return _bootstrap_intent_report(project=None, errors=errors)
@@ -517,11 +522,11 @@ def load_bootstrap_intent(path: str | Path) -> BootstrapIntent:
     except OSError as exc:
         errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="unreadable_setup_config", message=_sanitize_error_message(exc)))
         return _bootstrap_intent_report(project=None, errors=errors)
-    except SetupSpecError as exc:
-        errors.append(BootstrapIntentError(field_path=exc.field_path, code="invalid_setup", message=exc.message))
+    except yaml.YAMLError as exc:
+        errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="invalid_setup_config", message=_sanitize_error_message(exc)))
         return _bootstrap_intent_report(project=None, errors=errors)
 
-    return _bootstrap_intent_report(project=project, errors=errors)
+    return bootstrap_intent_from_setup(data)
 
 
 def bootstrap_intent_to_dict(intent: BootstrapIntent) -> dict[str, Any]:
@@ -563,7 +568,9 @@ def render_bootstrap_intent(config: SweetSpotProject | dict[str, Any]) -> str:
 def _bootstrap_intent_report(project: SweetSpotProject | None, errors: list[BootstrapIntentError]) -> BootstrapIntent:
     missing_inputs: list[str] = []
     if project is None:
-        missing_inputs.extend(["project.name", "aws.region", "aws.auth", "workload.input_manifest", "workload.output_prefix"])
+        missing_inputs.extend(error.field_path for error in errors if error.code == "missing_bootstrap_input")
+        if not missing_inputs:
+            missing_inputs.extend(["project.name", "aws.region", "aws.auth", "workload.input_manifest", "workload.output_prefix"])
         return BootstrapIntent(
             schema=BOOTSTRAP_INTENT_SCHEMA_V1,
             status="invalid" if errors else "incomplete",
@@ -620,6 +627,58 @@ def _bootstrap_missing_inputs(project: SweetSpotProject) -> list[str]:
     if not project.workload.output_prefix:
         missing.append("workload.output_prefix")
     return missing
+
+
+_BOOTSTRAP_REQUIRED_STRINGS = (
+    "schema",
+    "project.name",
+    "workload.input_manifest",
+    "workload.output_prefix",
+    "workload.architecture",
+    "aws.region",
+    "aws.auth.method",
+)
+_BOOTSTRAP_REQUIRED_MAPPINGS = ("project", "workload", "aws", "aws.auth")
+
+
+def _bootstrap_intent_validation_errors(data: Any) -> list[BootstrapIntentError]:
+    if not isinstance(data, dict):
+        return [BootstrapIntentError(field_path="$", code="invalid_setup", message="setup document must be a mapping")]
+
+    secret_findings = scan_for_secrets(data)
+    if secret_findings:
+        return [
+            BootstrapIntentError(field_path=finding.path, code=finding.code, message=finding.message)
+            for finding in secret_findings
+        ]
+
+    errors: list[BootstrapIntentError] = []
+    for field_path in _BOOTSTRAP_REQUIRED_MAPPINGS:
+        value = _lookup(data, field_path, missing=_MISSING)
+        if not isinstance(value, dict):
+            errors.append(_bootstrap_missing_error(field_path, "set this mapping in .sweetspot/sweetspot.yaml"))
+    for field_path in _BOOTSTRAP_REQUIRED_STRINGS:
+        value = _lookup(data, field_path, missing=_MISSING)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(_bootstrap_missing_error(field_path, "set a non-empty value in .sweetspot/sweetspot.yaml"))
+
+    method = _lookup(data, "aws.auth.method", missing=_MISSING)
+    if isinstance(method, str):
+        method = method.strip()
+        if method == "profile":
+            profile = _lookup(data, "aws.auth.profile", missing=_MISSING)
+            if not isinstance(profile, str) or not profile.strip():
+                errors.append(_bootstrap_missing_error("aws.auth.profile", "set a profile name or choose a different aws.auth.method"))
+        if method == "role":
+            role_arn = _lookup(data, "aws.auth.role_arn", missing=_MISSING)
+            if not isinstance(role_arn, str) or not role_arn.strip():
+                errors.append(_bootstrap_missing_error("aws.auth.role_arn", "set a role ARN reference or choose a different aws.auth.method"))
+
+    return errors
+
+
+def _bootstrap_missing_error(field_path: str, remediation: str) -> BootstrapIntentError:
+    return BootstrapIntentError(field_path=field_path, code="missing_bootstrap_input", message=f"is required for bootstrap intent; {remediation}")
 
 
 def doctor_project(project_dir: Path) -> dict[str, Any]:
