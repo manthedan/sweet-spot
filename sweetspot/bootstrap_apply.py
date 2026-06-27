@@ -32,10 +32,18 @@ CommandRunner = Callable[..., dict[str, Any]]
 class BootstrapApplyError(RuntimeError):
     """Raised when a bootstrap apply command cannot produce safe deployment outputs."""
 
-    def __init__(self, category: str, message: str, *, command_summaries: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        command_summaries: list[dict[str, Any]] | None = None,
+        output_completeness: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.command_summaries = command_summaries or []
+        self.output_completeness = output_completeness
 
 
 def bootstrap_apply_confirmation_token(plan_path: Path) -> str:
@@ -92,8 +100,8 @@ def apply_bootstrap_plan(
 
     try:
         deployment = _run_apply_and_extract_deployment(project_dir, runner, timeout_seconds=timeout_seconds, command_summaries=command_summaries, plan=plan)
-        _write_bootstrap_json(project_dir / DEPLOYMENT_OUTPUT_PATH, deployment)
-        output_completeness = _output_completeness(project_dir, plan, deployment_written=True)
+        _write_deployment_json(project_dir / DEPLOYMENT_OUTPUT_PATH, deployment)
+        output_completeness = _output_completeness(project_dir, plan, deployment_written=True, outputs=deployment.get("bootstrap_outputs"))
         outcome = _diagnostic(
             status="output_written",
             category="applied",
@@ -115,7 +123,7 @@ def apply_bootstrap_plan(
             message=str(exc),
             reviewed_plan=reviewed_plan,
             confirmation=confirmation_status,
-            output_completeness=output_completeness,
+            output_completeness=exc.output_completeness or output_completeness,
             command_summaries=summaries,
             recovery_hints=_recovery_hints(category),
         )
@@ -199,18 +207,29 @@ def _has_blocking_findings(plan: dict[str, Any]) -> bool:
     return False
 
 
-def _output_completeness(project_dir: Path, plan: dict[str, Any] | None, *, deployment_written: bool | None = None) -> dict[str, Any]:
+def _output_completeness(
+    project_dir: Path,
+    plan: dict[str, Any] | None,
+    *,
+    deployment_written: bool | None = None,
+    outputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     required = _required_generated_paths(plan)
     missing = [path for path in required if not (project_dir / path).is_file()]
     if deployment_written is None:
         deployment_written = (project_dir / DEPLOYMENT_OUTPUT_PATH).is_file()
-    complete = not missing and deployment_written
+    output_keys = sorted(outputs) if isinstance(outputs, dict) else []
+    missing_outputs = _missing_required_outputs(outputs)
+    complete = not missing and deployment_written and not missing_outputs
     return {
         "complete": complete,
         "required_artifacts_present": not missing,
         "deployment_output_written": bool(deployment_written),
         "required": [str(path) for path in required],
         "missing": [str(path) for path in missing],
+        "required_outputs": _required_opentofu_outputs(),
+        "present_outputs": output_keys,
+        "missing_outputs": missing_outputs,
     }
 
 
@@ -274,7 +293,13 @@ def _run_apply_and_extract_deployment(
     try:
         deployment = _deployment_from_outputs(plan, outputs)
     except (TypeError, ValueError, KeyError) as exc:
-        raise BootstrapApplyError("output_extraction_failed", f"Deployment outputs were incomplete: {sanitize_message(str(exc))}", command_summaries=command_summaries) from exc
+        output_completeness = _output_completeness(project_dir, plan, deployment_written=False, outputs=outputs if isinstance(outputs, dict) else None)
+        raise BootstrapApplyError(
+            "output_extraction_failed",
+            f"Deployment outputs were incomplete: {sanitize_message(str(exc))}",
+            command_summaries=command_summaries,
+            output_completeness=output_completeness,
+        ) from exc
     return deployment
 
 
@@ -305,16 +330,21 @@ def _subprocess_runner(command: list[str], *, cwd: Path, timeout_seconds: int = 
 def _deployment_from_outputs(plan: dict[str, Any] | None, outputs: Any) -> dict[str, Any]:
     if not isinstance(outputs, dict):
         raise TypeError("output JSON must be an object")
+    values = {key: _output_value(value) for key, value in outputs.items()}
+    missing_outputs = _missing_required_outputs(values)
+    if missing_outputs:
+        raise ValueError(f"missing required OpenTofu outputs: {', '.join(missing_outputs)}")
     if isinstance(outputs.get("deployment"), dict):
         deployment_value = _output_value(outputs["deployment"])
         if not isinstance(deployment_value, dict):
             raise ValueError("deployment output must be an object")
-        deployment = deployment_value
+        deployment = copy.deepcopy(deployment_value)
     else:
         if not isinstance(plan, dict) or not isinstance(plan.get("expected_deployment"), dict):
             raise ValueError("reviewed plan is missing expected_deployment template")
-        values = {key: _output_value(value) for key, value in outputs.items()}
         deployment = _replace_output_placeholders(copy.deepcopy(plan["expected_deployment"]), values)
+        _apply_named_outputs_to_deployment(deployment, values)
+    deployment["bootstrap_outputs"] = {key: values[key] for key in _required_opentofu_outputs()}
     if deployment.get("schema") != DEPLOYMENT_SCHEMA_V1:
         raise ValueError("deployment output has unexpected schema")
     if _contains_placeholder(deployment):
@@ -323,6 +353,52 @@ def _deployment_from_outputs(plan: dict[str, Any] | None, outputs: Any) -> dict[
         return validate_deployment(deployment)
     except PlannerSpecError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def _required_opentofu_outputs() -> list[str]:
+    return [
+        "batch_compute_environment",
+        "batch_job_queue",
+        "batch_job_definition",
+        "dlq_url",
+        "ecr_repository_url",
+        "log_group",
+        "operator_role_arn",
+        "sqs_queue_url",
+        "worker_image_digest",
+        "worker_task_role_arn",
+    ]
+
+
+def _missing_required_outputs(outputs: dict[str, Any] | None) -> list[str]:
+    if not isinstance(outputs, dict):
+        return _required_opentofu_outputs()
+    missing: list[str] = []
+    for key in _required_opentofu_outputs():
+        value = outputs.get(key)
+        if value is None or value == "":
+            missing.append(key)
+    return missing
+
+
+def _apply_named_outputs_to_deployment(deployment: dict[str, Any], values: dict[str, Any]) -> None:
+    regions = deployment.get("regions")
+    if not isinstance(regions, dict):
+        return
+    for raw_region in regions.values():
+        if not isinstance(raw_region, dict):
+            continue
+        raw_region["sqs_queue_url"] = values["sqs_queue_url"]
+        raw_region["dlq_url"] = values["dlq_url"]
+        architectures = raw_region.get("architectures")
+        if not isinstance(architectures, dict):
+            continue
+        for raw_arch in architectures.values():
+            if not isinstance(raw_arch, dict):
+                continue
+            raw_arch["batch_job_queue"] = values["batch_job_queue"]
+            raw_arch["job_definition"] = values["batch_job_definition"]
+            raw_arch["image"] = values["worker_image_digest"]
 
 
 def _output_value(raw: Any) -> Any:
@@ -418,6 +494,14 @@ def _persist_state_and_failure(project_dir: Path, outcome: dict[str, Any]) -> No
 def _write_bootstrap_json(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(_sanitize_obj(report), indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _write_deployment_json(path: Path, deployment: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(deployment, indent=2, sort_keys=True) + "\n"
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(payload, encoding="utf-8")
     tmp.replace(path)
