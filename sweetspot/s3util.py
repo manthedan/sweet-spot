@@ -4,7 +4,13 @@ from pathlib import Path
 from time import sleep
 from urllib.parse import urlparse
 
-from botocore.exceptions import ClientError
+try:
+    from botocore.exceptions import ClientError
+except ModuleNotFoundError:  # pragma: no cover - exercised in environments without optional AWS SDK deps
+    class ClientError(Exception):  # type: ignore[no-redef]
+        """Fallback so pure URI helpers can be imported without botocore installed."""
+
+        response: dict[str, object] = {}
 
 
 CONDITIONAL_PUT_MAX_ATTEMPTS = 4
