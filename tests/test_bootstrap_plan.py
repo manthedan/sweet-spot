@@ -6,8 +6,23 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sweetspot.bootstrap_plan import BOOTSTRAP_PLAN_SCHEMA_V1, render_bootstrap_plan
+from sweetspot.bootstrap_plan import BOOTSTRAP_PLAN_SCHEMA_V1, render_bootstrap_plan, render_opentofu_bootstrap_plan
 from sweetspot.setup import SWEETSPOT_CONFIG_PATH, load_setup, scan_for_secrets, setup_to_dict, write_project_context
+
+
+class FakeTofuRunner:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.commands = []
+
+    def __call__(self, command, *, cwd, timeout_seconds=30):
+        self.commands.append(list(command))
+        if any(part == "apply" for part in command):
+            raise AssertionError("OpenTofu apply must never be executed")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +139,97 @@ class BootstrapPlanContractTests(unittest.TestCase):
         self.assertEqual(plan["status"], "ready")
         self.assertEqual(before_paths, after_paths)
         self.assertEqual(plan["command_attempts"], [])
+
+    def test_opentofu_renderer_writes_deterministic_review_files(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+
+            first = render_opentofu_bootstrap_plan(project_dir)
+            rendered = {path.relative_to(project_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted((project_dir / ".sweetspot" / "infra").iterdir())}
+            second = render_opentofu_bootstrap_plan(project_dir)
+            rendered_again = {path.relative_to(project_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted((project_dir / ".sweetspot" / "infra").iterdir())}
+            plan_artifact = json.loads((project_dir / ".sweetspot" / "bootstrap-plan.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(first["status"], "ready")
+        self.assertEqual(second["status"], "ready")
+        self.assertEqual(rendered, rendered_again)
+        self.assertEqual(plan_artifact["schema"], BOOTSTRAP_PLAN_SCHEMA_V1)
+        self.assertEqual({p for p in rendered}, {
+            ".sweetspot/infra/main.tf",
+            ".sweetspot/infra/outputs.tf",
+            ".sweetspot/infra/terraform.tfvars.json",
+            ".sweetspot/infra/variables.tf",
+            ".sweetspot/infra/versions.tf",
+        })
+        self.assertIn('resource "aws_batch_job_queue" "job_queue"', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('"aws_region": "us-west-2"', rendered[".sweetspot/infra/terraform.tfvars.json"])
+        self.assertTrue(all(artifact["status"] == "rendered" for artifact in first["generated_artifacts"] if artifact["name"].startswith("opentofu_")))
+
+    def test_opentofu_validation_success_records_command_attempts(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        runner = FakeTofuRunner([
+            {"returncode": 0, "stdout": "OpenTofu v1.8.0\n", "stderr": "", "executable": "/usr/bin/tofu"},
+            {"returncode": 0, "stdout": "Success! The configuration is valid.\n", "stderr": "", "executable": "/usr/bin/tofu"},
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+
+            plan = render_opentofu_bootstrap_plan(project_dir, validate=True, command_runner=runner)
+
+        self.assertEqual(plan["opentofu"]["status"], "validation_passed")
+        self.assertEqual(plan["opentofu"]["executable"], "/usr/bin/tofu")
+        self.assertEqual(len(plan["command_attempts"]), 2)
+        self.assertTrue(any("validate" in attempt["command"] for attempt in plan["command_attempts"]))
+        self.assertFalse(any("apply" in " ".join(command) for command in runner.commands))
+
+    def test_opentofu_missing_executable_is_structured_finding(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        runner = FakeTofuRunner([FileNotFoundError("tofu not found")])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+
+            plan = render_opentofu_bootstrap_plan(project_dir, validate=True, command_runner=runner)
+
+        self.assertEqual(plan["opentofu"]["status"], "tofu_unavailable")
+        self.assertTrue(any(finding["code"] == "tofu_unavailable" for finding in plan["findings"]))
+        self.assertEqual(plan["command_attempts"][0]["status"], "tofu_unavailable")
+
+    def test_opentofu_validation_failure_sanitizes_stderr(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        runner = FakeTofuRunner([
+            {"returncode": 0, "stdout": "OpenTofu v1.8.0\n", "stderr": "", "executable": "/usr/bin/tofu"},
+            {"returncode": 1, "stdout": "", "stderr": "bad token AKIA1234567890ABCDEF and aws_secret_access_key abc\n", "executable": "/usr/bin/tofu"},
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+
+            plan = render_opentofu_bootstrap_plan(project_dir, validate=True, command_runner=runner)
+
+        serialized = json.dumps(plan, sort_keys=True)
+        self.assertEqual(plan["opentofu"]["status"], "validation_failed")
+        self.assertIn("[redacted]", serialized)
+        self.assertNotIn("AKIA1234567890ABCDEF", serialized)
+        self.assertNotIn("aws_secret_access_key", serialized)
+        self.assertTrue(any(finding["code"] == "opentofu_validation_failed" for finding in plan["findings"]))
+        self.assertEqual(scan_for_secrets(plan), ())
+
+    def test_opentofu_renderer_does_not_validate_or_apply_by_default(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        runner = FakeTofuRunner([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+
+            plan = render_opentofu_bootstrap_plan(project_dir, command_runner=runner)
+
+        self.assertEqual(plan["opentofu"]["status"], "not_requested")
+        self.assertEqual(plan["command_attempts"], [])
+        self.assertEqual(runner.commands, [])
 
 
 if __name__ == "__main__":
