@@ -229,5 +229,113 @@ class BootstrapApplyGuardContractTests(unittest.TestCase):
         self.assertEqual(runner.commands, [])
 
 
+class ScriptedApplyRunner:
+    def __init__(self, results: list[dict]) -> None:
+        self.results = list(results)
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command, *, cwd, timeout_seconds=30):
+        self.commands.append(list(command))
+        if not self.results:
+            raise AssertionError(f"unexpected command: {command!r}")
+        return self.results.pop(0)
+
+
+class BootstrapApplyPersistenceTests(BootstrapApplyGuardContractTests):
+    def _deployment_output(self) -> dict:
+        deployment = self._ready_plan()["expected_deployment"]
+        deployment = json.loads(json.dumps(deployment))
+        region = deployment["regions"]["us-west-2"]
+        region["sqs_queue_url"] = "https://sqs.us-west-2.amazonaws.com/123456789012/example"
+        region["dlq_url"] = "https://sqs.us-west-2.amazonaws.com/123456789012/example-dlq"
+        region["architectures"]["x86_64"]["image"] = "123456789012.dkr.ecr.us-west-2.amazonaws.com/example@sha256:" + "a" * 64
+        return {"deployment": {"value": deployment}}
+
+    def test_refusal_persists_state_and_failure_diagnostics(self) -> None:
+        apply_module = self._apply_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=None, command_runner=FakeApplyRunner())
+            state = json.loads((project_dir / ".sweetspot/bootstrap/state.json").read_text(encoding="utf-8"))
+            failure = json.loads((project_dir / ".sweetspot/bootstrap/failure.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(state, outcome)
+        self.assertEqual(failure, outcome)
+        self.assertEqual(state["status"], "blocked")
+        self.assertEqual(state["category"], "missing_reviewed_plan")
+        self.assertIn("recovery_hints", state)
+
+    def test_successful_mocked_apply_writes_deployment_output_and_state(self) -> None:
+        apply_module = self._apply_module()
+        runner = ScriptedApplyRunner(
+            [
+                {"returncode": 0, "stdout": "apply ok", "stderr": "", "executable": "opentofu"},
+                {"returncode": 0, "stdout": json.dumps(self._deployment_output()), "stderr": "", "executable": "opentofu"},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            plan_path = self._write_ready_artifacts(project_dir)
+            token = apply_module.bootstrap_apply_confirmation_token(plan_path)
+            outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=token, command_runner=runner)
+            state = json.loads((project_dir / ".sweetspot/bootstrap/state.json").read_text(encoding="utf-8"))
+            deployment = json.loads((project_dir / ".sweetspot/deployment.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(outcome["status"], "output_written")
+        self.assertEqual(outcome["category"], "applied")
+        self.assertEqual(outcome, state)
+        self.assertEqual(deployment["schema"], DEPLOYMENT_SCHEMA_V1)
+        self.assertEqual([cmd[1] for cmd in runner.commands], ["apply", "output"])
+        self.assertEqual(len(outcome["command_summaries"]), 2)
+        self.assertTrue(outcome["output_completeness"]["complete"])
+
+    def test_apply_permission_failure_persists_sanitized_failure_without_outputs(self) -> None:
+        apply_module = self._apply_module()
+        secret = "AKIA1234567890ABCDEF"
+        runner = ScriptedApplyRunner(
+            [
+                {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": f"AccessDenied for token {secret} and aws_secret_access_key=abcd",
+                    "executable": "opentofu",
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            plan_path = self._write_ready_artifacts(project_dir)
+            token = apply_module.bootstrap_apply_confirmation_token(plan_path)
+            outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=token, command_runner=runner)
+            failure_text = (project_dir / ".sweetspot/bootstrap/failure.json").read_text(encoding="utf-8")
+
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual(outcome["category"], "missing_permission")
+        self.assertFalse((project_dir / ".sweetspot/deployment.json").exists())
+        self.assertNotIn(secret, json.dumps(outcome, sort_keys=True))
+        self.assertNotIn(secret, failure_text)
+        self.assertIn("[REDACTED]", failure_text)
+
+    def test_output_extraction_failure_persists_failure_after_apply(self) -> None:
+        apply_module = self._apply_module()
+        runner = ScriptedApplyRunner(
+            [
+                {"returncode": 0, "stdout": "apply ok", "stderr": "", "executable": "opentofu"},
+                {"returncode": 0, "stdout": "not-json", "stderr": "", "executable": "opentofu"},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            plan_path = self._write_ready_artifacts(project_dir)
+            token = apply_module.bootstrap_apply_confirmation_token(plan_path)
+            outcome = apply_module.apply_bootstrap_plan(project_dir, confirmation=token, command_runner=runner)
+            failure = json.loads((project_dir / ".sweetspot/bootstrap/failure.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual(outcome["category"], "output_extraction_failed")
+        self.assertEqual(outcome, failure)
+        self.assertEqual([cmd[1] for cmd in runner.commands], ["apply", "output"])
+
+
 if __name__ == "__main__":
     unittest.main()
