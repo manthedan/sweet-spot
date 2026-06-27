@@ -59,6 +59,7 @@ from .finalize_service import (
     run_finalizer as _run_finalizer_service,
     run_integrated_finalizer as _run_integrated_finalizer_service,
 )
+from .bootstrap_plan import render_opentofu_bootstrap_plan
 from .output import format_table_value as _format_table_value, print_key_values as _print_key_values, print_table as _print_table
 from .planner import PlannerSpecError, initial_blocked_plan, iter_canary_tasks_from_logical_unit_count, iter_production_tasks_from_logical_unit_count, load_job_spec, plan_with_adaptive_canaries
 from .reconcile_service import run_worker_reconciliation as _run_worker_reconciliation_service
@@ -4665,11 +4666,90 @@ def cmd_doctor_bootstrap(args: argparse.Namespace) -> int:
     return local_exit_code
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
+def _bootstrap_plan_project_root(project_dir: Path) -> Path:
+    requested = Path(project_dir).expanduser()
+    if requested.name == ".sweetspot":
+        return requested.parent
+    return requested
+
+
+def _bootstrap_plan_artifact_path(project_root: Path, out: Path | None) -> Path:
+    sweetspot_dir = (project_root / ".sweetspot").resolve()
+    candidate = project_root / ".sweetspot" / "bootstrap-plan.json" if out is None else Path(out).expanduser()
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(sweetspot_dir)
+    except ValueError as exc:
+        raise ValueError("bootstrap plan artifacts must be written under .sweetspot/") from exc
+    return resolved
+
+
+def _bootstrap_plan_error_report(message: str, *, code: str = "bootstrap_plan_output_path_invalid") -> dict[str, Any]:
+    return {
+        "schema": "sweetspot.bootstrap.plan.v1",
+        "status": "invalid",
+        "ok": False,
+        "artifact_path": None,
+        "findings": [
+            {
+                "code": code,
+                "severity": "error",
+                "field_path": "$.artifact_path",
+                "message": message,
+            }
+        ],
+        "generated_artifacts": [],
+        "command_attempts": [],
+        "stderr_summary": [],
+        "next_actions": ["Choose an --out path under .sweetspot/ and rerun `sweetspot bootstrap plan`."],
+    }
+
+
+def _write_bootstrap_plan_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def cmd_bootstrap_plan(args: argparse.Namespace) -> int:
+    project_root = _bootstrap_plan_project_root(args.project_dir)
+    try:
+        artifact_path = _bootstrap_plan_artifact_path(project_root, args.out)
+    except ValueError as exc:
+        report = _bootstrap_plan_error_report(str(exc))
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 2
+
+    try:
+        report = render_opentofu_bootstrap_plan(
+            project_root,
+            validate=args.validate,
+            tofu_executable=args.tofu_executable,
+            timeout_seconds=args.validation_timeout_seconds,
+        )
+        try:
+            report["artifact_path"] = artifact_path.relative_to(project_root).as_posix()
+        except ValueError:
+            report["artifact_path"] = str(artifact_path)
+        report["ok"] = report.get("status") == "ready" and report.get("opentofu", {}).get("status") in {"not_requested", "validation_passed"}
+        _write_bootstrap_plan_report(artifact_path, report)
+    except OSError as exc:
+        report = _bootstrap_plan_error_report(f"failed to write bootstrap plan artifact: {exc}", code="bootstrap_plan_artifact_write_failed")
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 1
+
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
+PRIMARY_COMMANDS = frozenset({"admin", "bootstrap", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,init,doctor,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,init,doctor,bootstrap,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
@@ -5241,6 +5321,22 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported in this milestone")
         bootstrap.add_argument("--check-aws", "--aws-diagnostics", action="store_true", dest="check_aws", help="Opt in to read-only AWS bootstrap diagnostics after local bootstrap status is ready")
         bootstrap.set_defaults(func=cmd_doctor_bootstrap)
+
+        boot = _add_parser_with_examples(
+            sub,
+            "bootstrap",
+            help="Render reviewable bootstrap infrastructure plans without applying changes",
+            examples="  sweetspot bootstrap plan --project-dir .sweetspot --format json\n  sweetspot bootstrap plan --project-dir . --out .sweetspot/bootstrap-plan.json",
+        )
+        boot_sub = boot.add_subparsers(dest="bootstrap_cmd", required=True)
+        boot_plan = boot_sub.add_parser("plan", help="Render and save a local OpenTofu-backed bootstrap plan report")
+        boot_plan.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
+        boot_plan.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported")
+        boot_plan.add_argument("--out", type=Path, help="Plan artifact path; must resolve under the project .sweetspot directory")
+        boot_plan.add_argument("--validate", action="store_true", help="Run local `tofu version` and `tofu validate` after rendering review files")
+        boot_plan.add_argument("--tofu-executable", default="tofu", help="OpenTofu executable used only with --validate")
+        boot_plan.add_argument("--validation-timeout-seconds", type=int, default=30, help="Timeout for each local OpenTofu validation command")
+        boot_plan.set_defaults(func=cmd_bootstrap_plan)
 
     p = _add_parser_with_examples(
         sub,

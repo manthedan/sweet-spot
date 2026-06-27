@@ -132,7 +132,7 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,init,doctor,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
+        self.assertIn("{version,init,doctor,bootstrap,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
         self.assertIn("init", text)
         self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
         self.assertIn("doctor", text)
@@ -388,6 +388,75 @@ class ProjectDoctorCliTests(unittest.TestCase):
         self.assertNotIn("aws_diagnostics", report)
         self.assertEqual(report["validation_findings"][0]["code"], "secret_value_aws_access_key_id")
         self.assertNotIn(secret_text, json.dumps(report))
+
+    def test_bootstrap_plan_json_output_writes_default_artifact_without_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("bootstrap plan must not call boto3.client")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap plan must not call boto3.Session")),
+                patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", side_effect=AssertionError("bootstrap plan must not call AWS diagnostics")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["bootstrap", "plan", "--project-dir", str(project_root / ".sweetspot"), "--format", "json"]), 0)
+
+            report = json.loads(out.getvalue())
+            artifact = project_root / ".sweetspot" / "bootstrap-plan.json"
+            saved = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(report["schema"], "sweetspot.bootstrap.plan.v1")
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["status"], "ready")
+            self.assertEqual(report["artifact_path"], ".sweetspot/bootstrap-plan.json")
+            self.assertEqual(saved, report)
+            self.assertNotIn("aws_diagnostics", report)
+            self.assertTrue((project_root / ".sweetspot" / "infra" / "main.tf").exists())
+
+    def test_bootstrap_plan_incomplete_project_is_nonzero_and_still_writes_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            out = io.StringIO()
+            with (
+                patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", side_effect=AssertionError("bootstrap plan must not call AWS diagnostics")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["bootstrap", "plan", "--project-dir", str(project_root), "--format", "json"]), 1)
+
+            report = json.loads(out.getvalue())
+            artifact = project_root / ".sweetspot" / "bootstrap-plan.json"
+            self.assertFalse(report["ok"])
+            self.assertIn(report["status"], {"incomplete", "invalid"})
+            self.assertEqual(report["artifact_path"], ".sweetspot/bootstrap-plan.json")
+            self.assertEqual(json.loads(artifact.read_text(encoding="utf-8")), report)
+            self.assertNotIn("aws_diagnostics", report)
+
+    def test_bootstrap_plan_rejects_output_path_outside_sweetspot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["bootstrap", "plan", "--project-dir", str(project_root), "--out", "bootstrap-plan.json", "--format", "json"]), 2)
+
+            report = json.loads(out.getvalue())
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["status"], "invalid")
+            self.assertEqual(report["findings"][0]["code"], "bootstrap_plan_output_path_invalid")
+            self.assertFalse((project_root / "bootstrap-plan.json").exists())
+
+    def test_bootstrap_plan_namespace_does_not_replace_workload_plan(self) -> None:
+        help_out = io.StringIO()
+        with contextlib.redirect_stdout(help_out), self.assertRaises(SystemExit) as help_exit:
+            main(["bootstrap", "--help"])
+        self.assertEqual(help_exit.exception.code, 0)
+        self.assertIn("plan", help_out.getvalue())
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(main(["plan", "examples/job.x86.example.json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["schema"], "sweetspot.plan.v1")
 
     def test_admin_doctor_remains_live_aws_command(self) -> None:
         with (
