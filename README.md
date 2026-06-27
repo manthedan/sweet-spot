@@ -94,6 +94,20 @@ ruff check . && mypy sweetspot && python -m unittest discover -s tests -v
 
 For full release closeout (also runs OpenTofu checks when tofu is installed): `scripts/verify_release.sh`.
 
+### First-run local setup
+
+Initialize a contained `.sweetspot/` starter bundle from the example config, inspect the generated JobSpec, then run the agent-readable local setup doctor:
+
+```bash
+sweetspot init --config examples/setup.example.yaml --project-dir /tmp/example
+sweetspot plan /tmp/example/.sweetspot/job.json
+sweetspot doctor project --project-dir /tmp/example/.sweetspot --format json
+```
+
+`init` writes local setup state and starter artifacts only. It records AWS region/auth profile or role references for review, but does not provision AWS resources, create queues/buckets/roles, deploy workers, perform live AWS checks, or store credentials. `sweetspot doctor project --format json` emits the `sweetspot.project.doctor.v1` local validation surface with top-level `ok`, `checks`, and `summary`; each check includes an ID/status/severity for agent triage. Invalid setup and secret-looking material fail closed, while review placeholders can remain warnings until customized.
+
+See `docs/setup.md` for the full first-run handoff, generated `.sweetspot/` layout, AWS auth boundary, and M002 bootstrap limits.
+
 ### Task schema (`sweetspot.task.v1`)
 
 Each SQS message is a JSON object:
@@ -119,6 +133,8 @@ The primary agent interface uses a high-level controller workflow. Lower-level o
 
 | Command | Purpose | Key flags |
 | --- | --- | --- |
+| `sweetspot init` | Initialize a local `.sweetspot/` starter bundle from a setup config without provisioning AWS. | `--config`, `--project-dir`, `--force` |
+| `sweetspot doctor project` | Validate local setup artifacts and emit failure-closed project diagnostics for agents. | `--project-dir`, `--format json` |
 | `sweetspot plan` | Generate canary and production plans from a JobSpec. | `--input-manifest-jsonl`, `--out-canary-tasks-jsonl`, `--canary-summary-jsonl` |
 | `sweetspot run` | Execute canaries, submit production workers, reconcile. | `--deployment`, `--apply`, `--kickoff-only`, `--reconcile-until-drained`, `--finalize` |
 | `sweetspot monitor RUN_ID` | Emit non-blocking scheduler/CI status and finalize checkpoint commands. | `--emit-command`, `--interval`, `--output-prefix` |
@@ -160,6 +176,7 @@ See `infra/opentofu/README.md` for details.
 
 - `CONTRIBUTING.md` -- contributor workflow, trust boundary, release hygiene
 - `SECURITY.md` -- trusted-workload threat model
+- `docs/setup.md` -- first-run setup handoff, `.sweetspot/` layout, local doctor JSON, and AWS bootstrap boundary
 - `docs/reliability_contract.md` -- full worker/done-marker protocol
 - `docs/lifecycle_reports.md` -- lifecycle closeout report schemas and error payloads
 - `docs/cost_model.md` -- expected-total-cost pool ranking formulas
