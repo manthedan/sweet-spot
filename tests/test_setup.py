@@ -26,6 +26,7 @@ from sweetspot.setup import (
     dump_setup,
     load_setup,
     render_bootstrap_intent,
+    render_bootstrap_status,
     render_deployment_template,
     render_infra_vars_stub,
     render_next_steps,
@@ -331,6 +332,61 @@ class SetupModelTests(unittest.TestCase):
         self.assertEqual(report["status"], "invalid")
         self.assertEqual(report["errors"][0]["field_path"], SWEETSPOT_CONFIG_PATH)
         self.assertEqual(report["errors"][0]["code"], "invalid_setup_config")
+
+    def test_bootstrap_status_reports_ready_local_bundle_without_external_dependencies(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            report = json.loads(render_bootstrap_status(project_dir / ".sweetspot"))
+
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.status.v1")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["intent"]["schema"], "sweetspot.bootstrap.intent.v1")
+        self.assertEqual(report["intent"]["status"], "ready")
+        self.assertEqual(report["intent"]["region"], "us-west-2")
+        self.assertEqual(report["intent"]["auth"], {"method": "profile", "reference": "sweetspot-dev"})
+        self.assertEqual(report["validation_findings"], [])
+        artifacts = {artifact["name"]: artifact for artifact in report["generated_artifacts"]}
+        self.assertEqual(set(artifacts), {"config", "deployment_template", "doc", "infra_vars_stub", "job", "next_steps", "worker_notes", "worker_scaffold"})
+        self.assertTrue(all(artifact["status"] == "present" for artifact in artifacts.values()))
+        self.assertIn("Review generated artifacts", report["next_actions"][0])
+        self.assertEqual(scan_for_secrets(report), ())
+
+    def test_bootstrap_status_reports_missing_artifacts_and_inputs(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+        data = setup_to_dict(config)
+        data["aws"]["auth"].pop("profile")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            write_project_context(config, project_dir)
+            (project_dir / JOB_SPEC_PATH).unlink()
+            (project_dir / SWEETSPOT_CONFIG_PATH).write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            report = json.loads(render_bootstrap_status(project_dir))
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "incomplete")
+        self.assertIn("aws.auth.profile", report["intent"]["missing_inputs"])
+        artifacts = {artifact["name"]: artifact for artifact in report["generated_artifacts"]}
+        self.assertEqual(artifacts["job"]["status"], "missing")
+        self.assertTrue(any("aws.auth.profile" in action for action in report["next_actions"]))
+        self.assertTrue(any(JOB_SPEC_PATH in action for action in report["next_actions"]))
+
+    def test_bootstrap_status_reports_invalid_setup_without_secret_leakage(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sweetspot_dir = Path(tmpdir) / ".sweetspot"
+            sweetspot_dir.mkdir()
+            (sweetspot_dir / "sweetspot.yaml").write_text(f"schema: wrong\nworkload:\n  command: ['python', '{secret_text}']\n", encoding="utf-8")
+            report = json.loads(render_bootstrap_status(sweetspot_dir))
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["validation_findings"][0]["code"], "secret_value_aws_access_key_id")
+        self.assertNotIn(secret_text, json.dumps(report))
 
     def test_write_project_context_round_trips_and_renders_full_starter_bundle(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")

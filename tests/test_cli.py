@@ -136,7 +136,7 @@ class AdminCommandAliasTests(unittest.TestCase):
         self.assertIn("init", text)
         self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
         self.assertIn("doctor", text)
-        self.assertIn("Validate local .sweetspot context with `doctor project`; legacy AWS checks require explicit AWS flags", text)
+        self.assertIn("Validate local .sweetspot context with `doctor project` or render bootstrap status with `doctor bootstrap`; legacy AWS checks require explicit AWS flags", text)
         self.assertIn("sweetspot admin --help", text)
         self.assertNotIn("enqueue-jsonl", text)
         self.assertNotIn("==SUPPRESS==", text)
@@ -213,6 +213,48 @@ class ProjectDoctorCliTests(unittest.TestCase):
         codes = {finding["code"] for check in report["checks"] for finding in check["findings"]}
         self.assertIn("missing_setup_config", codes)
         self.assertIn("missing_job_artifact", codes)
+
+    def test_doctor_bootstrap_valid_init_outputs_local_status_without_aws(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("bootstrap doctor must not call boto3.client")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap doctor must not call boto3.Session")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json"]), 0)
+
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.status.v1")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["intent"]["auth"], {"method": "profile", "reference": "sweetspot-dev"})
+        self.assertTrue(all(artifact["status"] == "present" for artifact in report["generated_artifacts"]))
+        self.assertTrue(report["next_actions"])
+
+    def test_doctor_bootstrap_invalid_state_exits_nonzero_with_sanitized_json_without_aws(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / ".sweetspot"
+            project_dir.mkdir()
+            (project_dir / "sweetspot.yaml").write_text(f"schema: wrong\nworkload:\n  command: ['python', '{secret_text}']\n", encoding="utf-8")
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.client", side_effect=AssertionError("bootstrap doctor must not call boto3.client")),
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap doctor must not call boto3.Session")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json"]), 1)
+
+        report = json.loads(out.getvalue())
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["validation_findings"][0]["code"], "secret_value_aws_access_key_id")
+        self.assertNotIn(secret_text, json.dumps(report))
 
     def test_admin_doctor_remains_live_aws_command(self) -> None:
         with (

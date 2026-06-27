@@ -36,7 +36,9 @@ NEXT_STEPS_PATH = f"{SWEETSPOT_DIR}/{NEXT_STEPS}"
 
 DOCTOR_SCHEMA_V1 = "sweetspot.project.doctor.v1"
 BOOTSTRAP_INTENT_SCHEMA_V1 = "sweetspot.bootstrap.intent.v1"
+BOOTSTRAP_STATUS_SCHEMA_V1 = "sweetspot.bootstrap.status.v1"
 BOOTSTRAP_INTENT_STATUSES = {"ready", "incomplete", "invalid"}
+BOOTSTRAP_STATUS_STATUSES = {"ready", "incomplete", "invalid"}
 DOCTOR_STATUSES = {"pass", "warning", "fail"}
 DOCTOR_SEVERITIES = {"info", "warning", "error"}
 
@@ -151,6 +153,19 @@ class BootstrapIntent:
     resource_names: BootstrapResourceNames | None
     missing_inputs: tuple[str, ...]
     errors: tuple[BootstrapIntentError, ...]
+
+
+@dataclass(frozen=True)
+class BootstrapStatus:
+    schema: str
+    status: str
+    ok: bool
+    project_dir: str
+    root_dir: str
+    intent: dict[str, Any]
+    validation_findings: tuple[dict[str, str], ...]
+    generated_artifacts: tuple[dict[str, str], ...]
+    next_actions: tuple[str, ...]
 
 
 def load_setup(path: str | Path) -> SweetSpotProject:
@@ -563,6 +578,104 @@ def bootstrap_intent_to_dict(intent: BootstrapIntent) -> dict[str, Any]:
 def render_bootstrap_intent(config: SweetSpotProject | dict[str, Any]) -> str:
     """Render a stable, sanitized bootstrap intent report as JSON."""
     return json.dumps(bootstrap_intent_to_dict(bootstrap_intent_from_setup(config)), sort_keys=True, indent=2) + "\n"
+
+
+def bootstrap_status_for_project(project_dir: str | Path) -> dict[str, Any]:
+    """Return a deterministic local bootstrap status report for a generated project.
+
+    The status report is a planning/doctor surface only: it reads local files,
+    composes the sanitized bootstrap intent, checks generated artifact paths, and
+    emits next actions without importing AWS/OpenTofu clients, running
+    subprocesses, or writing project files.
+    """
+    requested_dir = Path(project_dir).expanduser()
+    sweetspot_dir = _resolve_doctor_sweetspot_dir(requested_dir)
+    root_dir = sweetspot_dir.parent
+    config_path = sweetspot_dir / SWEETSPOT_CONFIG
+    intent = load_bootstrap_intent(config_path)
+    intent_report = bootstrap_intent_to_dict(intent)
+    setup_config: SweetSpotProject | None = None
+    if config_path.exists() and config_path.is_file() and intent.status != "invalid":
+        try:
+            setup_config = load_setup(config_path)
+        except (OSError, SetupSpecError):
+            setup_config = None
+
+    artifact_paths = _doctor_artifact_paths(root_dir, setup_config)
+    generated_artifacts = tuple(_bootstrap_artifact_status(name, path, root_dir) for name, path in sorted(artifact_paths.items()))
+    validation_findings = tuple(
+        {"field_path": error.field_path, "code": error.code, "severity": "error", "message": error.message}
+        for error in intent.errors
+    )
+    artifact_failures = [artifact for artifact in generated_artifacts if artifact["status"] != "present"]
+    has_only_missing_inputs = bool(intent.errors) and all(error.code == "missing_bootstrap_input" for error in intent.errors)
+    status = (
+        "invalid"
+        if intent.status == "invalid" and not has_only_missing_inputs
+        else "incomplete"
+        if intent.missing_inputs or artifact_failures
+        else "ready"
+    )
+    if status not in BOOTSTRAP_STATUS_STATUSES:
+        raise ValueError(f"unknown bootstrap status: {status}")
+    report = BootstrapStatus(
+        schema=BOOTSTRAP_STATUS_SCHEMA_V1,
+        status=status,
+        ok=status == "ready",
+        project_dir=sweetspot_dir.as_posix(),
+        root_dir=root_dir.as_posix(),
+        intent=intent_report,
+        validation_findings=validation_findings,
+        generated_artifacts=generated_artifacts,
+        next_actions=tuple(_bootstrap_next_actions(status, intent, artifact_failures)),
+    )
+    return bootstrap_status_to_dict(report)
+
+
+def bootstrap_status_to_dict(status: BootstrapStatus) -> dict[str, Any]:
+    """Return a JSON-safe local bootstrap status report."""
+    return {
+        "schema": status.schema,
+        "status": status.status,
+        "ok": status.ok,
+        "project_dir": status.project_dir,
+        "root_dir": status.root_dir,
+        "intent": status.intent,
+        "validation_findings": list(status.validation_findings),
+        "generated_artifacts": list(status.generated_artifacts),
+        "next_actions": list(status.next_actions),
+    }
+
+
+def render_bootstrap_status(project_dir: str | Path) -> str:
+    """Render the local bootstrap status report as stable JSON."""
+    return json.dumps(bootstrap_status_for_project(project_dir), sort_keys=True, indent=2) + "\n"
+
+
+def _bootstrap_artifact_status(name: str, path: Path, root_dir: Path) -> dict[str, str]:
+    if path.exists() and path.is_file():
+        status = "present"
+    elif path.exists():
+        status = "invalid"
+    else:
+        status = "missing"
+    return {"name": name, "path": _display_path(path, root_dir), "status": status}
+
+
+def _bootstrap_next_actions(status: str, intent: BootstrapIntent, artifact_failures: list[dict[str, str]]) -> list[str]:
+    actions: list[str] = []
+    if status == "invalid":
+        actions.append("Fix .sweetspot/sweetspot.yaml until the bootstrap intent validates without sanitized errors.")
+    if intent.missing_inputs:
+        fields = ", ".join(intent.missing_inputs)
+        actions.append(f"Provide missing bootstrap inputs in .sweetspot/sweetspot.yaml: {fields}.")
+    if artifact_failures:
+        paths = ", ".join(artifact["path"] for artifact in artifact_failures)
+        actions.append(f"Regenerate or restore generated bootstrap artifacts before planning: {paths}.")
+    if not actions:
+        actions.append("Review generated artifacts and placeholders before any future AWS bootstrap apply step.")
+        actions.append("Keep AWS credentials outside .sweetspot; use the reported auth reference only.")
+    return actions
 
 
 def _bootstrap_intent_report(project: SweetSpotProject | None, errors: list[BootstrapIntentError]) -> BootstrapIntent:

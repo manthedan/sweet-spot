@@ -72,7 +72,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_join, s3_upload_text
-from .setup import SetupSpecError, doctor_project, load_setup, validate_setup, write_project_context
+from .setup import SetupSpecError, doctor_project, load_setup, render_bootstrap_status, validate_setup, write_project_context
 from .task_model import default_done_s3, parse_allowed_s3_prefixes
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_worker_timing
 
@@ -4624,6 +4624,12 @@ def cmd_doctor_project(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def cmd_doctor_bootstrap(args: argparse.Namespace) -> int:
+    report = json.loads(render_bootstrap_status(args.project_dir))
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
 PRIMARY_COMMANDS = frozenset({"admin", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
@@ -4633,7 +4639,7 @@ def _print_primary_help() -> None:
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
     print("  init      Initialize local SweetSpot project context from setup YAML")
-    print("  doctor    Validate local .sweetspot context with `doctor project`; legacy AWS checks require explicit AWS flags")
+    print("  doctor    Validate local .sweetspot context with `doctor project` or render bootstrap status with `doctor bootstrap`; legacy AWS checks require explicit AWS flags")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")
     print("  monitor   Emit non-blocking status/finalize checkpoint commands")
@@ -5195,6 +5201,10 @@ def main(argv: list[str] | None = None) -> int:
         project.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
         project.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported in this milestone")
         project.set_defaults(func=cmd_doctor_project)
+        bootstrap = doctor_sub.add_parser("bootstrap", help="Render local bootstrap status without contacting AWS")
+        bootstrap.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
+        bootstrap.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported in this milestone")
+        bootstrap.set_defaults(func=cmd_doctor_bootstrap)
 
     p = _add_parser_with_examples(
         sub,
