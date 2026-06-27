@@ -568,10 +568,7 @@ def bootstrap_intent_to_dict(intent: BootstrapIntent) -> dict[str, Any]:
         "backend": intent.backend,
         "resource_names": resource_names,
         "missing_inputs": list(intent.missing_inputs),
-        "errors": [
-            {"field_path": error.field_path, "code": error.code, "message": error.message}
-            for error in intent.errors
-        ],
+        "errors": [{"field_path": error.field_path, "code": error.code, "message": error.message} for error in intent.errors],
     }
 
 
@@ -603,19 +600,10 @@ def bootstrap_status_for_project(project_dir: str | Path) -> dict[str, Any]:
 
     artifact_paths = _doctor_artifact_paths(root_dir, setup_config)
     generated_artifacts = tuple(_bootstrap_artifact_status(name, path, root_dir) for name, path in sorted(artifact_paths.items()))
-    validation_findings = tuple(
-        {"field_path": error.field_path, "code": error.code, "severity": "error", "message": error.message}
-        for error in intent.errors
-    )
+    validation_findings = tuple({"field_path": error.field_path, "code": error.code, "severity": "error", "message": error.message} for error in intent.errors)
     artifact_failures = [artifact for artifact in generated_artifacts if artifact["status"] != "present"]
     has_only_missing_inputs = bool(intent.errors) and all(error.code == "missing_bootstrap_input" for error in intent.errors)
-    status = (
-        "invalid"
-        if intent.status == "invalid" and not has_only_missing_inputs
-        else "incomplete"
-        if intent.missing_inputs or artifact_failures
-        else "ready"
-    )
+    status = "invalid" if intent.status == "invalid" and not has_only_missing_inputs else "incomplete" if intent.missing_inputs or artifact_failures else "ready"
     if status not in BOOTSTRAP_STATUS_STATUSES:
         raise ValueError(f"unknown bootstrap status: {status}")
     report = BootstrapStatus(
@@ -760,10 +748,7 @@ def _bootstrap_intent_validation_errors(data: Any) -> list[BootstrapIntentError]
 
     secret_findings = scan_for_secrets(data)
     if secret_findings:
-        return [
-            BootstrapIntentError(field_path=finding.path, code=finding.code, message=finding.message)
-            for finding in secret_findings
-        ]
+        return [BootstrapIntentError(field_path=finding.path, code=finding.code, message=finding.message) for finding in secret_findings]
 
     errors: list[BootstrapIntentError] = []
     for field_path in _BOOTSTRAP_REQUIRED_MAPPINGS:
@@ -1091,7 +1076,7 @@ def _scan_for_secrets(value: Any, field_path: str, findings: list[SecretFinding]
         for key, child in value.items():
             key_text = str(key)
             child_path = f"{field_path}.{key_text}" if field_path != "$" else key_text
-            if _SECRET_KEY_RE.search(key_text):
+            if key_text != "confirmation_token" and _SECRET_KEY_RE.search(key_text):
                 findings.append(
                     SecretFinding(
                         path=child_path,

@@ -53,6 +53,13 @@ class FakeSTS:
         self.response = response or {"Account": RAW_ACCOUNT, "Arn": RAW_ARN, "UserId": "AROAABCDEFGHIJKLMNOP:raw-session"}
         self.exc = exc
         self.calls = 0
+        self.assume_role_calls = []
+
+    def assume_role(self, **kwargs):
+        self.assume_role_calls.append(kwargs)
+        if self.exc:
+            raise self.exc
+        return {"Credentials": {"AccessKeyId": "ASIAABCDEFGHIJKLMNOP", "SecretAccessKey": "secret", "SessionToken": "token"}}
 
     def get_caller_identity(self):
         self.calls += 1
@@ -125,6 +132,7 @@ class BootstrapAwsDiagnosticsTests(unittest.TestCase):
         self.assertEqual("[REDACTED_ACCOUNT_ID]", report["caller_identity"]["account"])
         self.assertEqual("[REDACTED_ARN]", report["caller_identity"]["arn"])
         self.assertEqual(["us-west-2", RAW_PROFILE], [sessions[0].kwargs["region_name"], sessions[0].kwargs["profile_name"]])
+        self.assertNotIn("sts:AssumeRole", report["required_actions"])
         checks = {check["name"]: check for check in report["checks"]}
         self.assertEqual("pass", checks["sts_get_caller_identity"]["status"])
         self.assertEqual("simulation_allowed", checks["iam_simulate_principal_policy"]["details"]["classification"])
@@ -135,6 +143,35 @@ class BootstrapAwsDiagnosticsTests(unittest.TestCase):
         report = diagnose_bootstrap_aws(intent=intent(), session_factory=session_factory_with(captured=sessions))
         self.assertTrue(report["ok"])
         self.assertNotIn("profile_name", sessions[0].kwargs)
+
+    def test_sso_auth_uses_configured_profile_reference(self):
+        sessions = []
+        report = diagnose_bootstrap_aws(intent=intent(auth_method="sso", auth_reference=RAW_PROFILE), session_factory=session_factory_with(captured=sessions))
+        self.assertTrue(report["ok"])
+        self.assertEqual("sso", report["auth"]["method"])
+        self.assertEqual(RAW_PROFILE, sessions[0].kwargs["profile_name"])
+
+    def test_sso_auth_without_reference_is_incomplete(self):
+        report = diagnose_bootstrap_aws(intent=intent(auth_method="sso", auth_reference=None), session_factory=lambda **kwargs: None)
+        self.assertFalse(report["ok"])
+        self.assertEqual("incomplete_auth", report["checks"][0]["details"]["classification"])
+
+    def test_role_auth_assumes_role_before_identity_checks(self):
+        sessions = []
+        base_sts = FakeSTS()
+        report = diagnose_bootstrap_aws(
+            intent=intent(auth_method="role", auth_reference=RAW_ARN),
+            session_factory=session_factory_with(sts=base_sts, captured=sessions),
+        )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual("role", report["auth"]["method"])
+        self.assertEqual("[REDACTED_AUTH_REFERENCE]", report["auth"]["reference"])
+        self.assertIn("sts:AssumeRole", report["required_actions"])
+        self.assertEqual(RAW_ARN, base_sts.assume_role_calls[0]["RoleArn"])
+        self.assertNotIn("profile_name", sessions[0].kwargs)
+        self.assertIn("aws_access_key_id", sessions[1].kwargs)
+        assert_no_raw_identifiers(self, report)
 
     def test_missing_credentials_from_sts_is_structured_failure(self):
         report = diagnose_bootstrap_aws(
@@ -220,7 +257,7 @@ class BootstrapAwsDiagnosticsTests(unittest.TestCase):
             raise AssertionError("session should not be constructed")
 
         unsupported = diagnose_bootstrap_aws(
-            intent=intent(auth_method="role", auth_reference=RAW_ARN),
+            intent=intent(auth_method="static-keys", auth_reference=RAW_ARN),
             session_factory=fail_if_called,
         )
         self.assertEqual("blocked", unsupported["status"])

@@ -59,13 +59,14 @@ def build_bootstrap_doctor_report(project_dir: str | Path, aws_diagnostics: dict
 
     sanitized_aws = _sanitize_obj(aws_diagnostics) if aws_diagnostics is not None else None
     if _is_missing_permission_aws(sanitized_aws):
+        aws_category = sanitized_aws.get("category") if isinstance(sanitized_aws, dict) else None
         evidence.append(
             {
                 "code": "aws_missing_permission",
                 "severity": "error",
                 "source": "aws_diagnostics",
                 "message": "Injected AWS diagnostics report missing permissions.",
-                "category": str(sanitized_aws.get("category") or "missing_permission"),
+                "category": str(aws_category or "missing_permission"),
             }
         )
     elif isinstance(sanitized_aws, dict) and sanitized_aws.get("status") == "blocked":
@@ -233,9 +234,13 @@ def _classify(
     aws_diagnostics: dict[str, Any] | None,
     evidence: list[dict[str, Any]],
 ) -> str:
+    if local_status["apply"] == "output_written" and local_status["deployment"] == "valid":
+        return "applied"
+
     if _is_missing_permission_failure(failure):
-        failure_data = failure.get("data") if isinstance(failure.get("data"), dict) else {}
-        evidence_item = {
+        raw_failure_data = failure.get("data")
+        failure_data: dict[str, Any] = raw_failure_data if isinstance(raw_failure_data, dict) else {}
+        evidence_item: dict[str, Any] = {
             "code": "bootstrap_missing_permission",
             "severity": "error",
             "source": "bootstrap_failure",
@@ -261,6 +266,17 @@ def _classify(
         if local_status["deployment"] == "valid":
             return "applied"
         return "drift_error"
+    if local_status["apply"] in {"failed", "applying"}:
+        evidence.append(
+            {
+                "code": f"bootstrap_apply_{local_status['apply']}",
+                "severity": "error",
+                "source": "bootstrap_state",
+                "path": str(BOOTSTRAP_STATE_PATH),
+                "message": f"Bootstrap apply state is {local_status['apply']}; inspect state/failure artifacts before retrying.",
+            }
+        )
+        return "drift_error"
 
     if local_status["plan"] == "ready" and local_status["setup"] == "ready":
         return "planned"
@@ -270,14 +286,36 @@ def _classify(
 def _is_missing_permission_failure(failure: dict[str, Any]) -> bool:
     if failure.get("status") != "present":
         return False
-    data = failure.get("data") or {}
+    data = failure.get("data")
+    if not isinstance(data, dict):
+        return False
     return str(data.get("category") or "").lower() == "missing_permission"
 
 
 def _is_missing_permission_aws(aws_diagnostics: dict[str, Any] | None) -> bool:
     if not isinstance(aws_diagnostics, dict):
         return False
-    return str(aws_diagnostics.get("category") or "").lower() == "missing_permission"
+    if str(aws_diagnostics.get("category") or "").lower() == "missing_permission":
+        return True
+    permission_classifications = {"access_denied", "simulation_denied", "simulation_unavailable", "missing_permission", "unauthorized"}
+    for check in aws_diagnostics.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status") or "").lower()
+        if status not in {"fail", "warn"}:
+            continue
+        raw_details = check.get("details")
+        details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
+        raw_error = check.get("error")
+        error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else {}
+        classifications = {
+            str(details.get("classification") or "").lower(),
+            str(error.get("classification") or "").lower(),
+            str(error.get("type") or "").lower(),
+        }
+        if details.get("missing_permission") or classifications & permission_classifications:
+            return True
+    return False
 
 
 def _status_for(classification: str) -> str:
@@ -299,8 +337,9 @@ def _next_actions_for(
     if classification == "applied":
         return ["Proceed with downstream worker-container handoff using the validated deployment output."]
     if classification == "missing_permission":
-        hints = []
-        failure_data = failure.get("data") if isinstance(failure.get("data"), dict) else {}
+        hints: list[str] = []
+        raw_failure_data = failure.get("data")
+        failure_data: dict[str, Any] = raw_failure_data if isinstance(raw_failure_data, dict) else {}
         hints.extend(str(item) for item in failure_data.get("recovery_hints") or [] if item)
         if isinstance(aws_diagnostics, dict):
             hints.extend(str(item) for item in aws_diagnostics.get("recovery_hints") or [] if item)
@@ -308,7 +347,8 @@ def _next_actions_for(
     if classification == "drift_error":
         return ["Inspect sanitized evidence, regenerate bootstrap artifacts if needed, and retry from the last safe lifecycle step."]
     if classification == "planned":
-        data = plan.get("data") if isinstance(plan.get("data"), dict) else {}
+        raw_plan_data = plan.get("data")
+        data: dict[str, Any] = raw_plan_data if isinstance(raw_plan_data, dict) else {}
         token = data.get("confirmation_token") or data.get("apply_confirmation_token")
         action = "Review the ready bootstrap plan, then run the explicit apply command when prepared."
         if token:
@@ -336,7 +376,9 @@ def _sanitize_obj(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
             key_text = str(key).lower()
-            if any(token in key_text for token in _SECRET_KEY_TOKENS):
+            if key_text == "confirmation_token" and isinstance(child, str) and child.startswith("apply:"):
+                sanitized[key] = child
+            elif any(token in key_text for token in _SECRET_KEY_TOKENS):
                 sanitized[key] = "[REDACTED]"
             else:
                 sanitized[key] = _sanitize_obj(child)

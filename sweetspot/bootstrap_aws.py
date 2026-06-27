@@ -8,25 +8,27 @@ from typing import Any, Callable, Mapping
 try:  # pragma: no cover - exercised when botocore is installed.
     from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError, ProfileNotFound
 except (ImportError, ModuleNotFoundError):  # pragma: no cover - local fallback is covered in this environment.
-    class ClientError(Exception):
+
+    class ClientError(Exception):  # type: ignore[no-redef]
         def __init__(self, error_response: Mapping[str, Any], operation_name: str):
             super().__init__(str(error_response.get("Error", {}).get("Message", "ClientError")))
             self.response = dict(error_response)
             self.operation_name = operation_name
 
-    class NoCredentialsError(Exception):
+    class NoCredentialsError(Exception):  # type: ignore[no-redef]
         pass
 
-    class PartialCredentialsError(Exception):
+    class PartialCredentialsError(Exception):  # type: ignore[no-redef]
         def __init__(self, provider: str, cred_var: str):
             super().__init__(f"partial credentials for {provider}: {cred_var}")
             self.provider = provider
             self.cred_var = cred_var
 
-    class ProfileNotFound(Exception):
+    class ProfileNotFound(Exception):  # type: ignore[no-redef]
         def __init__(self, profile: str):
             super().__init__(f"The config profile ({profile}) could not be found")
             self.profile = profile
+
 
 AWS_DIAGNOSTICS_SCHEMA_V1 = "sweetspot.bootstrap.aws_diagnostics.v1"
 SWEETSPOT_CONFIG_PATH = ".sweetspot/sweetspot.yaml"
@@ -34,14 +36,34 @@ SWEETSPOT_CONFIG_PATH = ".sweetspot/sweetspot.yaml"
 DEFAULT_REQUIRED_ACTIONS = (
     "sts:GetCallerIdentity",
     "iam:SimulatePrincipalPolicy",
+    "iam:CreateRole",
+    "iam:CreatePolicy",
+    "iam:PutRolePolicy",
+    "iam:AttachRolePolicy",
+    "iam:CreateInstanceProfile",
+    "iam:AddRoleToInstanceProfile",
+    "iam:PassRole",
+    "ec2:DescribeVpcs",
+    "ec2:DescribeSubnets",
+    "ec2:DescribeSecurityGroups",
+    "batch:CreateComputeEnvironment",
+    "batch:CreateJobQueue",
+    "batch:RegisterJobDefinition",
     "batch:SubmitJob",
     "batch:DescribeJobs",
+    "sqs:CreateQueue",
+    "sqs:SetQueueAttributes",
+    "sqs:GetQueueAttributes",
     "sqs:ReceiveMessage",
     "sqs:DeleteMessage",
     "s3:GetObject",
     "s3:PutObject",
+    "ecr:CreateRepository",
+    "ecr:DescribeRepositories",
+    "logs:CreateLogGroup",
+    "logs:PutRetentionPolicy",
 )
-SUPPORTED_AUTH_METHODS = {"env", "profile", "sso"}
+SUPPORTED_AUTH_METHODS = {"env", "profile", "role", "sso"}
 _ACCOUNT_RE = re.compile(r"\b\d{12}\b")
 _ARN_RE = re.compile(r"\barn:aws(?:-[a-z]+)*:[^\s\"'<>]+")
 _ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
@@ -70,6 +92,11 @@ def diagnose_bootstrap_aws(
     region = _redact(intent_dict.get("region")) if intent_dict.get("region") else None
     auth_method = intent_dict.get("auth_method")
     auth_reference = intent_dict.get("auth_reference")
+    if auth_method == "sso" and isinstance(auth_reference, str) and auth_reference.startswith("AWS SSO session"):
+        auth_reference = None
+    actions = tuple(required_actions)
+    if auth_method == "role" and "sts:AssumeRole" not in actions:
+        actions = ("sts:AssumeRole", *actions)
     checks: list[dict[str, Any]] = []
     redactions: set[str] = set()
     caller_identity: dict[str, Any] | None = None
@@ -86,7 +113,7 @@ def diagnose_bootstrap_aws(
         },
         "caller_identity": None,
         "checks": checks,
-        "required_actions": tuple(required_actions),
+        "required_actions": actions,
         "redactions": [],
     }
 
@@ -111,7 +138,7 @@ def diagnose_bootstrap_aws(
         checks.append(_check("iam_simulate_principal_policy", "skipped", "info", details={"reason": "unsupported_auth"}))
         return _finalize(report, redactions)
 
-    if auth_method in {"profile", "sso"} and not auth_reference:
+    if auth_method in {"profile", "role", "sso"} and not auth_reference:
         checks.append(
             _check(
                 "auth",
@@ -123,11 +150,24 @@ def diagnose_bootstrap_aws(
         return _finalize(report, redactions)
 
     session_kwargs: dict[str, Any] = {"region_name": region}
-    if auth_method in {"profile", "sso"}:
+    if auth_method in {"profile", "sso"} and auth_reference:
         session_kwargs["profile_name"] = auth_reference
 
     try:
         session = _default_session_factory(**session_kwargs) if session_factory is None else session_factory(**session_kwargs)
+        if auth_method == "role":
+            base_sts = _client(session, "sts", region, sts_client_factory)
+            assumed = base_sts.assume_role(RoleArn=auth_reference, RoleSessionName="sweetspot-bootstrap-diagnostics")
+            credentials = assumed.get("Credentials") if isinstance(assumed, Mapping) else None
+            if not isinstance(credentials, Mapping):
+                raise RuntimeError("assume_role response did not contain credentials")
+            assumed_kwargs = {
+                "region_name": region,
+                "aws_access_key_id": credentials.get("AccessKeyId"),
+                "aws_secret_access_key": credentials.get("SecretAccessKey"),
+                "aws_session_token": credentials.get("SessionToken"),
+            }
+            session = _default_session_factory(**assumed_kwargs) if session_factory is None else session_factory(**assumed_kwargs)
         checks.append(
             _check(
                 "auth",
@@ -181,7 +221,7 @@ def diagnose_bootstrap_aws(
 
     try:
         iam = _client(session, "iam", region, iam_client_factory)
-        response = iam.simulate_principal_policy(PolicySourceArn=raw_arn, ActionNames=list(required_actions))
+        response = iam.simulate_principal_policy(PolicySourceArn=raw_arn, ActionNames=list(actions))
         evaluation = tuple(_simulation_results(response))
         denied = tuple(item for item in evaluation if item.get("decision") != "allowed")
         checks.append(
@@ -219,15 +259,19 @@ def _load_intent(project_dir: str | Path | None, intent: Any | None) -> dict[str
     if intent is None and project_dir is None:
         raise ValueError("project_dir or intent is required")
     if intent is None:
+        if project_dir is None:
+            raise ValueError("project_dir or intent is required")
         setup_path = Path(project_dir) / SWEETSPOT_CONFIG_PATH
         intent = _setup_mapping_from_yaml(setup_path)
     elif isinstance(intent, Mapping) and "aws" in intent:
         intent = _intent_from_setup_mapping(intent)
     elif not isinstance(intent, Mapping) and not hasattr(intent, "auth_method"):
         raise TypeError("intent must be a BootstrapIntent-compatible object or setup dict")
-    if is_dataclass(intent):
+    if is_dataclass(intent) and not isinstance(intent, type):
         return asdict(intent)
-    return dict(intent)
+    if isinstance(intent, Mapping):
+        return dict(intent)
+    return dict(vars(intent))
 
 
 def _default_session_factory(**kwargs: Any) -> Any:
@@ -343,7 +387,7 @@ def _intent_from_setup_mapping(setup: Mapping[str, Any]) -> dict[str, Any]:
     aws = setup.get("aws") or {}
     auth = aws.get("auth") or {}
     method = auth.get("method")
-    reference = auth.get("profile") or auth.get("role_arn")
+    reference = auth.get("profile") or auth.get("sso_profile") or auth.get("sso_session") or auth.get("role_arn")
     return {
         "schema": "sweetspot.bootstrap.intent.v1",
         "status": "ready",

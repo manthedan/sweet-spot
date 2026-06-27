@@ -34,6 +34,7 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
     def _write_ready_plan(self, project_dir: Path) -> dict:
         self._write_ready_local_bundle(project_dir)
         plan = render_bootstrap_plan(project_dir)
+        plan["confirmation_token"] = "apply:0123456789abcdef"
         self.assertEqual(plan["schema"], BOOTSTRAP_PLAN_SCHEMA_V1)
         self.assertEqual(plan["status"], "ready")
         plan_path = project_dir / ".sweetspot" / "bootstrap-plan.json"
@@ -108,8 +109,10 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
         self.assertNotIn(SECRET, json.dumps(report, sort_keys=True))
 
     def test_no_local_sweetspot_state_maps_to_not_started_without_live_dependencies(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch("subprocess.run", side_effect=AssertionError("subprocess must not run")), mock.patch(
-            "subprocess.Popen", side_effect=AssertionError("subprocess must not run")
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("subprocess.run", side_effect=AssertionError("subprocess must not run")),
+            mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess must not run")),
         ):
             report = self._classify(Path(tmpdir))
 
@@ -131,6 +134,19 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
         self.assertEqual(report["exit_code"], 0)
         self.assertTrue(any(item["code"] == "bootstrap_plan_ready" and item["path"] == ".sweetspot/bootstrap-plan.json" for item in report["evidence"]))
         self.assertTrue(any("review" in action.lower() or "apply" in action.lower() for action in report["next_actions"]))
+        self.assertIn("apply:0123456789abcdef", json.dumps(report))
+        self.assertNotIn("[REDACTED]", json.dumps(report.get("next_actions", [])))
+
+    def test_failed_apply_state_maps_to_drift_error_not_planned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            self._write_ready_plan(project_dir)
+            self._write_apply_state(project_dir, status="failed", category="apply_failed")
+            report = self._classify(project_dir)
+
+        self._assert_report_contract(report, "drift_error")
+        self.assertEqual(report["local_status"]["apply"], "failed")
+        self.assertTrue(any(item["code"] == "bootstrap_apply_failed" for item in report["evidence"]))
 
     def test_output_written_state_plus_valid_deployment_maps_to_applied(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -195,9 +211,7 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
                         "status": "failed",
                         "category": "missing_permission",
                         "message": f"AccessDenied for token {SECRET} and aws_secret_access_key=abcd",
-                        "command_summaries": [
-                            {"command": "opentofu apply", "returncode": 1, "stderr_summary": f"denied {SECRET}"}
-                        ],
+                        "command_summaries": [{"command": "opentofu apply", "returncode": 1, "stderr_summary": f"denied {SECRET}"}],
                         "recovery_hints": ["Update the AWS profile permissions."],
                     },
                     sort_keys=True,
@@ -237,12 +251,12 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
         aws_diagnostics = {
             "status": "error",
             "category": "missing_permission",
-            "checks": [
-                {"name": "sts_get_caller_identity", "status": "denied", "message": f"AccessDenied for {SECRET}"}
-            ],
+            "checks": [{"name": "sts_get_caller_identity", "status": "denied", "message": f"AccessDenied for {SECRET}"}],
         }
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(subprocess, "run", side_effect=AssertionError("live AWS checks must be opt-in/injected")), mock.patch.object(
-            subprocess, "Popen", side_effect=AssertionError("live AWS checks must be opt-in/injected")
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.object(subprocess, "run", side_effect=AssertionError("live AWS checks must be opt-in/injected")),
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("live AWS checks must be opt-in/injected")),
         ):
             project_dir = Path(tmpdir)
             self._write_ready_plan(project_dir)

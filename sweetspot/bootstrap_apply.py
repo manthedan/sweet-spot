@@ -24,6 +24,10 @@ _SECRET_VALUE_RE = re.compile(
     r"(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|aws_secret_access_key|BEGIN [A-Z ]*PRIVATE KEY|Bearer\s+[A-Za-z0-9._~+/=-]+|[A-Za-z0-9/+]{40,})",
     re.IGNORECASE,
 )
+_ACCOUNT_RE = re.compile(r"\b\d{12}\b")
+_ARN_RE = re.compile(r"\barn:aws(?:-[a-z]+)*:[^\s\"'<>]+")
+_REQUEST_ID_RE = re.compile(r"(?i)\b(?:request(?:id| id)?|x-amz-request-id|host id)[:= ]+[A-Za-z0-9/+=._:-]+")
+_PROFILE_CONTEXT_RE = re.compile(r"(?i)(?:profile|role|session)(?: name)?\s*['\"]([^'\"]+)['\"]")
 _PERMISSION_RE = re.compile(r"(access.?denied|unauthorized|forbidden|permission|not authorized)", re.IGNORECASE)
 
 CommandRunner = Callable[..., dict[str, Any]]
@@ -49,8 +53,21 @@ class BootstrapApplyError(RuntimeError):
 def bootstrap_apply_confirmation_token(plan_path: Path) -> str:
     """Return the exact human confirmation token for a reviewed bootstrap plan."""
 
-    digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    digest = hashlib.sha256(_confirmation_identity_bytes(plan_path)).hexdigest()
     return f"apply:{digest[:16]}"
+
+
+def _confirmation_identity_bytes(plan_path: Path) -> bytes:
+    data = plan_path.read_bytes()
+    try:
+        plan = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return data
+    if not isinstance(plan, dict):
+        return data
+    plan = copy.deepcopy(plan)
+    plan.pop("confirmation_token", None)
+    return json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def apply_bootstrap_plan(
@@ -59,6 +76,7 @@ def apply_bootstrap_plan(
     confirmation: str | None,
     command_runner: CommandRunner | None = None,
     timeout_seconds: int = 300,
+    tofu_executable: str = "tofu",
 ) -> dict[str, Any]:
     """Guard and apply the reviewed bootstrap plan without requiring live AWS in tests."""
 
@@ -99,8 +117,16 @@ def apply_bootstrap_plan(
     _write_bootstrap_json(project_dir / BOOTSTRAP_STATE_PATH, applying)
 
     try:
-        deployment = _run_apply_and_extract_deployment(project_dir, runner, timeout_seconds=timeout_seconds, command_summaries=command_summaries, plan=plan)
+        deployment = _run_apply_and_extract_deployment(
+            project_dir,
+            runner,
+            timeout_seconds=timeout_seconds,
+            command_summaries=command_summaries,
+            plan=plan,
+            tofu_executable=tofu_executable,
+        )
         _write_deployment_json(project_dir / DEPLOYMENT_OUTPUT_PATH, deployment)
+        _remove_bootstrap_failure(project_dir)
         output_completeness = _output_completeness(project_dir, plan, deployment_written=True, outputs=deployment.get("bootstrap_outputs"))
         outcome = _diagnostic(
             status="output_written",
@@ -187,6 +213,10 @@ def _blocking_reason(
         return "blocking_plan_finding", "Reviewed bootstrap plan contains blocking findings."
     if not output_completeness.get("required_artifacts_present", False):
         return "missing_generated_artifact", "Required generated infrastructure artifacts are missing."
+    if output_completeness.get("drifted"):
+        return "generated_artifact_drift", "Generated infrastructure artifacts changed after plan review."
+    if output_completeness.get("input_errors"):
+        return "unresolved_apply_input", "Mutable OpenTofu inputs still contain unresolved or invalid apply values."
     if confirmation.get("status") == "missing":
         return "confirmation_missing", "Exact apply confirmation token is required before AWS mutation."
     if confirmation.get("status") == "mismatched":
@@ -216,21 +246,124 @@ def _output_completeness(
 ) -> dict[str, Any]:
     required = _required_generated_paths(plan)
     missing = [path for path in required if not (project_dir / path).is_file()]
+    drifted = _artifact_digest_mismatches(project_dir, plan)
     if deployment_written is None:
         deployment_written = (project_dir / DEPLOYMENT_OUTPUT_PATH).is_file()
     output_keys = sorted(outputs) if isinstance(outputs, dict) else []
     missing_outputs = _missing_required_outputs(outputs)
-    complete = not missing and deployment_written and not missing_outputs
+    input_errors = _tfvars_input_errors(project_dir)
+    complete = not missing and not drifted and not input_errors and deployment_written and not missing_outputs
     return {
         "complete": complete,
         "required_artifacts_present": not missing,
         "deployment_output_written": bool(deployment_written),
         "required": [str(path) for path in required],
         "missing": [str(path) for path in missing],
+        "drifted": drifted,
+        "input_errors": input_errors,
         "required_outputs": _required_opentofu_outputs(),
         "present_outputs": output_keys,
         "missing_outputs": missing_outputs,
     }
+
+
+def _tfvars_immutable_mismatches(project_dir: Path, plan: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(plan, dict):
+        return []
+    tfvars_path = project_dir / ".sweetspot/infra/terraform.tfvars.json"
+    if not tfvars_path.is_file():
+        return []
+    try:
+        data = json.loads(tfvars_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw_intent = plan.get("intent")
+    intent: dict[str, Any] = raw_intent if isinstance(raw_intent, dict) else {}
+    raw_resource_names = intent.get("resource_names")
+    resource_names: dict[str, Any] = raw_resource_names if isinstance(raw_resource_names, dict) else {}
+    raw_auth = intent.get("auth")
+    auth: dict[str, Any] = raw_auth if isinstance(raw_auth, dict) else {}
+    auth_method = str(auth.get("method") or "env")
+    auth_reference = str(auth.get("reference") or "")
+    expected = {
+        "aws_region": intent.get("region"),
+        "aws_profile": auth_reference if auth_method in {"profile", "sso"} and auth_reference and not auth_reference.startswith("AWS SSO session") else "",
+        "aws_role_arn": auth_reference if auth_method == "role" else "",
+        "input_bucket": resource_names.get("input_bucket"),
+        "output_bucket": resource_names.get("output_bucket"),
+        "output_prefix": resource_names.get("output_prefix"),
+    }
+    drifted: list[dict[str, str]] = []
+    for field, expected_value in expected.items():
+        if expected_value is None:
+            continue
+        actual_value = data.get(field)
+        if actual_value != expected_value:
+            drifted.append(
+                {
+                    "path": ".sweetspot/infra/terraform.tfvars.json",
+                    "field": field,
+                    "reason": "immutable_tfvars_field_changed",
+                    "expected": str(expected_value),
+                    "actual": str(actual_value),
+                }
+            )
+    return drifted
+
+
+def _tfvars_input_errors(project_dir: Path) -> list[dict[str, str]]:
+    tfvars_path = project_dir / ".sweetspot/infra/terraform.tfvars.json"
+    if not tfvars_path.exists():
+        return []
+    try:
+        data = json.loads(tfvars_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return [{"path": ".sweetspot/infra/terraform.tfvars.json", "field": "$", "reason": sanitize_message(str(exc))}]
+    if not isinstance(data, dict):
+        return [{"path": ".sweetspot/infra/terraform.tfvars.json", "field": "$", "reason": "tfvars must be a JSON object"}]
+    digest = data.get("worker_image_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", digest):
+        return [
+            {
+                "path": ".sweetspot/infra/terraform.tfvars.json",
+                "field": "worker_image_sha256",
+                "reason": "must be replaced with a 64-character worker image sha256 digest before apply",
+            }
+        ]
+    return []
+
+
+def _artifact_digest_mismatches(project_dir: Path, plan: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(plan, dict):
+        return []
+    drifted: list[dict[str, str]] = []
+    for artifact in plan.get("generated_artifacts") or []:
+        if not isinstance(artifact, dict) or artifact.get("status") != "rendered":
+            continue
+        raw_path = artifact.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        candidate = Path(raw_path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        if not (candidate == Path(".sweetspot/deployment.template.json") or candidate.is_relative_to(_INFRA_DIR)):
+            continue
+        if candidate == Path(".sweetspot/infra/terraform.tfvars.json"):
+            drifted.extend(_tfvars_immutable_mismatches(project_dir, plan))
+            continue
+        expected = artifact.get("sha256")
+        if not isinstance(expected, str) or not expected:
+            drifted.append({"path": str(candidate), "reason": "missing_review_digest"})
+            continue
+        path = project_dir / candidate
+        if not path.is_file():
+            continue
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            drifted.append({"path": str(candidate), "reason": "sha256_mismatch", "expected_sha256": expected, "actual_sha256": actual})
+    return drifted
 
 
 def _required_generated_paths(plan: dict[str, Any] | None) -> list[Path]:
@@ -272,17 +405,25 @@ def _run_apply_and_extract_deployment(
     timeout_seconds: int,
     command_summaries: list[dict[str, Any]],
     plan: dict[str, Any] | None,
+    tofu_executable: str,
 ) -> dict[str, Any]:
     infra_dir = project_dir / _INFRA_DIR
-    apply_result = _invoke_runner(runner, ["opentofu", "apply", "-auto-approve"], cwd=infra_dir, timeout_seconds=timeout_seconds)
-    command_summaries.append(_command_summary("opentofu apply", apply_result))
+    executable = tofu_executable or "tofu"
+    init_result = _invoke_runner(runner, [executable, "init", "-backend=false", "-input=false", "-no-color"], cwd=infra_dir, timeout_seconds=timeout_seconds)
+    command_summaries.append(_command_summary(f"{executable} init -backend=false", init_result))
+    if int(init_result.get("returncode", 1)) != 0:
+        message = _join_command_message(init_result)
+        raise BootstrapApplyError("init_failed", f"OpenTofu init failed: {sanitize_message(message)}", command_summaries=command_summaries)
+
+    apply_result = _invoke_runner(runner, [executable, "apply", "-auto-approve"], cwd=infra_dir, timeout_seconds=timeout_seconds)
+    command_summaries.append(_command_summary(f"{executable} apply", apply_result))
     if int(apply_result.get("returncode", 1)) != 0:
         message = _join_command_message(apply_result)
         category = "missing_permission" if _PERMISSION_RE.search(message) else "apply_failed"
         raise BootstrapApplyError(category, f"OpenTofu apply failed: {sanitize_message(message)}", command_summaries=command_summaries)
 
-    output_result = _invoke_runner(runner, ["opentofu", "output", "-json"], cwd=infra_dir, timeout_seconds=timeout_seconds)
-    command_summaries.append(_command_summary("opentofu output -json", output_result))
+    output_result = _invoke_runner(runner, [executable, "output", "-json"], cwd=infra_dir, timeout_seconds=timeout_seconds)
+    command_summaries.append(_command_summary(f"{executable} output -json", output_result))
     if int(output_result.get("returncode", 1)) != 0:
         message = _join_command_message(output_result)
         raise BootstrapApplyError("output_extraction_failed", f"OpenTofu output extraction failed: {sanitize_message(message)}", command_summaries=command_summaries)
@@ -477,6 +618,9 @@ def _recovery_hints(category: str) -> list[str]:
         "reviewed_plan_not_ready": ["Resolve plan findings until the bootstrap plan status is ready."],
         "blocking_plan_finding": ["Resolve blocking findings in the reviewed bootstrap plan before applying."],
         "missing_generated_artifact": ["Regenerate missing .sweetspot infrastructure artifacts before applying."],
+        "generated_artifact_drift": ["Regenerate and rereview the bootstrap plan after any immutable .sweetspot/infra or deployment template changes, then use the new confirmation token."],
+        "unresolved_apply_input": ["Replace .sweetspot/infra/terraform.tfvars.json worker_image_sha256 with the reviewed 64-character image digest before applying."],
+        "init_failed": ["Run `tofu init -backend=false` from .sweetspot/infra and fix initialization errors before retrying guarded apply."],
         "confirmation_missing": ["Pass the exact apply:<plan-hash> confirmation token shown in the reviewed plan diagnostics."],
         "confirmation_mismatched": ["Re-read the reviewed plan and use its current exact confirmation token."],
         "missing_permission": ["Verify AWS/OpenTofu credentials and IAM permissions, then retry with a freshly reviewed plan."],
@@ -507,6 +651,13 @@ def _write_deployment_json(path: Path, deployment: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _remove_bootstrap_failure(project_dir: Path) -> None:
+    try:
+        (project_dir / BOOTSTRAP_FAILURE_PATH).unlink()
+    except FileNotFoundError:
+        return
+
+
 def summarize_text(value: Any, *, limit: int = 500) -> str:
     text = sanitize_message(str(value or ""))
     text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
@@ -516,7 +667,11 @@ def summarize_text(value: Any, *, limit: int = 500) -> str:
 
 
 def sanitize_message(value: str) -> str:
-    return _SECRET_VALUE_RE.sub("[REDACTED]", value)
+    redacted = _REQUEST_ID_RE.sub("[REDACTED_AWS_REQUEST]", value)
+    redacted = _ARN_RE.sub("[REDACTED_ARN]", redacted)
+    redacted = _ACCOUNT_RE.sub("[REDACTED_ACCOUNT_ID]", redacted)
+    redacted = _PROFILE_CONTEXT_RE.sub(lambda match: match.group(0).replace(match.group(1), "[REDACTED_AUTH_REFERENCE]"), redacted)
+    return _SECRET_VALUE_RE.sub("[REDACTED]", redacted)
 
 
 def _sanitize_obj(value: Any) -> Any:

@@ -4659,7 +4659,7 @@ def cmd_doctor_bootstrap(args: argparse.Namespace) -> int:
         if _bootstrap_doctor_allows_live_aws(report):
             from .bootstrap_aws import diagnose_bootstrap_aws
 
-            aws_diagnostics = diagnose_bootstrap_aws(project_dir=args.project_dir)
+            aws_diagnostics = diagnose_bootstrap_aws(project_dir=_bootstrap_plan_project_root(args.project_dir))
         else:
             aws_diagnostics = _skipped_bootstrap_aws_diagnostics(report)
         report = classify_bootstrap_lifecycle(args.project_dir, aws_diagnostics=aws_diagnostics)
@@ -4691,6 +4691,9 @@ def _bootstrap_plan_artifact_path(project_root: Path, out: Path | None) -> Path:
         resolved.relative_to(sweetspot_dir)
     except ValueError as exc:
         raise ValueError("bootstrap plan artifacts must be written under .sweetspot/") from exc
+    expected = (project_root / BOOTSTRAP_PLAN_PATH).resolve()
+    if resolved != expected:
+        raise ValueError(f"bootstrap plan artifact path must be {BOOTSTRAP_PLAN_PATH.as_posix()}")
     return resolved
 
 
@@ -4722,6 +4725,15 @@ def _write_bootstrap_plan_report(path: Path, report: dict[str, Any]) -> None:
         fh.write("\n")
 
 
+def _refresh_bootstrap_confirmation_token(report: dict[str, Any]) -> None:
+    import hashlib as _hashlib
+
+    identity = dict(report)
+    identity.pop("confirmation_token", None)
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    report["confirmation_token"] = f"apply:{_hashlib.sha256(payload).hexdigest()[:16]}"
+
+
 def cmd_bootstrap_plan(args: argparse.Namespace) -> int:
     project_root = _bootstrap_plan_project_root(args.project_dir)
     try:
@@ -4743,6 +4755,8 @@ def cmd_bootstrap_plan(args: argparse.Namespace) -> int:
         except ValueError:
             report["artifact_path"] = str(artifact_path)
         report["ok"] = report.get("status") == "ready" and report.get("opentofu", {}).get("status") in {"not_requested", "validation_passed"}
+        if report.get("status") == "ready":
+            _refresh_bootstrap_confirmation_token(report)
         _write_bootstrap_plan_report(artifact_path, report)
     except OSError as exc:
         report = _bootstrap_plan_error_report(f"failed to write bootstrap plan artifact: {exc}", code="bootstrap_plan_artifact_write_failed")
@@ -4794,7 +4808,12 @@ def cmd_bootstrap_apply(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 2
 
-    outcome = apply_bootstrap_plan(project_root, confirmation=args.confirm, timeout_seconds=args.apply_timeout_seconds)
+    outcome = apply_bootstrap_plan(
+        project_root,
+        confirmation=args.confirm,
+        timeout_seconds=args.apply_timeout_seconds,
+        tofu_executable=args.tofu_executable,
+    )
     report = {**outcome, "ok": outcome.get("status") == "output_written"}
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ok"] else 1
@@ -5377,33 +5396,34 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap.add_argument("--check-aws", "--aws-diagnostics", action="store_true", dest="check_aws", help="Opt in to read-only AWS bootstrap diagnostics after local bootstrap status is ready")
         bootstrap.set_defaults(func=cmd_doctor_bootstrap)
 
-        boot = _add_parser_with_examples(
-            sub,
-            "bootstrap",
-            help="Render reviewable bootstrap infrastructure plans and guarded apply diagnostics",
-            examples=(
-                "  sweetspot bootstrap plan --project-dir .sweetspot --format json\n"
-                "  sweetspot bootstrap plan --project-dir . --out .sweetspot/bootstrap-plan.json\n"
-                "  sweetspot bootstrap apply --project-dir . --confirm apply:<plan-hash> --format json"
-            ),
-        )
-        boot_sub = boot.add_subparsers(dest="bootstrap_cmd", required=True)
-        boot_plan = boot_sub.add_parser("plan", help="Render and save a local OpenTofu-backed bootstrap plan report")
-        boot_plan.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
-        boot_plan.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported")
-        boot_plan.add_argument("--out", type=Path, help="Plan artifact path; must resolve under the project .sweetspot directory")
-        boot_plan.add_argument("--validate", action="store_true", help="Run local `tofu version` and `tofu validate` after rendering review files")
-        boot_plan.add_argument("--tofu-executable", default="tofu", help="OpenTofu executable used only with --validate")
-        boot_plan.add_argument("--validation-timeout-seconds", type=int, default=30, help="Timeout for each local OpenTofu validation command")
-        boot_plan.set_defaults(func=cmd_bootstrap_plan)
-        boot_apply = boot_sub.add_parser("apply", help="Apply a reviewed bootstrap plan only after exact confirmation")
-        boot_apply.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
-        boot_apply.add_argument("--plan", type=Path, help="Reviewed plan artifact path; must be .sweetspot/bootstrap-plan.json")
-        boot_apply.add_argument("--output", type=Path, help="Deployment output path; must be .sweetspot/deployment.json")
-        boot_apply.add_argument("--confirm", help="Exact apply:<plan-hash> confirmation token from the reviewed plan artifact")
-        boot_apply.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported")
-        boot_apply.add_argument("--apply-timeout-seconds", type=int, default=300, help="Timeout for each OpenTofu apply/output command")
-        boot_apply.set_defaults(func=cmd_bootstrap_apply)
+    boot = _add_parser_with_examples(
+        sub,
+        "bootstrap",
+        help="Render reviewable bootstrap infrastructure plans and guarded apply diagnostics",
+        examples=(
+            "  sweetspot bootstrap plan --project-dir .sweetspot --format json\n"
+            "  sweetspot bootstrap plan --project-dir . --out .sweetspot/bootstrap-plan.json\n"
+            "  sweetspot bootstrap apply --project-dir . --confirm apply:<plan-hash> --format json"
+        ),
+    )
+    boot_sub = boot.add_subparsers(dest="bootstrap_cmd", required=True)
+    boot_plan = boot_sub.add_parser("plan", help="Render and save a local OpenTofu-backed bootstrap plan report")
+    boot_plan.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
+    boot_plan.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported")
+    boot_plan.add_argument("--out", type=Path, help="Plan artifact path; must resolve under the project .sweetspot directory")
+    boot_plan.add_argument("--validate", action="store_true", help="Run local `tofu version` and `tofu validate` after rendering review files")
+    boot_plan.add_argument("--tofu-executable", default="tofu", help="OpenTofu executable used only with --validate")
+    boot_plan.add_argument("--validation-timeout-seconds", type=int, default=30, help="Timeout for each local OpenTofu validation command")
+    boot_plan.set_defaults(func=cmd_bootstrap_plan)
+    boot_apply = boot_sub.add_parser("apply", help="Apply a reviewed bootstrap plan only after exact confirmation")
+    boot_apply.add_argument("--project-dir", type=Path, default=Path(".sweetspot"), help="Generated .sweetspot directory or containing project root")
+    boot_apply.add_argument("--plan", type=Path, help="Reviewed plan artifact path; must be .sweetspot/bootstrap-plan.json")
+    boot_apply.add_argument("--output", type=Path, help="Deployment output path; must be .sweetspot/deployment.json")
+    boot_apply.add_argument("--confirm", help="Exact apply:<plan-hash> confirmation token from the reviewed plan artifact")
+    boot_apply.add_argument("--format", choices=["json"], default="json", help="Output format; only json is supported")
+    boot_apply.add_argument("--apply-timeout-seconds", type=int, default=300, help="Timeout for each OpenTofu apply/output command")
+    boot_apply.add_argument("--tofu-executable", default="tofu", help="OpenTofu executable used for guarded apply/output commands")
+    boot_apply.set_defaults(func=cmd_bootstrap_apply)
 
     p = _add_parser_with_examples(
         sub,

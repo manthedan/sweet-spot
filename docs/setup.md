@@ -157,7 +157,7 @@ Run bootstrap plan when you want a versioned, machine-readable OpenTofu-backed r
 sweetspot bootstrap plan --project-dir .sweetspot --format json
 ```
 
-The command accepts either the generated `.sweetspot/` directory or the containing project root. By default it writes `.sweetspot/bootstrap-plan.json` and returns the same JSON report on stdout. Custom `--out` paths must stay under `.sweetspot/` so review artifacts remain contained with the local SweetSpot bundle.
+The command accepts either the generated `.sweetspot/` directory or the containing project root. It writes `.sweetspot/bootstrap-plan.json` and returns the same JSON report on stdout; guarded apply consumes that exact path, so alternate `--out` paths are rejected for this lifecycle.
 
 `bootstrap plan` is a review-before-apply surface. It renders deterministic OpenTofu configuration files and a deployment-output template, but it does not run `tofu apply`, create AWS resources, create Terraform/OpenTofu state, build or push images, write deployment outputs, contact AWS, or store secrets. Treat the generated files as the exact infrastructure intent to review before the S04 guarded-apply work, not as provisioned infrastructure.
 

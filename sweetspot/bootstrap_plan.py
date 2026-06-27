@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -70,15 +71,15 @@ def render_opentofu_bootstrap_plan(
     tofu_executable: str = "tofu",
     timeout_seconds: int = 30,
 ) -> dict[str, Any]:
-    '''Render deterministic OpenTofu bootstrap review files and optional validation status.'''
+    """Render deterministic OpenTofu bootstrap review files and optional validation status."""
 
     root = Path(project_dir)
     plan = render_bootstrap_plan(root)
     if plan["status"] == "ready":
         files = _opentofu_files(plan)
-        _write_generated_files(root, files)
         if plan.get("expected_deployment") is not None:
-            _write_json(root / ".sweetspot" / "deployment.template.json", plan["expected_deployment"])
+            files[".sweetspot/deployment.template.json"] = _json_text(plan["expected_deployment"])
+        _write_generated_files(root, files)
         plan["generated_artifacts"] = _rendered_artifacts(plan["generated_artifacts"], files)
         plan["next_actions"] = [
             "Review .sweetspot/infra/ and .sweetspot/bootstrap-plan.json before running any infrastructure command.",
@@ -107,6 +108,7 @@ def render_opentofu_bootstrap_plan(
             }
         )
     if plan["status"] == "ready":
+        plan["confirmation_token"] = _confirmation_token_for_plan(plan)
         _write_json(root / ".sweetspot" / "bootstrap-plan.json", plan)
     return _redact_secrets(plan)
 
@@ -118,37 +120,62 @@ def _write_generated_files(root: Path, files: dict[str, str]) -> None:
         path.write_text(content, encoding="utf-8")
 
 
+def _json_text(value: Any) -> str:
+    return json.dumps(_redact_secrets(value), indent=2, sort_keys=True) + "\n"
+
+
+def _confirmation_token_for_plan(plan: dict[str, Any]) -> str:
+    identity = dict(plan)
+    identity.pop("confirmation_token", None)
+    payload = json.dumps(_redact_secrets(identity), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return f"apply:{digest[:16]}"
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_redact_secrets(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(_json_text(value), encoding="utf-8")
 
 
 def _rendered_artifacts(artifacts: list[dict[str, str]], files: dict[str, str]) -> list[dict[str, str]]:
-    rendered_paths = set(files) | {".sweetspot/bootstrap-plan.json", ".sweetspot/deployment.template.json"}
+    rendered_paths = set(files) | {".sweetspot/bootstrap-plan.json"}
     existing = {artifact["path"] for artifact in artifacts}
     out: list[dict[str, str]] = []
     for artifact in artifacts:
         updated = dict(artifact)
-        if updated.get("path") in rendered_paths:
+        relpath = updated.get("path")
+        if relpath in rendered_paths:
             updated["status"] = "rendered"
+            if relpath in files:
+                updated["sha256"] = hashlib.sha256(files[relpath].encode("utf-8")).hexdigest()
         out.append(updated)
     for relpath in sorted(rendered_paths - existing):
-        out.append({"name": relpath.replace(".sweetspot/", "").replace("/", "_").replace(".", "_"), "path": relpath, "status": "rendered"})
+        item = {"name": relpath.replace(".sweetspot/", "").replace("/", "_").replace(".", "_"), "path": relpath, "status": "rendered"}
+        if relpath in files:
+            item["sha256"] = hashlib.sha256(files[relpath].encode("utf-8")).hexdigest()
+        out.append(item)
     return out
 
 
 def _opentofu_files(plan: dict[str, Any]) -> dict[str, str]:
     names = _inventory_by_logical_name(plan.get("resource_inventory", []))
+    resource_names = plan.get("intent", {}).get("resource_names") if isinstance(plan.get("intent"), dict) else None
+    resource_names = resource_names if isinstance(resource_names, dict) else {}
+    auth = plan["intent"].get("auth") if isinstance(plan["intent"].get("auth"), dict) else {}
+    auth_method = str(auth.get("method") or "env")
+    auth_reference = str(auth.get("reference") or "")
     tfvars = {
         "aws_account_id": "000000000000",
         "aws_region": plan["intent"].get("region") or "us-east-1",
+        "aws_profile": auth_reference if auth_method in {"profile", "sso"} and auth_reference and not auth_reference.startswith("AWS SSO session") else "",
+        "aws_role_arn": auth_reference if auth_method == "role" else "",
         "input_bucket": names.get("input_bucket", {}).get("name", "replace-me-input-bucket"),
         "output_bucket": names.get("output_bucket", {}).get("name", "replace-me-output-bucket"),
-        "output_prefix": names.get("output_bucket", {}).get("output_prefix", "runs/"),
+        "output_prefix": resource_names.get("output_prefix") or "runs/",
         "worker_image_sha256": "replace-with-worker-image-digest",
     }
     return {
-        ".sweetspot/infra/versions.tf": _versions_tf(),
+        ".sweetspot/infra/versions.tf": _versions_tf(auth_method),
         ".sweetspot/infra/variables.tf": _variables_tf(),
         ".sweetspot/infra/main.tf": _main_tf(names),
         ".sweetspot/infra/outputs.tf": _outputs_tf(),
@@ -170,26 +197,31 @@ def _inventory_by_logical_name(inventory: Any) -> dict[str, dict[str, str]]:
     return out
 
 
-def _versions_tf() -> str:
-    return '''terraform {
+def _versions_tf(auth_method: str = "env") -> str:
+    provider_lines = ['provider "aws" {', "  region = var.aws_region"]
+    if auth_method in {"profile", "sso"}:
+        provider_lines.append('  profile = var.aws_profile != "" ? var.aws_profile : null')
+    if auth_method == "role":
+        provider_lines.extend(["  assume_role {", "    role_arn = var.aws_role_arn", "  }"])
+    provider_lines.append("}")
+    provider = "\n".join(provider_lines)
+    return f"""terraform {{
   required_version = ">= 1.6.0"
 
-  required_providers {
-    aws = {
+  required_providers {{
+    aws = {{
       source  = "hashicorp/aws"
       version = ">= 5.0"
-    }
-  }
-}
+    }}
+  }}
+}}
 
-provider "aws" {
-  region = var.aws_region
-}
-'''
+{provider}
+"""
 
 
 def _variables_tf() -> str:
-    return '''variable "aws_account_id" {
+    return """variable "aws_account_id" {
   description = "AWS account id used for ARN construction in reviewable outputs."
   type        = string
 }
@@ -197,6 +229,18 @@ def _variables_tf() -> str:
 variable "aws_region" {
   description = "AWS region where bootstrap resources will be created."
   type        = string
+}
+
+variable "aws_profile" {
+  description = "Optional AWS shared config profile reviewed for bootstrap apply."
+  type        = string
+  default     = ""
+}
+
+variable "aws_role_arn" {
+  description = "Optional AWS role ARN reviewed for bootstrap apply."
+  type        = string
+  default     = ""
 }
 
 variable "input_bucket" {
@@ -218,19 +262,55 @@ variable "worker_image_sha256" {
   description = "Digest for the worker image that will be submitted to AWS Batch."
   type        = string
 }
-'''
+"""
 
 
 def _main_tf(names: dict[str, dict[str, str]]) -> str:
     def name(logical: str, fallback: str) -> str:
         return names.get(logical, {}).get("name", fallback)
 
-    return f'''data "aws_iam_policy_document" "batch_assume_role" {{
+    return f"""data "aws_vpc" "default" {{
+  default = true
+}}
+
+data "aws_subnets" "default" {{
+  filter {{
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }}
+}}
+
+data "aws_security_group" "default" {{
+  name   = "default"
+  vpc_id = data.aws_vpc.default.id
+}}
+
+data "aws_iam_policy_document" "batch_assume_role" {{
   statement {{
     actions = ["sts:AssumeRole"]
     principals {{
       type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com", "batch.amazonaws.com"]
+      identifiers = ["batch.amazonaws.com"]
+    }}
+  }}
+}}
+
+data "aws_iam_policy_document" "task_assume_role" {{
+  statement {{
+    actions = ["sts:AssumeRole"]
+    principals {{
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }}
+  }}
+}}
+
+data "aws_iam_policy_document" "ec2_assume_role" {{
+  statement {{
+    actions = ["sts:AssumeRole"]
+    principals {{
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
     }}
   }}
 }}
@@ -240,9 +320,34 @@ resource "aws_iam_role" "operator_role" {{
   assume_role_policy = data.aws_iam_policy_document.batch_assume_role.json
 }}
 
+resource "aws_iam_role" "batch_service_role" {{
+  name               = "{name('compute_environment', 'sweetspot-compute')}-batch-service-role"
+  assume_role_policy = data.aws_iam_policy_document.batch_assume_role.json
+}}
+
+resource "aws_iam_role_policy_attachment" "batch_service_role" {{
+  role       = aws_iam_role.batch_service_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
+}}
+
 resource "aws_iam_role" "worker_task_role" {{
   name               = "{name('worker_task_role', 'sweetspot-worker-task-role')}"
-  assume_role_policy = data.aws_iam_policy_document.batch_assume_role.json
+  assume_role_policy = data.aws_iam_policy_document.task_assume_role.json
+}}
+
+resource "aws_iam_role" "ecs_instance_role" {{
+  name               = "{name('compute_environment', 'sweetspot-compute')}-ecs-instance-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}}
+
+resource "aws_iam_role_policy_attachment" "ecs_instance_role" {{
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}}
+
+resource "aws_iam_instance_profile" "ecs_instance_profile" {{
+  name = "{name('compute_environment', 'sweetspot-compute')}-ecs-instance-profile"
+  role = aws_iam_role.ecs_instance_role.name
 }}
 
 resource "aws_iam_role_policy" "worker_task_policy" {{
@@ -264,14 +369,17 @@ resource "aws_batch_compute_environment" "compute_environment" {{
   type                     = "MANAGED"
   state                    = "ENABLED"
   compute_resources {{
-    type               = "SPOT"
-    min_vcpus          = 0
-    max_vcpus          = 16
-    instance_role      = aws_iam_role.operator_role.arn
-    subnets            = []
-    security_group_ids = []
+    type                = "EC2"
+    allocation_strategy = "BEST_FIT_PROGRESSIVE"
+    min_vcpus           = 0
+    max_vcpus           = 16
+    instance_role       = aws_iam_instance_profile.ecs_instance_profile.arn
+    instance_type       = ["optimal"]
+    subnets             = data.aws_subnets.default.ids
+    security_group_ids  = [data.aws_security_group.default.id]
   }}
-  service_role = aws_iam_role.operator_role.arn
+  service_role = aws_iam_role.batch_service_role.arn
+  depends_on   = [aws_iam_role_policy_attachment.batch_service_role, aws_iam_role_policy_attachment.ecs_instance_role]
 }}
 
 resource "aws_batch_job_queue" "job_queue" {{
@@ -308,11 +416,11 @@ resource "aws_cloudwatch_log_group" "worker_log_group" {{
   name              = "{name('worker_log_group', '/aws/batch/sweetspot')}"
   retention_in_days = 14
 }}
-'''
+"""
 
 
 def _outputs_tf() -> str:
-    return '''output "batch_compute_environment" { value = aws_batch_compute_environment.compute_environment.name }
+    return """output "batch_compute_environment" { value = aws_batch_compute_environment.compute_environment.name }
 output "batch_job_queue" { value = aws_batch_job_queue.job_queue.name }
 output "batch_job_definition" { value = aws_batch_job_definition.job_definition.name }
 output "dlq_url" { value = aws_sqs_queue.dead_letter_queue.url }
@@ -322,7 +430,7 @@ output "operator_role_arn" { value = aws_iam_role.operator_role.arn }
 output "sqs_queue_url" { value = aws_sqs_queue.queue.url }
 output "worker_image_digest" { value = "${aws_ecr_repository.worker_repository.repository_url}@sha256:${var.worker_image_sha256}" }
 output "worker_task_role_arn" { value = aws_iam_role.worker_task_role.arn }
-'''
+"""
 
 
 def _default_command_runner(command: list[str], *, cwd: Path, timeout_seconds: int = 30) -> dict[str, Any]:
@@ -334,18 +442,30 @@ def _run_opentofu_validation(plan: dict[str, Any], cwd: Path, runner: Callable[.
     version = _attempt_command(plan, runner, [executable, "version"], cwd, timeout_seconds, unavailable_status="tofu_unavailable")
     if version is None:
         plan["opentofu"]["status"] = "tofu_unavailable"
-        plan["findings"].append({"code": "tofu_unavailable", "severity": "warning", "field_path": "$.opentofu.executable", "message": "OpenTofu executable was not available; review artifacts were rendered but local validation was skipped."})
+        plan["findings"].append(
+            {"code": "tofu_unavailable", "severity": "warning", "field_path": "$.opentofu.executable", "message": "OpenTofu executable was not available; review artifacts were rendered but local validation was skipped."}
+        )
         plan["next_actions"].append("Install OpenTofu or provide a command runner, then rerun validation from .sweetspot/infra.")
         return
     plan["opentofu"]["executable"] = version.get("executable") or executable
     plan["opentofu"]["version"] = _first_line(version.get("stdout"))
+    init = _attempt_command(plan, runner, [executable, "init", "-backend=false", "-input=false", "-no-color"], cwd, timeout_seconds, unavailable_status="validation_failed")
+    if init is None or int(init.get("returncode", 1)) != 0:
+        plan["opentofu"]["status"] = "validation_failed"
+        plan["findings"].append(
+            {"code": "opentofu_init_failed", "severity": "error", "field_path": "$.opentofu.status", "message": "OpenTofu init -backend=false returned a nonzero status; inspect command_attempts and stderr_summary."}
+        )
+        plan["next_actions"].append("Fix the rendered OpenTofu init findings before validation or apply.")
+        return
     validation = _attempt_command(plan, runner, [executable, "validate", "-no-color"], cwd, timeout_seconds, unavailable_status="validation_failed")
     if validation is not None and int(validation.get("returncode", 1)) == 0:
         plan["opentofu"]["status"] = "validation_passed"
         plan["next_actions"].append("OpenTofu validate passed locally; apply remains a manual, out-of-band action.")
     else:
         plan["opentofu"]["status"] = "validation_failed"
-        plan["findings"].append({"code": "opentofu_validation_failed", "severity": "error", "field_path": "$.opentofu.status", "message": "OpenTofu validation returned a nonzero status; inspect command_attempts and stderr_summary."})
+        plan["findings"].append(
+            {"code": "opentofu_validation_failed", "severity": "error", "field_path": "$.opentofu.status", "message": "OpenTofu validation returned a nonzero status; inspect command_attempts and stderr_summary."}
+        )
         plan["next_actions"].append("Fix the rendered OpenTofu validation findings before any manual apply.")
 
 
@@ -366,7 +486,14 @@ def _attempt_command(plan: dict[str, Any], runner: Callable[..., Any], command: 
         plan["stderr_summary"].append(attempt["stderr_summary"])
         return {"returncode": 124, "stdout": "", "stderr": str(exc), "executable": command[0]}
     exit_code = int(result.get("returncode", 1))
-    attempt.update({"status": "passed" if exit_code == 0 else "failed", "exit_code": exit_code, "stdout_summary": _sanitize_output(str(result.get("stdout") or "")), "stderr_summary": _sanitize_output(str(result.get("stderr") or ""))})
+    attempt.update(
+        {
+            "status": "passed" if exit_code == 0 else "failed",
+            "exit_code": exit_code,
+            "stdout_summary": _sanitize_output(str(result.get("stdout") or "")),
+            "stderr_summary": _sanitize_output(str(result.get("stderr") or "")),
+        }
+    )
     plan["command_attempts"].append(attempt)
     if attempt["stderr_summary"]:
         plan["stderr_summary"].append(attempt["stderr_summary"])
@@ -511,10 +638,7 @@ def _resource_inventory(intent: BootstrapIntent, names: dict[str, str]) -> list[
         },
         {
             "group": "outputs",
-            "resources": [
-                {"type": "output", "name": key, "value": value}
-                for key, value in sorted(_deployment_outputs(names).items())
-            ],
+            "resources": [{"type": "output", "name": key, "value": value} for key, value in sorted(_deployment_outputs(names).items())],
         },
     ]
 
@@ -563,14 +687,14 @@ def _deployment_outputs(names: dict[str, str]) -> dict[str, str]:
 
 def _derived_names(intent: BootstrapIntent) -> dict[str, str]:
     resource_names = intent.resource_names
-    project_slug = _slug(intent.project_name or (resource_names.project_slug if resource_names else "sweetspot"))
+    project_slug = resource_names.project_slug if resource_names and resource_names.project_slug else _slug(intent.project_name or "sweetspot")
     architecture = "x86_64"
     input_bucket = "${var.input_bucket}"
     output_bucket = "${var.output_bucket}"
     output_prefix = "${var.output_prefix}"
     job_definition = f"{project_slug}-worker-job"
     job_queue = f"{project_slug}-worker-queue"
-    container_image = f"${{aws_ecr_repository.worker_repository.repository_url}}@sha256:${{var.worker_image_sha256}}"
+    container_image = "${aws_ecr_repository.worker_repository.repository_url}@sha256:${var.worker_image_sha256}"
     if resource_names is not None:
         architecture = _architecture_from_name(resource_names.job_definition) or _architecture_from_name(resource_names.job_queue) or architecture
         input_bucket = resource_names.input_bucket or input_bucket
@@ -626,7 +750,18 @@ def _next_actions(intent: BootstrapIntent, findings: list[dict[str, str]]) -> li
 
 def _redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(key): ("[redacted]" if _SECRET_KEY_RE.search(str(key)) else _redact_secrets(item)) for key, item in value.items()}
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text == "sha256" and isinstance(item, str) and re.fullmatch(r"[A-Fa-f0-9]{64}", item):
+                redacted[key_text] = item
+            elif key_text == "confirmation_token" and isinstance(item, str) and re.fullmatch(r"apply:[0-9a-f]{16}", item):
+                redacted[key_text] = item
+            elif _SECRET_KEY_RE.search(key_text):
+                redacted[key_text] = "[redacted]"
+            else:
+                redacted[key_text] = _redact_secrets(item)
+        return redacted
     if isinstance(value, list):
         return [_redact_secrets(item) for item in value]
     if isinstance(value, tuple):

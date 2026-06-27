@@ -272,14 +272,14 @@ class ProjectDoctorCliTests(unittest.TestCase):
 
             out = io.StringIO()
             with patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", return_value=diagnostics) as diagnose, contextlib.redirect_stdout(out):
-                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--check-aws"]), 0)
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--check-aws"]), 2)
 
         diagnose.assert_called_once_with(project_dir=project_root)
         report = json.loads(out.getvalue())
         self.assertEqual(report["schema"], "sweetspot.bootstrap.doctor.v1")
-        self.assertEqual(report["classification"], "not_started")
-        self.assertEqual(report["status"], "action_required")
-        self.assertEqual(report["exit_code"], 0)
+        self.assertEqual(report["classification"], "missing_permission")
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["exit_code"], 2)
         self.assertEqual(report["local_status"]["setup"], "ready")
         self.assertEqual(report["aws_diagnostics"]["schema"], "sweetspot.bootstrap.aws_diagnostics.v1")
         self.assertEqual(report["aws_diagnostics"]["status"], "warning")
@@ -291,6 +291,29 @@ class ProjectDoctorCliTests(unittest.TestCase):
         for raw in (raw_account, raw_arn, raw_profile, raw_error, "AdminSecretRole", "req-123"):
             self.assertNotIn(raw, rendered)
         self.assertIn("[REDACTED_AWS_ERROR]", rendered)
+
+    def test_doctor_bootstrap_check_aws_normalizes_generated_sweetspot_project_dir(self) -> None:
+        diagnostics = {
+            "schema": "sweetspot.bootstrap.aws_diagnostics.v1",
+            "ok": True,
+            "status": "ready",
+            "region": "us-west-2",
+            "auth": {"method": "profile", "reference": "[REDACTED_AUTH_REFERENCE]"},
+            "caller_identity": None,
+            "checks": [{"name": "sts_get_caller_identity", "status": "pass", "severity": "info", "details": {"classification": "identity_available"}}],
+            "redactions": ["profile_or_role_name"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", "examples/setup.example.yaml", "--project-dir", str(project_root)]), 0)
+
+            out = io.StringIO()
+            with patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", return_value=diagnostics) as diagnose, contextlib.redirect_stdout(out):
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root / ".sweetspot"), "--format", "json", "--check-aws"]), 0)
+
+        diagnose.assert_called_once_with(project_dir=project_root)
+        self.assertEqual("ready", json.loads(out.getvalue())["aws_diagnostics"]["status"])
 
     def test_doctor_bootstrap_aws_diagnostics_alias_maps_to_same_behavior(self) -> None:
         diagnostics = {
@@ -418,10 +441,13 @@ class ProjectDoctorCliTests(unittest.TestCase):
             report = json.loads(out.getvalue())
             artifact = project_root / ".sweetspot" / "bootstrap-plan.json"
             saved = json.loads(artifact.read_text(encoding="utf-8"))
+            from sweetspot.bootstrap_apply import bootstrap_apply_confirmation_token
+
             self.assertEqual(report["schema"], "sweetspot.bootstrap.plan.v1")
             self.assertTrue(report["ok"])
             self.assertEqual(report["status"], "ready")
             self.assertEqual(report["artifact_path"], ".sweetspot/bootstrap-plan.json")
+            self.assertEqual(report["confirmation_token"], bootstrap_apply_confirmation_token(artifact))
             self.assertEqual(saved, report)
             self.assertNotIn("aws_diagnostics", report)
             self.assertTrue((project_root / ".sweetspot" / "infra" / "main.tf").exists())
@@ -519,11 +545,45 @@ class ProjectDoctorCliTests(unittest.TestCase):
                     0,
                 )
 
-        apply_mock.assert_called_once()
+        apply_mock.assert_called_once_with(project_root, confirmation="apply:abc123", timeout_seconds=300, tofu_executable="tofu")
         report = json.loads(out.getvalue())
         self.assertTrue(report["ok"])
         self.assertEqual(report["status"], "output_written")
         self.assertEqual(report["category"], "applied")
+
+    def test_bootstrap_apply_forwards_custom_tofu_executable(self) -> None:
+        outcome = {
+            "schema": "sweetspot.bootstrap.apply.v1",
+            "status": "blocked",
+            "category": "confirmation_missing",
+            "message": "Exact apply confirmation token is required before AWS mutation.",
+            "recovery_hints": [],
+            "reviewed_plan": {"status": "ready"},
+            "confirmation": {"status": "missing"},
+            "output_completeness": {"complete": False},
+            "command_summaries": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            out = io.StringIO()
+            with patch("sweetspot.cli.apply_bootstrap_plan", return_value=outcome) as apply_mock, contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    main(
+                        [
+                            "bootstrap",
+                            "apply",
+                            "--project-dir",
+                            str(project_root / ".sweetspot"),
+                            "--tofu-executable",
+                            "/opt/bin/tofu",
+                            "--format",
+                            "json",
+                        ]
+                    ),
+                    1,
+                )
+
+        apply_mock.assert_called_once_with(project_root, confirmation=None, timeout_seconds=300, tofu_executable="/opt/bin/tofu")
 
     def test_bootstrap_apply_rejects_output_path_outside_sweetspot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,18 +591,20 @@ class ProjectDoctorCliTests(unittest.TestCase):
             out = io.StringIO()
             with patch("sweetspot.cli.apply_bootstrap_plan", side_effect=AssertionError("invalid output path must not invoke apply")), contextlib.redirect_stdout(out):
                 self.assertEqual(
-                    main([
-                        "bootstrap",
-                        "apply",
-                        "--project-dir",
-                        str(project_root),
-                        "--confirm",
-                        "apply:anything",
-                        "--output",
-                        "deployment.json",
-                        "--format",
-                        "json",
-                    ]),
+                    main(
+                        [
+                            "bootstrap",
+                            "apply",
+                            "--project-dir",
+                            str(project_root),
+                            "--confirm",
+                            "apply:anything",
+                            "--output",
+                            "deployment.json",
+                            "--format",
+                            "json",
+                        ]
+                    ),
                     2,
                 )
 
