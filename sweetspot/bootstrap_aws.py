@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping
 
 try:  # pragma: no cover - exercised when botocore is installed.
     from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError, ProfileNotFound
-except ModuleNotFoundError:  # pragma: no cover - local fallback is covered in this environment.
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - local fallback is covered in this environment.
     class ClientError(Exception):
         def __init__(self, error_response: Mapping[str, Any], operation_name: str):
             super().__init__(str(error_response.get("Error", {}).get("Message", "ClientError")))
