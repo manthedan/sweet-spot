@@ -99,13 +99,55 @@ sweetspot doctor project --format json
 
 ### Bootstrap doctor validation
 
-Run bootstrap doctor when you want to inspect the generated bootstrap intent and artifact state:
+Run bootstrap doctor when you want a machine-readable lifecycle report for bootstrap recovery:
 
 ```bash
 sweetspot doctor bootstrap --format json
 ```
 
-By default, `sweetspot doctor bootstrap` is also read-only and local. Like `sweetspot init`, it does not contact AWS, create resources, validate live credentials, or probe IAM. Use the default command first when you only need to confirm that `.sweetspot/sweetspot.yaml` can be turned into bootstrap-ready local intent.
+By default, `sweetspot doctor bootstrap` is artifact-only, read-only, local, and non-mutating. It accepts either the project root or the `.sweetspot/` directory, normalizes that input to the project root, reads existing files, classifies lifecycle state, and returns JSON with schema `sweetspot.bootstrap.doctor.v1`. It does not render a new plan, invoke OpenTofu, run subprocesses, contact AWS, create resources, validate live credentials, probe IAM, write recovery artifacts, or store credential material.
+
+Use the default command first when you need to recover from an interrupted or stale bootstrap flow without making the situation worse. It reads these local evidence files when present:
+
+| Evidence file | What the doctor uses it for |
+|---|---|
+| `.sweetspot/sweetspot.yaml` and generated setup artifacts | Local setup readiness through the same setup-status surface used by bootstrap planning. |
+| `.sweetspot/bootstrap-plan.json` | Reviewed plan presence, schema `sweetspot.bootstrap.plan.v1`, and whether plan status is `ready`. |
+| `.sweetspot/bootstrap/state.json` | Last guarded apply state such as `blocked`, `applying`, `failed`, or `output_written`. |
+| `.sweetspot/bootstrap/failure.json` | Sanitized failure category, command summaries, messages, and recovery hints from blocked or failed apply attempts. |
+| `.sweetspot/deployment.json` | Deployment-output validity through schema `sweetspot.deployment.v1`; this is required before downstream runtime handoff. |
+
+The report includes `classification`, `status`, `exit_code`, `local_status`, ordered `evidence`, `next_actions`, and, only when requested, sanitized `aws_diagnostics`. `exit_code` is `0` for `not_started`, `planned`, and `applied`; it is non-zero for `drift_error` and `missing_permission` so scripts can stop on states that require repair.
+
+Bootstrap doctor classifications:
+
+| Classification | Meaning | Exit semantics | Recovery |
+|---|---|---|---|
+| `not_started` | No usable local setup or ready bootstrap plan exists yet. `.sweetspot/` may be missing, incomplete, or not ready for bootstrap. | `exit_code: 0`, `status: action_required`. | Run or repair local setup, then rerun `sweetspot bootstrap plan --project-dir .sweetspot --format json`. |
+| `planned` | Local setup is ready and `.sweetspot/bootstrap-plan.json` is present with schema `sweetspot.bootstrap.plan.v1` and status `ready`, but guarded apply has not produced valid deployment outputs. | `exit_code: 0`, `status: action_required`. | Review the current plan, use its current confirmation token, and run guarded apply only when mutation is intentional. Regenerate the plan first if setup or generated OpenTofu files are stale. |
+| `applied` | Apply state reports `output_written` and `.sweetspot/deployment.json` validates as `sweetspot.deployment.v1`. | `exit_code: 0`, `status: ok`. | Continue to downstream runtime or worker-container work using the validated deployment output. |
+| `drift_error` | Local artifacts disagree or are unreadable: malformed plan/state/failure JSON, invalid plan schema, apply state saying `output_written` without a valid deployment output, or another sanitized error evidence item. | Non-zero `exit_code`, `status: error`. | Inspect `evidence` and `next_actions`; fix corrupt files, regenerate the bootstrap plan, or retry from the last safe lifecycle step. Do not invent deployment outputs or rerun mutation commands just to clear the error. |
+| `missing_permission` | Guarded apply failure diagnostics or opt-in AWS diagnostics indicate missing AWS/IAM permission. | Non-zero `exit_code`, `status: error`. | Read sanitized `failure.json`, command summaries, AWS diagnostics, and recovery hints; update the user-owned profile, SSO session, role, or IAM policy outside `.sweetspot/`, then retry from a freshly reviewed plan. |
+
+Command safety boundaries:
+
+| Command or action | Safety class | Notes |
+|---|---|---|
+| `sweetspot init`, `sweetspot plan`, `sweetspot doctor project`, default `sweetspot doctor bootstrap`, and `sweetspot bootstrap plan` without validation | Safe/local. | Reads and writes only contained local review artifacts according to each command's contract; no live AWS calls or resource mutation. |
+| `sweetspot bootstrap plan --validate` | Local subprocess validation. | May run local `tofu init -backend=false` and `tofu validate`; still does not apply resources or contact AWS backends. |
+| `sweetspot doctor bootstrap --check-aws --format json` | Live/read-only and opt-in. | May construct a boto3 session and call STS/IAM diagnostics. It returns sanitized JSON and does not mutate AWS. |
+| `sweetspot bootstrap apply --format json --confirm apply:<first-16-sha256>` | Guarded mutation. | May call OpenTofu apply and create or update AWS resources only after the reviewed plan and exact confirmation token pass the guard. |
+
+AWS credentials remain user-owned at all times. Use normal AWS profile, environment, SSO, or role-reference mechanisms outside this repository. Do not store access keys, secret keys, session tokens, generated credentials, private keys, bearer tokens, raw profile credentials, or unredacted AWS errors in `.sweetspot/` files, logs, docs, worker code, Terraform variables, or repository-local environment files.
+
+Common bootstrap-doctor recovery flows:
+
+- **Stale plan:** if `classification` is `planned` but the plan identity, generated artifacts, setup intent, or confirmation token no longer matches what the operator reviewed, discard the stale review decision, rerun `sweetspot bootstrap plan --project-dir .sweetspot --format json`, review the new `.sweetspot/bootstrap-plan.json`, and use only the new confirmation token for guarded apply.
+- **Failed apply:** if `local_status.apply` is `failed` or `classification` is `missing_permission`/`drift_error`, inspect `.sweetspot/bootstrap/failure.json`, `evidence`, and `next_actions` first. Fix the named OpenTofu, AWS permission, or output-extraction problem before retrying; rerun from a freshly reviewed plan rather than invoking OpenTofu directly.
+- **Missing permissions:** keep the fix outside `.sweetspot/` by updating the referenced AWS profile, SSO session, role, or IAM policy. Then rerun default `sweetspot doctor bootstrap --format json`; use `--check-aws` only when a live read-only confirmation is intentional.
+- **Invalid deployment output:** if apply state says `output_written` but `.sweetspot/deployment.json` is missing or invalid, treat the project as not handed off. Repair by rerunning the guarded apply/output-extraction path from a current reviewed plan; do not create or edit deployment output JSON by hand just to satisfy runtime consumers.
+
+M003 worker-container work may proceed only when the doctor reports `classification: "applied"` with a valid `.sweetspot/deployment.json` using schema `sweetspot.deployment.v1`. That deployment registry must include bootstrap outputs needed by runtime and worker-container code, including queue/job-definition/image values and worker task role data such as `worker_task_role_arn`.
 
 ### Bootstrap plan review
 
@@ -447,4 +489,6 @@ Before moving from setup into runtime-first commands or future bootstrap work, c
 - The plan report is `ready`, or every `incomplete`/`invalid` finding has an explicit recovery note.
 - Generated OpenTofu and deployment plan artifacts have been reviewed as intent only, with no apply, state, resource creation, credential storage, or deployment output writing performed.
 - Optional `doctor bootstrap --check-aws` diagnostics were run only when live read-only AWS checks were intentional.
-- You understand that S03 owns reviewable bootstrap plan artifacts, and S04 owns guarded apply, live resource mutation, and deployment output writing.
+- Default `sweetspot doctor bootstrap --format json` classifies the lifecycle state, and any `drift_error` or `missing_permission` evidence has been recovered before runtime handoff.
+- Before M003 worker-container work, bootstrap doctor reports `classification: "applied"` and `.sweetspot/deployment.json` validates as `sweetspot.deployment.v1` with bootstrap outputs such as Batch queue/job definition/image references and worker task role data.
+- You understand that S03 owns reviewable bootstrap plan artifacts, S04 owns guarded apply, live resource mutation, and deployment output writing, and M003 consumes only the validated deployment registry produced by that lifecycle.
