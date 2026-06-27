@@ -144,6 +144,42 @@ sweetspot bootstrap plan --project-dir . --validate --format json
 
 Without `--validate`, the report records OpenTofu status as not requested. With `--validate`, SweetSpot may run local `tofu init -backend=false` and `tofu validate` against the generated directory. If `tofu` is unavailable, install OpenTofu or rerun without validation and document that validation was not performed. If validation fails, review the sanitized `command_attempts`, `stderr_summary`, and `next_actions` fields, fix the generated contract or setup intent, and rerun. Validation failure is a local review finding, not a reason to run apply manually from SweetSpot-generated directories.
 
+### Guarded bootstrap apply
+
+Run guarded apply only after the bootstrap plan has been generated and reviewed. This is the first bootstrap command in this lifecycle that may mutate AWS, so it fails closed unless the reviewed plan artifact is present, has `status: "ready"`, has no blocking findings, includes the generated OpenTofu artifacts, and the caller supplies the exact confirmation token derived from the reviewed plan bytes.
+
+Minimal flow:
+
+```bash
+sweetspot bootstrap plan --project-dir .sweetspot --format json
+# Review .sweetspot/bootstrap-plan.json, including findings, generated_artifacts,
+# resource_inventory, expected_deployment, and reviewed_plan.confirmation_token.
+sweetspot bootstrap apply --format json --confirm apply:<first-16-sha256>
+```
+
+Use the current confirmation token from the reviewed plan identity. The token format is `apply:<first-16-sha256>`, and changing `.sweetspot/bootstrap-plan.json` changes the expected token. Do not reuse a token copied from an older plan.
+
+`bootstrap apply` writes machine-readable state for cold-start recovery:
+
+| Artifact | Written when | How to use it |
+|---|---|---|
+| `.sweetspot/bootstrap/state.json` | Every guarded apply attempt, including blocked, applying, failed, and output-written states. | Inspect `schema`, `status`, `category`, `message`, `reviewed_plan`, `confirmation`, `output_completeness`, `command_summaries`, and `recovery_hints` before retrying. |
+| `.sweetspot/bootstrap/failure.json` | Blocked or failed attempts. | Use the sanitized `category`, `message`, command summaries, and recovery hints to fix the refusal or failure without rerunning a mutating command first. |
+| `.sweetspot/deployment.json` | Only after OpenTofu apply and output extraction both succeed. | Runtime commands load this `sweetspot.deployment.v1` registry. Treat its absence as evidence that deployment outputs were not completed. |
+
+Apply statuses are intentionally explicit:
+
+| Status | Meaning | Recovery |
+|---|---|---|
+| `blocked` | The guard refused to call OpenTofu apply. Common categories include `missing_reviewed_plan`, `invalid_reviewed_plan`, `reviewed_plan_not_ready`, `blocking_plan_finding`, `missing_generated_artifact`, `confirmation_missing`, and `confirmation_mismatched`. | Fix the reviewed plan, generated artifact, or confirmation token named in `state.json`/`failure.json`, then rerun from the plan-review step. |
+| `applying` | The guard passed and the OpenTofu apply runner has been invoked, but deployment outputs have not yet been written. | If this is the last persisted state after an interruption, inspect local OpenTofu state outside SweetSpot's JSON summaries before retrying, then rerun only with a freshly reviewed plan and exact token. |
+| `failed` | OpenTofu apply or output extraction failed after the guard passed. Categories include `missing_permission`, `apply_failed`, and `output_extraction_failed`. | Read sanitized `command_summaries` and `recovery_hints`; fix AWS/OpenTofu permissions, command failure, or missing outputs before retrying. |
+| `output_written` | Apply succeeded and `.sweetspot/deployment.json` was written from complete OpenTofu outputs. | Continue to runtime validation using the deployment registry. |
+
+Live AWS apply requires user-owned AWS credentials configured outside `.sweetspot/`, such as AWS CLI profiles, SSO, role assumption, or environment credentials supplied by the user's shell. Prefer short-lived credentials. Never paste access keys, secret keys, session tokens, bearer tokens, private keys, passwords, or generated credential files into `.sweetspot/` artifacts, docs, worker code, Terraform variables, or repository-local environment files.
+
+The regression tests use mocked OpenTofu runners and mocked AWS diagnostics so the guarded contract can be verified without live credentials or resource mutation. S05 will expand doctor and recovery documentation that classifies these persisted state/failure artifacts for operators and agents.
+
 Use the AWS diagnostics mode only when a human or agent explicitly wants a live, read-only AWS check:
 
 ```bash
