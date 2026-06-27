@@ -107,6 +107,43 @@ sweetspot doctor bootstrap --format json
 
 By default, `sweetspot doctor bootstrap` is also read-only and local. Like `sweetspot init`, it does not contact AWS, create resources, validate live credentials, or probe IAM. Use the default command first when you only need to confirm that `.sweetspot/sweetspot.yaml` can be turned into bootstrap-ready local intent.
 
+### Bootstrap plan review
+
+Run bootstrap plan when you want a versioned, machine-readable OpenTofu-backed review artifact from the same local bootstrap intent:
+
+```bash
+sweetspot bootstrap plan --project-dir .sweetspot --format json
+```
+
+The command accepts either the generated `.sweetspot/` directory or the containing project root. By default it writes `.sweetspot/bootstrap-plan.json` and returns the same JSON report on stdout. Custom `--out` paths must stay under `.sweetspot/` so review artifacts remain contained with the local SweetSpot bundle.
+
+`bootstrap plan` is a review-before-apply surface. It renders deterministic OpenTofu configuration files and a deployment-output template, but it does not run `tofu apply`, create AWS resources, create Terraform/OpenTofu state, build or push images, write deployment outputs, contact AWS, or store secrets. Treat the generated files as the exact infrastructure intent to review before the S04 guarded-apply work, not as provisioned infrastructure.
+
+Generated plan output includes:
+
+| Artifact | Role | Review notes |
+|---|---|---|
+| `.sweetspot/bootstrap-plan.json` | Versioned plan report with `schema: sweetspot.bootstrap.plan.v1`. | Review `status`, `findings`, `resource_inventory`, `generated_artifacts`, `command_attempts`, `stderr_summary`, and `next_actions` before any later mutation work. |
+| `.sweetspot/infra/opentofu/main.tf.json` | Deterministic OpenTofu configuration for IAM roles, Batch compute environment, Batch queue, Batch job definition, SQS queue, ECR repository, S3 bucket references, CloudWatch logs, and outputs. | Review resource names, tags, region, and references. This file is not applied by SweetSpot in S03. |
+| `.sweetspot/infra/opentofu/terraform.tfvars.json` | Sanitized variable values derived from setup intent. | It must not contain access keys, secret keys, session tokens, passwords, private keys, or bearer tokens. Auth remains reference-only. |
+| `.sweetspot/deployment.plan.json` | Review-only deployment-output skeleton using schema `sweetspot.deployment.v1`. | S04 owns guarded apply and writing real deployment outputs; do not use this skeleton as proof that resources exist. |
+
+Plan report statuses are intentionally reviewable even when setup is not yet deployable:
+
+| Status | Meaning | Recovery |
+|---|---|---|
+| `ready` | Local setup intent is sufficient to render the OpenTofu review files. | Review generated artifacts and keep them as handoff input for S04. If `--validate` was used, also review the OpenTofu validation status. |
+| `incomplete` | Required bootstrap inputs are missing or fixable, such as missing local setup fields or placeholder deployment values. | Fix `.sweetspot/sweetspot.yaml` through setup input or regenerate local setup, then rerun `sweetspot bootstrap plan`. The artifact is still useful for seeing what is missing. |
+| `invalid` | The setup bundle or output target is not safe to turn into a plan, such as corrupt config, unsafe output paths, or artifact write failures. | Fix the reported finding before continuing. Do not hand the artifact to S04 until the report is no longer invalid. |
+
+OpenTofu validation is optional and local:
+
+```bash
+sweetspot bootstrap plan --project-dir . --validate --format json
+```
+
+Without `--validate`, the report records OpenTofu status as not requested. With `--validate`, SweetSpot may run local `tofu init -backend=false` and `tofu validate` against the generated directory. If `tofu` is unavailable, install OpenTofu or rerun without validation and document that validation was not performed. If validation fails, review the sanitized `command_attempts`, `stderr_summary`, and `next_actions` fields, fix the generated contract or setup intent, and rerun. Validation failure is a local review finding, not a reason to run apply manually from SweetSpot-generated directories.
+
 Use the AWS diagnostics mode only when a human or agent explicitly wants a live, read-only AWS check:
 
 ```bash
@@ -222,9 +259,9 @@ A useful first-run interpretation is: `ok: true` with `status: warning` is accep
 
 ## M002 boundary
 
-M001 setup stops at local project context, starter artifacts, planner compatibility, and local doctor observability. M002 adds an explicit read-only AWS diagnostics path for bootstrap review, but provisioning remains future bootstrap work. Creating or wiring queues, buckets, IAM roles, Batch compute environments, Batch job queues, Batch job definitions, container images, Terraform state, or deployments is still not performed by init, project doctor, default bootstrap doctor, or `doctor bootstrap --check-aws`.
+M001 setup stops at local project context, starter artifacts, planner compatibility, and local doctor observability. M002 adds explicit read-only AWS diagnostics and OpenTofu plan rendering paths for bootstrap review, but provisioning remains future bootstrap work. Creating or wiring queues, buckets, IAM roles, Batch compute environments, Batch job queues, Batch job definitions, container images, Terraform/OpenTofu state, deployment outputs, or deployments is still not performed by init, project doctor, default bootstrap doctor, `doctor bootstrap --check-aws`, or `bootstrap plan`.
 
-Do not infer that init or diagnostics have provisioned infrastructure. They have only captured intent, generated files for review, and optionally reported sanitized live AWS identity/permission signals.
+Do not infer that init, diagnostics, or plan rendering have provisioned infrastructure. They have only captured intent, generated files for review, and optionally reported sanitized live AWS identity/permission signals. S03 stops at a reviewable plan artifact; S04 owns guarded mutation, apply controls, deployment output writing, and any proof that live resources were created.
 
 ## Troubleshooting
 
@@ -292,6 +329,29 @@ What to do:
 3. Rotate any real credential that was accidentally written.
 4. Rerun `sweetspot doctor project --format json` and continue only after `secret_scan` passes.
 
+### Bootstrap plan incomplete or invalid
+
+Symptom: `sweetspot bootstrap plan --format json` reports `status: "incomplete"` or `status: "invalid"`.
+
+What to do:
+
+1. Read `findings` and `next_actions` in `.sweetspot/bootstrap-plan.json` or stdout.
+2. For `incomplete`, fix missing local setup intent in `.sweetspot/sweetspot.yaml` through setup input or regenerate the bundle from valid config, then rerun the plan command.
+3. For `invalid`, fix unsafe paths, corrupt config, or artifact write problems before continuing.
+4. Do not run OpenTofu apply or invent deployment outputs to bypass the status; S04 owns guarded mutation after the review artifact is valid.
+
+### OpenTofu unavailable or validation failed
+
+Symptom: `sweetspot bootstrap plan --validate --format json` reports an OpenTofu status such as executable unavailable, init failed, validation failed, or timed out.
+
+What to do:
+
+1. Confirm the local `tofu` executable is installed and on PATH, or provide `--tofu-executable` for a local validation smoke.
+2. Inspect `command_attempts`, `stderr_summary`, and `next_actions`; stderr is summarized and sanitized for review.
+3. Fix setup intent or generated-contract defects and rerun `sweetspot bootstrap plan --validate --format json`.
+4. If OpenTofu is unavailable on the machine, rerun without `--validate` and keep the rendered plan as review input; CI and user machines are not required to have OpenTofu installed.
+5. Never use a failed validation as a reason to run `tofu apply` manually from the generated directory.
+
 ### AWS diagnostics not configured
 
 Symptom: `doctor bootstrap --check-aws --format json` includes `aws_diagnostics.status: "blocked"` with `missing_region`, `missing_auth_method`, `unsupported_auth`, or `incomplete_auth`.
@@ -347,4 +407,8 @@ Before moving from setup into runtime-first commands or future bootstrap work, c
 - `ok` is `true`, or every failure finding has been fixed.
 - Any placeholder warnings are understood as review-only M001 artifacts.
 - AWS auth remains reference-only and no generated file contains credential material.
-- You understand that M002, not M001 init, owns AWS bootstrap and live resource validation.
+- `sweetspot bootstrap plan --project-dir .sweetspot --format json` has produced a reviewable `.sweetspot/bootstrap-plan.json` when preparing the bootstrap handoff.
+- The plan report is `ready`, or every `incomplete`/`invalid` finding has an explicit recovery note.
+- Generated OpenTofu and deployment plan artifacts have been reviewed as intent only, with no apply, state, resource creation, credential storage, or deployment output writing performed.
+- Optional `doctor bootstrap --check-aws` diagnostics were run only when live read-only AWS checks were intentional.
+- You understand that S03 owns reviewable bootstrap plan artifacts, and S04 owns guarded apply, live resource mutation, and deployment output writing.

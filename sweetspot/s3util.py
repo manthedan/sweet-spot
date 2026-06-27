@@ -28,15 +28,28 @@ def s3_join(prefix: str, *parts: str) -> str:
     return "/".join([prefix.rstrip("/"), *[p.strip("/") for p in parts if p]])
 
 
+def _client_error_code(exc: BaseException) -> str | None:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    error = response.get("Error", {})
+    if not isinstance(error, dict):
+        return None
+    code = error.get("Code")
+    return str(code) if code is not None else None
+
+
 def s3_exists(s3, uri: str) -> bool:
     bucket, key = parse_s3_uri(uri)
     try:
         s3.head_object(Bucket=bucket, Key=key)
         return True
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
+    except Exception as exc:
+        code = _client_error_code(exc)
         if code in {"404", "NoSuchKey", "NotFound"}:
             return False
+        if isinstance(exc, ClientError):
+            raise
         raise
 
 
