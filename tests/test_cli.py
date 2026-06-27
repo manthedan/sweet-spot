@@ -230,12 +230,14 @@ class ProjectDoctorCliTests(unittest.TestCase):
                 self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json"]), 0)
 
         report = json.loads(out.getvalue())
-        self.assertEqual(report["schema"], "sweetspot.bootstrap.status.v1")
-        self.assertTrue(report["ok"])
-        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.doctor.v1")
+        self.assertEqual(report["classification"], "not_started")
+        self.assertEqual(report["status"], "action_required")
+        self.assertEqual(report["exit_code"], 0)
         self.assertNotIn("aws_diagnostics", report)
-        self.assertEqual(report["intent"]["auth"], {"method": "profile", "reference": "sweetspot-dev"})
-        self.assertTrue(all(artifact["status"] == "present" for artifact in report["generated_artifacts"]))
+        self.assertEqual(report["local_status"]["setup"], "ready")
+        self.assertEqual(report["local_status"]["plan"], "missing")
+        self.assertTrue(any(item["code"] == "local_setup_ready" for item in report["evidence"]))
         self.assertTrue(report["next_actions"])
 
     def test_doctor_bootstrap_check_aws_attaches_sanitized_diagnostics(self) -> None:
@@ -274,8 +276,11 @@ class ProjectDoctorCliTests(unittest.TestCase):
 
         diagnose.assert_called_once_with(project_dir=project_root)
         report = json.loads(out.getvalue())
-        self.assertEqual(report["schema"], "sweetspot.bootstrap.status.v1")
-        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.doctor.v1")
+        self.assertEqual(report["classification"], "not_started")
+        self.assertEqual(report["status"], "action_required")
+        self.assertEqual(report["exit_code"], 0)
+        self.assertEqual(report["local_status"]["setup"], "ready")
         self.assertEqual(report["aws_diagnostics"]["schema"], "sweetspot.bootstrap.aws_diagnostics.v1")
         self.assertEqual(report["aws_diagnostics"]["status"], "warning")
         self.assertEqual(
@@ -323,11 +328,13 @@ class ProjectDoctorCliTests(unittest.TestCase):
                 patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("bootstrap doctor must not call boto3.Session")),
                 contextlib.redirect_stdout(out),
             ):
-                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json", "--check-aws"]), 1)
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json", "--check-aws"]), 2)
 
         report = json.loads(out.getvalue())
-        self.assertFalse(report["ok"])
-        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.doctor.v1")
+        self.assertEqual(report["classification"], "drift_error")
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["local_status"]["setup"], "invalid")
         self.assertEqual(report["aws_diagnostics"]["status"], "not_configured")
         self.assertEqual(report["aws_diagnostics"]["checks"][0]["status"], "skipped")
         self.assertEqual(report["aws_diagnostics"]["checks"][0]["details"]["reason"], "local_bootstrap_not_ready")
@@ -359,13 +366,16 @@ class ProjectDoctorCliTests(unittest.TestCase):
 
             out = io.StringIO()
             with patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", return_value=diagnostics), contextlib.redirect_stdout(out):
-                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--check-aws"]), 1)
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_root), "--format", "json", "--check-aws"]), 2)
 
         report = json.loads(out.getvalue())
-        self.assertTrue(report["ok"])
-        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.doctor.v1")
+        self.assertEqual(report["classification"], "drift_error")
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["exit_code"], 2)
         self.assertFalse(report["aws_diagnostics"]["ok"])
         self.assertEqual(report["aws_diagnostics"]["status"], "blocked")
+        self.assertTrue(any(item["code"] == "aws_diagnostics_blocked" for item in report["evidence"]))
 
     def test_doctor_bootstrap_invalid_state_exits_nonzero_with_sanitized_json_without_aws(self) -> None:
         secret_text = "AKIA1234567890ABCDEF"
@@ -380,13 +390,14 @@ class ProjectDoctorCliTests(unittest.TestCase):
                 patch("sweetspot.bootstrap_aws.diagnose_bootstrap_aws", side_effect=AssertionError("default bootstrap doctor must not call AWS diagnostics")),
                 contextlib.redirect_stdout(out),
             ):
-                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json"]), 1)
+                self.assertEqual(main(["doctor", "bootstrap", "--project-dir", str(project_dir), "--format", "json"]), 2)
 
         report = json.loads(out.getvalue())
-        self.assertFalse(report["ok"])
-        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.doctor.v1")
+        self.assertEqual(report["classification"], "drift_error")
+        self.assertEqual(report["status"], "error")
         self.assertNotIn("aws_diagnostics", report)
-        self.assertEqual(report["validation_findings"][0]["code"], "secret_value_aws_access_key_id")
+        self.assertTrue(any(item["code"] == "local_setup_invalid" for item in report["evidence"]))
         self.assertNotIn(secret_text, json.dumps(report))
 
     def test_bootstrap_plan_json_output_writes_default_artifact_without_aws(self) -> None:

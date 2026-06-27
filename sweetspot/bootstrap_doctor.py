@@ -28,7 +28,7 @@ def classify_bootstrap_lifecycle(project_dir: str | Path, aws_diagnostics: dict[
 
 
 def build_bootstrap_doctor_report(project_dir: str | Path, aws_diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
-    root = Path(project_dir).expanduser()
+    root = _project_root(Path(project_dir).expanduser())
     evidence: list[dict[str, Any]] = []
     next_actions: list[str] = []
     local_setup = _local_setup_status(root, evidence, next_actions)
@@ -68,6 +68,15 @@ def build_bootstrap_doctor_report(project_dir: str | Path, aws_diagnostics: dict
                 "category": str(sanitized_aws.get("category") or "missing_permission"),
             }
         )
+    elif isinstance(sanitized_aws, dict) and sanitized_aws.get("status") == "blocked":
+        evidence.append(
+            {
+                "code": "aws_diagnostics_blocked",
+                "severity": "error",
+                "source": "aws_diagnostics",
+                "message": "Opt-in AWS diagnostics were blocked before live bootstrap status could be confirmed.",
+            }
+        )
 
     classification = _classify(local_status=local_status, plan=plan, state=state, failure=failure, aws_diagnostics=sanitized_aws, evidence=evidence)
     if classification not in _CLASSIFICATIONS:
@@ -78,7 +87,7 @@ def build_bootstrap_doctor_report(project_dir: str | Path, aws_diagnostics: dict
         "schema": BOOTSTRAP_DOCTOR_SCHEMA_V1,
         "classification": classification,
         "status": _status_for(classification),
-        "exit_code": 0 if classification == "applied" else 2 if classification in {"drift_error", "missing_permission"} else 1,
+        "exit_code": 2 if classification in {"drift_error", "missing_permission"} else 0,
         "local_status": local_status,
         "evidence": evidence,
         "next_actions": _dedupe(next_actions) or ["Inspect local SweetSpot bootstrap artifacts before retrying."],
@@ -86,6 +95,10 @@ def build_bootstrap_doctor_report(project_dir: str | Path, aws_diagnostics: dict
     if sanitized_aws is not None:
         report["aws_diagnostics"] = sanitized_aws
     return _sanitize_obj(report)
+
+
+def _project_root(requested_dir: Path) -> Path:
+    return requested_dir.parent if requested_dir.name == ".sweetspot" else requested_dir
 
 
 def _local_setup_status(root: Path, evidence: list[dict[str, Any]], next_actions: list[str]) -> str:

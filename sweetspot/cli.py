@@ -74,7 +74,7 @@ from .run_state import (
     write_run_state as _write_run_state,
 )
 from .s3util import parse_s3_uri, s3_join, s3_upload_text
-from .setup import SetupSpecError, doctor_project, load_setup, render_bootstrap_status, validate_setup, write_project_context
+from .setup import SetupSpecError, doctor_project, load_setup, validate_setup, write_project_context
 from .task_model import default_done_s3, parse_allowed_s3_prefixes
 from .worker import DEFAULT_LOG_TAIL_BYTES, DEFAULT_MAX_LOG_BYTES, SAFE_TASK_TIMEOUT_SECONDS, parse_redact_patterns, run_worker, validate_worker_timing
 
@@ -4651,20 +4651,27 @@ def _skipped_bootstrap_aws_diagnostics(local_report: Mapping[str, Any]) -> dict[
 
 
 def cmd_doctor_bootstrap(args: argparse.Namespace) -> int:
-    report = json.loads(render_bootstrap_status(args.project_dir))
-    local_exit_code = 0 if report["ok"] else 1
+    from .bootstrap_doctor import classify_bootstrap_lifecycle
+
+    report = classify_bootstrap_lifecycle(args.project_dir)
+    aws_diagnostics: dict[str, Any] | None = None
     if getattr(args, "check_aws", False):
-        if report.get("ok") and report.get("status") == "ready":
+        if _bootstrap_doctor_allows_live_aws(report):
             from .bootstrap_aws import diagnose_bootstrap_aws
 
             aws_diagnostics = diagnose_bootstrap_aws(project_dir=args.project_dir)
         else:
             aws_diagnostics = _skipped_bootstrap_aws_diagnostics(report)
-        report["aws_diagnostics"] = aws_diagnostics
-        if local_exit_code == 0 and aws_diagnostics.get("status") == "blocked":
-            local_exit_code = 1
+        report = classify_bootstrap_lifecycle(args.project_dir, aws_diagnostics=aws_diagnostics)
     print(json.dumps(report, indent=2, sort_keys=True))
-    return local_exit_code
+    return int(report.get("exit_code", 1))
+
+
+def _bootstrap_doctor_allows_live_aws(report: Mapping[str, Any]) -> bool:
+    local_status = report.get("local_status")
+    if not isinstance(local_status, Mapping):
+        return False
+    return local_status.get("setup") == "ready"
 
 
 def _bootstrap_plan_project_root(project_dir: Path) -> Path:

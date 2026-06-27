@@ -115,6 +115,7 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
 
         self._assert_report_contract(report, "not_started")
         self.assertEqual(report["local_status"]["setup"], "missing")
+        self.assertEqual(report["exit_code"], 0)
         self.assertTrue(any(item["code"] == "sweetspot_state_missing" for item in report["evidence"]))
         self.assertNotIn("aws_diagnostics", report)
 
@@ -127,6 +128,7 @@ class BootstrapDoctorClassifierContractTests(unittest.TestCase):
         self._assert_report_contract(report, "planned")
         self.assertEqual(report["local_status"]["setup"], "ready")
         self.assertEqual(report["local_status"]["plan"], "ready")
+        self.assertEqual(report["exit_code"], 0)
         self.assertTrue(any(item["code"] == "bootstrap_plan_ready" and item["path"] == ".sweetspot/bootstrap-plan.json" for item in report["evidence"]))
         self.assertTrue(any("review" in action.lower() or "apply" in action.lower() for action in report["next_actions"]))
 
