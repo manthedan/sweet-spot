@@ -19,9 +19,13 @@ from sweetspot.setup import (
     WORKER_NOTES_PATH,
     WORKER_SCAFFOLD_PATH,
     SetupSpecError,
+    bootstrap_intent_from_setup,
+    bootstrap_intent_to_dict,
+    load_bootstrap_intent,
     doctor_project,
     dump_setup,
     load_setup,
+    render_bootstrap_intent,
     render_deployment_template,
     render_infra_vars_stub,
     render_next_steps,
@@ -222,6 +226,62 @@ class SetupModelTests(unittest.TestCase):
 
             with self.assertRaises(Exception):
                 load_setup(path)
+
+    def test_bootstrap_intent_derives_sanitized_local_inputs_without_external_dependencies(self) -> None:
+        config = load_setup(ROOT / "examples" / "setup.example.yaml")
+
+        intent = bootstrap_intent_from_setup(config)
+        report = bootstrap_intent_to_dict(intent)
+        rendered = json.loads(render_bootstrap_intent(config))
+
+        self.assertEqual(report, rendered)
+        self.assertEqual(report["schema"], "sweetspot.bootstrap.intent.v1")
+        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["project_name"], "example-batch-project")
+        self.assertEqual(report["region"], "us-west-2")
+        self.assertEqual(report["auth"], {"method": "profile", "reference": "sweetspot-dev"})
+        self.assertEqual(report["backend"], "opentofu-local-template")
+        self.assertEqual(report["missing_inputs"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(
+            report["resource_names"],
+            {
+                "project_slug": "example-batch-project",
+                "job_definition": "example-batch-project-x86_64-job-definition",
+                "job_queue": "example-batch-project-x86_64-job-queue",
+                "container_image": "example-batch-project-x86_64-worker",
+                "input_bucket": "example-sweetspot-input",
+                "output_bucket": "example-sweetspot-output",
+                "output_prefix": "runs/example",
+            },
+        )
+        self.assertEqual(scan_for_secrets(report), ())
+        self.assertNotIn("AWS_ACCESS_KEY_ID", json.dumps(report))
+        self.assertNotIn("opentofu", {error["code"] for error in report["errors"]})
+
+    def test_load_bootstrap_intent_reports_missing_setup_without_throwing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_path = Path(tmpdir) / SWEETSPOT_CONFIG_PATH
+            intent = load_bootstrap_intent(missing_path)
+
+        report = bootstrap_intent_to_dict(intent)
+        self.assertEqual(report["status"], "invalid")
+        self.assertIsNone(report["resource_names"])
+        self.assertIn("aws.region", report["missing_inputs"])
+        self.assertEqual(report["errors"], [{"field_path": SWEETSPOT_CONFIG_PATH, "code": "missing_setup_config", "message": "setup config is missing"}])
+
+    def test_bootstrap_intent_reports_invalid_setup_without_secret_leakage(self) -> None:
+        secret_text = "AKIA1234567890ABCDEF"
+        data = setup_to_dict(load_setup(ROOT / "examples" / "setup.example.yaml"))
+        data["workload"]["command"] = ["python", "worker.py", secret_text]
+
+        report = bootstrap_intent_to_dict(bootstrap_intent_from_setup(data))
+
+        self.assertEqual(report["status"], "invalid")
+        self.assertIsNone(report["resource_names"])
+        self.assertIn("workload.command[2]", report["errors"][0]["field_path"])
+        self.assertEqual(report["errors"][0]["code"], "invalid_setup")
+        self.assertNotIn(secret_text, json.dumps(report))
 
     def test_write_project_context_round_trips_and_renders_full_starter_bundle(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")

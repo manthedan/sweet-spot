@@ -35,6 +35,8 @@ INFRA_VARS_STUB_PATH = f"{SWEETSPOT_DIR}/{INFRA_VARS_STUB}"
 NEXT_STEPS_PATH = f"{SWEETSPOT_DIR}/{NEXT_STEPS}"
 
 DOCTOR_SCHEMA_V1 = "sweetspot.project.doctor.v1"
+BOOTSTRAP_INTENT_SCHEMA_V1 = "sweetspot.bootstrap.intent.v1"
+BOOTSTRAP_INTENT_STATUSES = {"ready", "incomplete", "invalid"}
 DOCTOR_STATUSES = {"pass", "warning", "fail"}
 DOCTOR_SEVERITIES = {"info", "warning", "error"}
 
@@ -117,6 +119,38 @@ class SweetSpotProject:
     workload: WorkloadIntent
     aws: AwsAuthIntent
     bootstrap: BootstrapLayout
+
+
+@dataclass(frozen=True)
+class BootstrapResourceNames:
+    project_slug: str
+    job_definition: str
+    job_queue: str
+    container_image: str
+    input_bucket: str
+    output_bucket: str
+    output_prefix: str
+
+
+@dataclass(frozen=True)
+class BootstrapIntentError:
+    field_path: str
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class BootstrapIntent:
+    schema: str
+    status: str
+    project_name: str | None
+    region: str | None
+    auth_method: str | None
+    auth_reference: str | None
+    backend: str
+    resource_names: BootstrapResourceNames | None
+    missing_inputs: tuple[str, ...]
+    errors: tuple[BootstrapIntentError, ...]
 
 
 def load_setup(path: str | Path) -> SweetSpotProject:
@@ -438,6 +472,154 @@ def _existing_parent_file_conflicts(destinations: list[Path], base_dir: Path) ->
                 break
             parent = parent.parent
     return sorted(set(conflicts))
+
+
+def bootstrap_intent_from_setup(config: SweetSpotProject | dict[str, Any]) -> BootstrapIntent:
+    """Derive the local bootstrap intent from setup config without external calls.
+
+    The result is intentionally limited to sanitized references and deterministic
+    resource naming hints so doctor/bootstrap planning can report readiness before
+    any AWS SDK or OpenTofu dependency is imported.
+    """
+    errors: list[BootstrapIntentError] = []
+    project: SweetSpotProject | None = None
+    try:
+        project = _ensure_valid_project(config)
+    except SetupSpecError as exc:
+        errors.append(BootstrapIntentError(field_path=exc.field_path, code="invalid_setup", message=exc.message))
+
+    if project is None:
+        return _bootstrap_intent_report(project=None, errors=errors)
+    return _bootstrap_intent_report(project=project, errors=errors)
+
+
+def load_bootstrap_intent(path: str | Path) -> BootstrapIntent:
+    """Load `.sweetspot/sweetspot.yaml` and return a structured local intent report.
+
+    Filesystem and YAML/config failures are captured as sanitized intent errors
+    instead of being raised, making the shape safe for project doctor and future
+    failure-recovery flows. No network, subprocess, AWS SDK, or OpenTofu work is
+    performed.
+    """
+    setup_path = Path(path)
+    errors: list[BootstrapIntentError] = []
+    try:
+        project = load_setup(setup_path)
+    except FileNotFoundError:
+        errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="missing_setup_config", message="setup config is missing"))
+        return _bootstrap_intent_report(project=None, errors=errors)
+    except IsADirectoryError:
+        errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="invalid_setup_config", message="setup config is not a regular file"))
+        return _bootstrap_intent_report(project=None, errors=errors)
+    except PermissionError as exc:
+        errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="unreadable_setup_config", message=_sanitize_error_message(exc)))
+        return _bootstrap_intent_report(project=None, errors=errors)
+    except OSError as exc:
+        errors.append(BootstrapIntentError(field_path=SWEETSPOT_CONFIG_PATH, code="unreadable_setup_config", message=_sanitize_error_message(exc)))
+        return _bootstrap_intent_report(project=None, errors=errors)
+    except SetupSpecError as exc:
+        errors.append(BootstrapIntentError(field_path=exc.field_path, code="invalid_setup", message=exc.message))
+        return _bootstrap_intent_report(project=None, errors=errors)
+
+    return _bootstrap_intent_report(project=project, errors=errors)
+
+
+def bootstrap_intent_to_dict(intent: BootstrapIntent) -> dict[str, Any]:
+    """Return a JSON/YAML-safe bootstrap intent report."""
+    if intent.status not in BOOTSTRAP_INTENT_STATUSES:
+        raise ValueError(f"unknown bootstrap intent status: {intent.status}")
+    resource_names = None
+    if intent.resource_names is not None:
+        resource_names = {
+            "project_slug": intent.resource_names.project_slug,
+            "job_definition": intent.resource_names.job_definition,
+            "job_queue": intent.resource_names.job_queue,
+            "container_image": intent.resource_names.container_image,
+            "input_bucket": intent.resource_names.input_bucket,
+            "output_bucket": intent.resource_names.output_bucket,
+            "output_prefix": intent.resource_names.output_prefix,
+        }
+    return {
+        "schema": intent.schema,
+        "status": intent.status,
+        "project_name": intent.project_name,
+        "region": intent.region,
+        "auth": {"method": intent.auth_method, "reference": intent.auth_reference},
+        "backend": intent.backend,
+        "resource_names": resource_names,
+        "missing_inputs": list(intent.missing_inputs),
+        "errors": [
+            {"field_path": error.field_path, "code": error.code, "message": error.message}
+            for error in intent.errors
+        ],
+    }
+
+
+def render_bootstrap_intent(config: SweetSpotProject | dict[str, Any]) -> str:
+    """Render a stable, sanitized bootstrap intent report as JSON."""
+    return json.dumps(bootstrap_intent_to_dict(bootstrap_intent_from_setup(config)), sort_keys=True, indent=2) + "\n"
+
+
+def _bootstrap_intent_report(project: SweetSpotProject | None, errors: list[BootstrapIntentError]) -> BootstrapIntent:
+    missing_inputs: list[str] = []
+    if project is None:
+        missing_inputs.extend(["project.name", "aws.region", "aws.auth", "workload.input_manifest", "workload.output_prefix"])
+        return BootstrapIntent(
+            schema=BOOTSTRAP_INTENT_SCHEMA_V1,
+            status="invalid" if errors else "incomplete",
+            project_name=None,
+            region=None,
+            auth_method=None,
+            auth_reference=None,
+            backend="opentofu-local-template",
+            resource_names=None,
+            missing_inputs=tuple(sorted(set(missing_inputs))),
+            errors=tuple(errors),
+        )
+
+    missing_inputs.extend(_bootstrap_missing_inputs(project))
+    status = "invalid" if errors else "incomplete" if missing_inputs else "ready"
+    input_uri = urlparse(project.workload.input_manifest)
+    output_uri = urlparse(project.workload.output_prefix)
+    slug = _safe_slug(project.project.name)
+    resource_names = BootstrapResourceNames(
+        project_slug=slug,
+        job_definition=f"{slug}-{project.workload.architecture}-job-definition",
+        job_queue=f"{slug}-{project.workload.architecture}-job-queue",
+        container_image=f"{slug}-{project.workload.architecture}-worker",
+        input_bucket=input_uri.netloc,
+        output_bucket=output_uri.netloc,
+        output_prefix=output_uri.path.strip("/"),
+    )
+    return BootstrapIntent(
+        schema=BOOTSTRAP_INTENT_SCHEMA_V1,
+        status=status,
+        project_name=project.project.name,
+        region=project.aws.region,
+        auth_method=project.aws.method,
+        auth_reference=_auth_reference(project.aws),
+        backend="opentofu-local-template",
+        resource_names=resource_names,
+        missing_inputs=tuple(sorted(set(missing_inputs))),
+        errors=tuple(errors),
+    )
+
+
+def _bootstrap_missing_inputs(project: SweetSpotProject) -> list[str]:
+    missing: list[str] = []
+    if not project.project.name:
+        missing.append("project.name")
+    if not project.aws.region:
+        missing.append("aws.region")
+    if project.aws.method == "profile" and not project.aws.profile:
+        missing.append("aws.auth.profile")
+    if project.aws.method == "role" and not project.aws.role_arn:
+        missing.append("aws.auth.role_arn")
+    if not project.workload.input_manifest:
+        missing.append("workload.input_manifest")
+    if not project.workload.output_prefix:
+        missing.append("workload.output_prefix")
+    return missing
 
 
 def doctor_project(project_dir: Path) -> dict[str, Any]:
