@@ -2899,54 +2899,7 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(progress["completion_fraction"], 2 / 3)
         self.assertIsNotNone(progress["estimated_remaining_seconds"])
 
-    def test_status_from_state_discovers_aws_targets_and_output_prefix(self) -> None:
-        class FakeSTS:
-            def get_caller_identity(self):
-                return {"Account": "123", "Arn": "arn", "UserId": "u"}
-
-        class FakeSQS:
-            def get_queue_attributes(self, **kwargs):
-                visible = "4" if kwargs["QueueUrl"] == "run-queue" else "0"
-                return {
-                    "Attributes": {
-                        "ApproximateNumberOfMessages": visible,
-                        "ApproximateNumberOfMessagesNotVisible": "1",
-                        "ApproximateNumberOfMessagesDelayed": "0",
-                    }
-                }
-
-        class FakeS3:
-            def list_objects_v2(self, **kwargs):
-                return {"Contents": [{"Key": "runs/r1/done/t0.done.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)}], "IsTruncated": False}
-
-        class FakePaginator:
-            def paginate(self, **kwargs):
-                if kwargs["jobStatus"] == "RUNNING":
-                    return [{"jobSummaryList": [{"jobId": "j1", "jobName": "run-1-worker-0000", "status": "RUNNING"}]}]
-                return [{"jobSummaryList": []}]
-
-        class FakeBatch:
-            def get_paginator(self, name):
-                return FakePaginator()
-
-        class FakeSession:
-            region_name = "us-west-2"
-
-            def __init__(self, profile_name=None, region_name=None):
-                self.profile_name = profile_name
-                self.region_name = region_name
-
-            def client(self, service, region_name=None):
-                if service == "sts":
-                    return FakeSTS()
-                if service == "sqs":
-                    return FakeSQS()
-                if service == "s3":
-                    return FakeS3()
-                if service == "batch":
-                    return FakeBatch()
-                raise AssertionError(service)
-
+    def test_status_from_state_embeds_lifecycle_state_without_aws_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "artifacts" / "run-1"
             artifact_dir.mkdir(parents=True)
@@ -2961,24 +2914,25 @@ class StatusTests(unittest.TestCase):
                     "run_queue": {"queue_url": "run-queue", "dlq_url": "dlq"},
                     "production_binding": {"target": {"region": "us-west-2", "sqs_queue_url": "fallback-queue", "dlq_url": "dlq", "batch_job_queue": "jq"}},
                 },
-                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker", "batch_job_queue": "jq"}],
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker", "batch_job_queue": "jq"}],
             }
             (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
             out = io.StringIO()
-            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
-                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--format", "json"]), 0)
         report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.status.v1")
         self.assertEqual(report["region"], "us-west-2")
-        self.assertEqual(report["queues"]["source"]["queue_url"], "run-queue")
-        self.assertEqual(report["queues"]["source"]["depth"]["visible"], 4)
-        self.assertEqual(report["queues"]["dlq"]["queue_url"], "dlq")
-        self.assertEqual(report["batch"]["job_queue"], "jq")
-        self.assertEqual(report["batch"]["job_name_prefix"], "run-1-worker")
-        self.assertEqual(report["output_s3"]["output_prefix"], "s3://bucket/runs/r1")
-        self.assertEqual(report["output_s3"]["done_markers"]["expected_count"], 2)
+        self.assertEqual(report["queues"], {})
+        self.assertIsNone(report["batch"])
+        self.assertIsNone(report["output_s3"])
         self.assertEqual(report["run_context"]["queue_url"], "run-queue")
-
-
+        self.assertEqual(report["run"]["production_task_count"], 2)
+        lifecycle = report["lifecycle_state"]
+        self.assertEqual(lifecycle["schema"], "sweetspot.lifecycle_state.v1")
+        self.assertEqual(lifecycle["state"], "WORKERS_RUNNING")
+        self.assertTrue(lifecycle["recommended_commands"])
+        self.assertIn("source_queue_depth", lifecycle["missing_facts"])
 class FinishTests(unittest.TestCase):
     def test_finish_from_state_blocks_when_workers_are_active(self) -> None:
         class FakeSQS:

@@ -22,7 +22,7 @@ import boto3
 
 from . import lane_manager, scout
 from .aws_batch import ACTIVE_STATUSES, active_jobs, desired_worker_count, iso_now, queue_depth, utc_stamp
-from .lifecycle import RunContext, load_run_context
+from .lifecycle import RunContext, evaluate_lifecycle_state, load_run_context
 from .batch_service import (
     redact_env as _redact_env,
     safe_active_worker_count as _safe_active_worker_count,
@@ -2473,7 +2473,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     run_id = getattr(args, "run_id", None)
     artifact_dir = getattr(args, "artifact_dir", None)
     from_state = bool(getattr(args, "from_state", False))
-    context: RunContext | None = load_run_context(run_id, artifact_dir) if from_state else None
+    context: RunContext | None = None
+    lifecycle_state: dict[str, Any] | None = None
+    if from_state:
+        try:
+            context = load_run_context(run_id, artifact_dir)
+        except SystemExit:
+            context = None
+        lifecycle_state = evaluate_lifecycle_state(context, run_id=run_id, artifact_dir=artifact_dir)
     if context is not None:
         run_id = context.run_id
         artifact_dir = context.artifact_dir
@@ -2490,6 +2497,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     job_queue = getattr(args, "job_queue", None) or (context.batch_job_queue if context is not None else None)
     output_prefix = getattr(args, "output_prefix", None) or (context.output_prefix if context is not None else None)
     region = getattr(args, "region", None) or (context.region if context is not None else None)
+    if from_state:
+        report = {
+            "schema": "sweetspot.status.v1",
+            "checked_at": iso_now(),
+            "run": run_report,
+            "run_context": context.as_report() if context is not None else None,
+            "region": region,
+            "identity": None,
+            "queues": {},
+            "batch": None,
+            "output_s3": None,
+            "lifecycle_state": lifecycle_state,
+        }
+        if args.format == "table":
+            _print_status_table(report)
+        else:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     needs_aws = bool(queue_url or dlq_url or job_queue or output_prefix or (run_id is None and artifact_dir is None))
     session = boto3.Session(profile_name=args.profile, region_name=region) if needs_aws else None
     identity: dict[str, Any] | None = None
