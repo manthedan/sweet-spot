@@ -181,6 +181,38 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "artifact" and item.get("field") == "production_task_count" for item in report["evidence"]))
         self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
 
+    def test_enqueue_phase_reports_production_enqueued(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir, phases=[{"name": "enqueue_tasks", "status": "completed"}])
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "PRODUCTION_ENQUEUED")
+        self.assertEqual(report["legacy_outcome"], "in_progress")
+        self.assertEqual(report["known_facts"]["enqueue_tasks_status"], "completed")
+        self.assertIn("submit_workers_status", report["missing_facts"])
+        self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
+        self.assertTrue(any(action["action"] == "replan" for action in report["unsafe_actions"]))
+
+    def test_submit_phase_reports_workers_running_before_drain_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir, phases=[{"name": "submit_workers", "status": "in_progress"}])
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "WORKERS_RUNNING")
+        self.assertEqual(report["legacy_outcome"], "in_progress")
+        self.assertEqual(report["known_facts"]["submit_workers_status"], "in_progress")
+        self.assertIn("source_queue_depth", report["missing_facts"])
+        self.assertIn("active_worker_count", report["missing_facts"])
+        self.assertTrue(any(action["action"] == "finish" for action in report["unsafe_actions"]))
+
     def test_submit_complete_with_status_is_draining_and_finish_dry_run_recommended(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "run-123"
@@ -196,6 +228,23 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertIn("final_manifest_complete", report["missing_facts"])
         self.assertIn("--dry-run", report["recommended_commands"][0])
         self.assertEqual(report["known_facts"]["submit_workers_status"], "completed")
+
+    def test_partial_finalizer_artifact_reports_finalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir, phases=[{"name": "submit_workers", "status": "completed"}])
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_jsonl(artifact_dir / "task_status.jsonl", [{"id": "task-1", "status": "done"}])
+            self._write_json(artifact_dir / "finish_report.json", {"started_at": "2026-06-27T00:00:00Z"})
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "FINALIZING")
+        self.assertEqual(report["legacy_outcome"], "in_progress")
+        self.assertIn("finish_report_ok", report["missing_facts"])
+        self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
+        self.assertTrue(any(item["kind"] == "report" and item.get("field") == "exists" for item in report["evidence"]))
 
     def test_complete_final_manifest_is_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

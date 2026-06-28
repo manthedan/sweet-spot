@@ -553,9 +553,13 @@ def evaluate_lifecycle_state(
     if isinstance(final_complete, bool):
         known_facts["final_manifest_complete"] = final_complete
         evidence.append(_evidence("report", path=context.final_manifest_json, field="complete", value=final_complete))
+    elif final_manifest is not None:
+        evidence.append(_evidence("report", path=context.final_manifest_json, field="exists", value=True))
     if isinstance(finish_ok, bool):
         known_facts["finish_report_ok"] = finish_ok
         evidence.append(_evidence("report", path=context.finish_report_json, field="ok", value=finish_ok))
+    elif finish_report is not None:
+        evidence.append(_evidence("report", path=context.finish_report_json, field="exists", value=True))
     if finish_blocker_count is not None:
         known_facts["finish_blocker_count"] = finish_blocker_count
         evidence.append(_evidence("report", path=context.finish_report_json, field="blockers", value=finish_blocker_count))
@@ -573,6 +577,13 @@ def evaluate_lifecycle_state(
     elif finish_ok is False or (finish_blocker_count or 0) > 0:
         state = "BLOCKED"
         legacy_outcome = "blocked"
+    elif final_manifest is not None or finish_report is not None:
+        state = "FINALIZING"
+        legacy_outcome = "in_progress"
+        if not isinstance(final_complete, bool):
+            missing_facts.append("final_manifest_complete")
+        if not isinstance(finish_ok, bool):
+            missing_facts.append("finish_report_ok")
     elif submit_status in {"completed", "complete"} and ((task_status_count or 0) > 0 or (outputs_count or 0) > 0):
         state = "DRAINING"
         legacy_outcome = "in_progress"
