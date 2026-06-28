@@ -298,6 +298,14 @@ def _phase_status(context: RunContext, name: str) -> str | None:
     return _string_or_none(_phase_by_name(context.run_state, name).get("status"))
 
 
+def _first_phase_status(context: RunContext, *names: str) -> str | None:
+    for name in names:
+        status = _phase_status(context, name)
+        if status is not None:
+            return status
+    return None
+
+
 def _evidence(kind: str, *, path: Path | None = None, field: str | None = None, value: Any = None) -> dict[str, Any]:
     item: dict[str, Any] = {"kind": kind}
     if path is not None:
@@ -499,8 +507,14 @@ def evaluate_lifecycle_state(
     task_status_count = _jsonl_count(context.task_status_jsonl)
     outputs_count = _jsonl_count(context.outputs_manifest_jsonl)
     repair_count = _jsonl_count(context.repair_tasks_jsonl)
+    repair_enqueue_status = _first_phase_status(context, "enqueue_repair_tasks", "repair_enqueue", "enqueue_repairs")
+    repair_submit_status = _first_phase_status(context, "submit_repair_workers", "repair_submit", "submit_repairs")
     final_manifest, final_manifest_error = _read_json_object(context.final_manifest_json)
     finish_report, finish_report_error = _read_json_object(context.finish_report_json)
+    cancellation_report_path = _first_existing_path([artifact_root / "cancelled.json", artifact_root / "cancellation.json", artifact_root / "cancel_report.json"])
+    blocked_report_path = _first_existing_path([artifact_root / "blocked.json", artifact_root / "blocker_report.json"])
+    cancellation_report, cancellation_report_error = _read_json_object(cancellation_report_path)
+    blocked_report, blocked_report_error = _read_json_object(blocked_report_path)
 
     known_facts.update(
         {
@@ -525,6 +539,8 @@ def evaluate_lifecycle_state(
         "outputs_manifest_count": outputs_count,
         "enqueue_tasks_status": enqueue_status,
         "submit_workers_status": submit_status,
+        "repair_enqueue_status": repair_enqueue_status,
+        "repair_submit_status": repair_submit_status,
     }
     known_facts.update({key: value for key, value in optional_fact_values.items() if value is not None})
 
@@ -540,11 +556,23 @@ def evaluate_lifecycle_state(
         evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.enqueue_tasks.status", value=enqueue_status))
     if submit_status is not None:
         evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.submit_workers.status", value=submit_status))
+    if repair_enqueue_status is not None:
+        evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.repair_enqueue.status", value=repair_enqueue_status))
+    if repair_submit_status is not None:
+        evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.repair_submit.status", value=repair_submit_status))
+    if cancellation_report_path is not None:
+        evidence.append(_evidence("artifact", path=cancellation_report_path, field="exists", value=True))
+    if blocked_report_path is not None:
+        evidence.append(_evidence("artifact", path=blocked_report_path, field="exists", value=True))
 
     if final_manifest_error:
         warnings.append({"code": "invalid_final_manifest", "message": final_manifest_error})
     if finish_report_error:
         warnings.append({"code": "invalid_finish_report", "message": finish_report_error})
+    if cancellation_report_error:
+        warnings.append({"code": "invalid_cancellation_report", "message": cancellation_report_error})
+    if blocked_report_error:
+        warnings.append({"code": "invalid_blocked_report", "message": blocked_report_error})
 
     final_complete = final_manifest.get("complete") if final_manifest is not None else None
     finish_ok = finish_report.get("ok") if finish_report is not None else None
@@ -564,17 +592,37 @@ def evaluate_lifecycle_state(
         known_facts["finish_blocker_count"] = finish_blocker_count
         evidence.append(_evidence("report", path=context.finish_report_json, field="blockers", value=finish_blocker_count))
 
-    invalid_local_artifact = bool(final_manifest_error or finish_report_error)
+    invalid_local_artifact = bool(final_manifest_error or finish_report_error or cancellation_report_error or blocked_report_error)
+    terminal_success = finish_ok is True or final_complete is True
+    repair_evidence = final_complete is False or (repair_count or 0) > 0
+    blocked_evidence = finish_ok is False or (finish_blocker_count or 0) > 0 or blocked_report_path is not None
+    repair_work_started = (repair_count or 0) > 0 and repair_enqueue_status in {"in_progress", "running", "completed", "complete"}
+    repair_workers_started = (repair_count or 0) > 0 and repair_submit_status in {"in_progress", "running", "completed", "complete"}
+    contradictory_terminal_evidence = terminal_success and (repair_evidence or blocked_evidence)
     if invalid_local_artifact:
         state = "FAILED_REVIEW_REQUIRED"
-        missing_facts.append("valid_finalizer_artifacts")
-    elif finish_ok is True or final_complete is True:
+        if final_manifest_error or finish_report_error:
+            missing_facts.append("valid_finalizer_artifacts")
+        if cancellation_report_error or blocked_report_error:
+            missing_facts.append("valid_local_side_path_artifacts")
+    elif contradictory_terminal_evidence:
+        state = "FAILED_REVIEW_REQUIRED"
+        missing_facts.append("consistent_terminal_artifacts")
+        warnings.append({"code": "contradictory_lifecycle_artifacts", "message": "terminal success evidence conflicts with repair or blocked evidence"})
+    elif cancellation_report_path is not None:
+        state = "CANCELLED"
+        legacy_outcome = "cancelled"
+    elif repair_workers_started or repair_work_started:
+        state = "REPAIR_RUNNING"
+        legacy_outcome = "repair_running"
+        missing_facts.extend(["repair_queue_depth", "active_repair_worker_count"])
+    elif terminal_success:
         state = "COMPLETE"
         legacy_outcome = "finished" if finish_ok is True else "finalized_complete"
-    elif final_complete is False or (repair_count or 0) > 0:
+    elif repair_evidence:
         state = "NEEDS_REPAIR"
         legacy_outcome = "repair_needed"
-    elif finish_ok is False or (finish_blocker_count or 0) > 0:
+    elif blocked_evidence:
         state = "BLOCKED"
         legacy_outcome = "blocked"
     elif final_manifest is not None or finish_report is not None:

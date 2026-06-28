@@ -278,6 +278,56 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertEqual(report["known_facts"]["repair_task_count"], 1)
         self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "repair-plan", "run-123"])
 
+    def test_repair_tasks_with_repair_enqueue_phase_reports_repair_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir, phases=[{"name": "enqueue_repair_tasks", "status": "completed"}])
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_jsonl(artifact_dir / "repair_tasks.jsonl", [{"id": "task-1"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "REPAIR_RUNNING")
+        self.assertEqual(report["legacy_outcome"], "repair_running")
+        self.assertEqual(report["known_facts"]["repair_task_count"], 1)
+        self.assertEqual(report["known_facts"]["repair_enqueue_status"], "completed")
+        self.assertIn("repair_queue_depth", report["missing_facts"])
+        self.assertIn("active_repair_worker_count", report["missing_facts"])
+        self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
+
+    def test_blocked_marker_reports_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "blocked.json", {"reason": "missing permission"})
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "BLOCKED")
+        self.assertEqual(report["legacy_outcome"], "blocked")
+        self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "explain", "run-123"])
+        self.assertTrue(any(item.get("path", "").endswith("blocked.json") for item in report["evidence"]))
+
+    def test_cancellation_marker_reports_cancelled_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "cancelled.json", {"reason": "operator cancelled"})
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "CANCELLED")
+        self.assertEqual(report["legacy_outcome"], "cancelled")
+        self.assertTrue(report["terminal"])
+        self.assertFalse(report["review_required"])
+        self.assertIn("--dry-run", report["recommended_commands"][0])
+        self.assertTrue(any(action["action"] == "resume_workers" for action in report["unsafe_actions"]))
+
     def test_malformed_finalizer_artifact_requires_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "run-123"
@@ -293,6 +343,37 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertIn("valid_finalizer_artifacts", report["missing_facts"])
         self.assertTrue(any(warning["code"] == "invalid_final_manifest" for warning in report["warnings"]))
         self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "explain", "run-123"])
+
+    def test_malformed_blocked_marker_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            (artifact_dir / "blocked.json").write_text("{not json", encoding="utf-8")
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "FAILED_REVIEW_REQUIRED")
+        self.assertTrue(report["review_required"])
+        self.assertIn("valid_local_side_path_artifacts", report["missing_facts"])
+        self.assertTrue(any(warning["code"] == "invalid_blocked_report" for warning in report["warnings"]))
+
+    def test_contradictory_complete_and_repair_artifacts_require_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "final_manifest.json", {"complete": True})
+            self._write_jsonl(artifact_dir / "repair_tasks.jsonl", [{"id": "task-1"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "FAILED_REVIEW_REQUIRED")
+        self.assertTrue(report["review_required"])
+        self.assertIn("consistent_terminal_artifacts", report["missing_facts"])
+        self.assertTrue(any(warning["code"] == "contradictory_lifecycle_artifacts" for warning in report["warnings"]))
 
     def test_mismatched_run_id_requires_review_without_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
