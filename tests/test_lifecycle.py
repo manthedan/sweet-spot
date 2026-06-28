@@ -246,6 +246,22 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
         self.assertTrue(any(item["kind"] == "report" and item.get("field") == "exists" for item in report["evidence"]))
 
+    def test_finalizing_actions_guard_finish_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir, phases=[{"name": "submit_workers", "status": "completed"}])
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "finish_report.json", {"started_at": "2026-06-27T00:00:00Z"})
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        safe_by_action = {action["action"]: action for action in report["safe_actions"]}
+        unsafe_by_action = {action["action"]: action for action in report["unsafe_actions"]}
+        self.assertIn("finish_dry_run", safe_by_action)
+        self.assertIn("--dry-run", safe_by_action["finish_dry_run"]["command"])
+        self.assertEqual(unsafe_by_action["cleanup"]["required_state"], "COMPLETE")
+        self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
+
     def test_complete_final_manifest_is_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "run-123"
@@ -277,6 +293,23 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertEqual(report["legacy_outcome"], "repair_needed")
         self.assertEqual(report["known_facts"]["repair_task_count"], 1)
         self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "repair-plan", "run-123"])
+
+    def test_needs_repair_actions_allow_guarded_finish_only_as_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "final_manifest.json", {"complete": False})
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        safe_by_action = {action["action"]: action for action in report["safe_actions"]}
+        unsafe_by_action = {action["action"]: action for action in report["unsafe_actions"]}
+        self.assertIn("repair_plan", safe_by_action)
+        self.assertIn("finish_dry_run", safe_by_action)
+        self.assertIn("--dry-run", safe_by_action["finish_dry_run"]["command"])
+        self.assertEqual(unsafe_by_action["mark_complete"]["required_state"], "COMPLETE")
+        self.assertEqual(unsafe_by_action["cleanup"]["required_state"], "COMPLETE")
 
     def test_repair_tasks_with_repair_enqueue_phase_reports_repair_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

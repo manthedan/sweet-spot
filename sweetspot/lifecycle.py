@@ -385,7 +385,10 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
         unsafe.append(_unsafe("cleanup", "final manifest is absent", "COMPLETE"))
         recommended.append(commands["finish_dry_run"])
     elif state == "FINALIZING":
-        safe.append(_action("status", commands["status"], "finalizer artifacts should be inspected until completion"))
+        safe.extend([
+            _action("status", commands["status"], "finalizer artifacts should be inspected until completion"),
+            _action("finish_dry_run", commands["finish_dry_run"], "finish is guarded from finalizing state and should remain dry-run until evidence is reviewed"),
+        ])
         unsafe.extend([
             _unsafe("enqueue", "finalization is already in progress"),
             _unsafe("cleanup", "finalization has not completed", "COMPLETE"),
@@ -399,7 +402,10 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
         unsafe.append(_unsafe("repair", "successful completion evidence is present", "NEEDS_REPAIR"))
         recommended.append(commands["cleanup_dry_run"])
     elif state == "NEEDS_REPAIR":
-        safe.append(_action("repair_plan", commands["repair_plan"], "finalizer evidence indicates repairable missing or failed outputs"))
+        safe.extend([
+            _action("repair_plan", commands["repair_plan"], "finalizer evidence indicates repairable missing or failed outputs"),
+            _action("finish_dry_run", commands["finish_dry_run"], "rerun finalization only as a guarded dry-run after repair evidence is reviewed"),
+        ])
         unsafe.extend([
             _unsafe("mark_complete", "final manifest or report is incomplete", "COMPLETE"),
             _unsafe("cleanup", "repair inputs may still be required", "COMPLETE"),
