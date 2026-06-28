@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from sweetspot.lifecycle import (
     LIFECYCLE_STATE_REPORT_REQUIRED_FIELDS,
@@ -8,6 +11,7 @@ from sweetspot.lifecycle import (
     LIFECYCLE_STATES,
     REVIEW_REQUIRED_LIFECYCLE_STATES,
     TERMINAL_LIFECYCLE_STATES,
+    evaluate_lifecycle_state,
     validate_lifecycle_state_report,
 )
 
@@ -113,6 +117,146 @@ class LifecycleContractTests(unittest.TestCase):
         self.assertIn("recommended_commands must be a list", errors)
         self.assertIn("evidence must be a list", errors)
         self.assertIn("warnings must be a list", errors)
+
+
+
+class LifecycleEvaluatorTests(unittest.TestCase):
+    def _write_json(self, path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _write_jsonl(self, path: Path, rows: list[dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def _run_state(self, artifact_dir: Path, *, plan_status: str = "ready", phases: list[dict[str, object]] | None = None) -> None:
+        self._write_json(
+            artifact_dir / "run_state.json",
+            {
+                "run_id": "run-123",
+                "job_spec_sha256": "abc123",
+                "plan": {"status": plan_status, "tasks": [{"id": "task-1"}, {"id": "task-2"}]},
+                "controller": {
+                    "deployment_sha256": "deploy123",
+                    "run_queue": {"queue_url": "https://sqs.example.invalid/q", "dlq_url": "https://sqs.example.invalid/dlq"},
+                    "production_binding": {"target": {"batch_job_queue": "queue"}},
+                },
+                "artifacts": {"production_tasks_jsonl": "production_tasks.jsonl"},
+                "phases": phases or [],
+            },
+        )
+
+    def assertValidReport(self, report: dict[str, object]) -> None:
+        self.assertEqual(validate_lifecycle_state_report(report), [])
+
+    def test_missing_run_state_is_new_with_non_mutating_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            report = evaluate_lifecycle_state(run_id="run-123", artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "NEW")
+        self.assertFalse(report["terminal"])
+        self.assertFalse(report["review_required"])
+        self.assertIn("run_state_json", report["missing_facts"])
+        self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "run", "JOB_SPEC"])
+        self.assertTrue(any(action["action"] == "finish" for action in report["unsafe_actions"]))
+
+    def test_ready_plan_reports_known_facts_and_local_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}, {"id": "task-2"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "PLAN_READY")
+        self.assertEqual(report["legacy_outcome"], "ready_to_finish")
+        self.assertEqual(report["known_facts"]["job_spec_sha256"], "abc123")
+        self.assertEqual(report["known_facts"]["deployment_sha256"], "deploy123")
+        self.assertEqual(report["known_facts"]["plan_task_count"], 2)
+        self.assertEqual(report["known_facts"]["production_task_count"], 2)
+        self.assertTrue(report["known_facts"]["source_queue_url_recorded"])
+        self.assertTrue(any(item["kind"] == "artifact" and item.get("field") == "production_task_count" for item in report["evidence"]))
+        self.assertEqual(report["recommended_commands"][0][:4], ["sweetspot", "status", "run-123", "--from-state"])
+
+    def test_submit_complete_with_status_is_draining_and_finish_dry_run_recommended(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir, phases=[{"name": "submit_workers", "status": "completed"}])
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_jsonl(artifact_dir / "task_status.jsonl", [{"id": "task-1", "status": "done"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "DRAINING")
+        self.assertIn("active_worker_count", report["missing_facts"])
+        self.assertIn("final_manifest_complete", report["missing_facts"])
+        self.assertIn("--dry-run", report["recommended_commands"][0])
+        self.assertEqual(report["known_facts"]["submit_workers_status"], "completed")
+
+    def test_complete_final_manifest_is_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "final_manifest.json", {"complete": True})
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "COMPLETE")
+        self.assertTrue(report["terminal"])
+        self.assertFalse(report["review_required"])
+        self.assertEqual(report["known_facts"]["final_manifest_complete"], True)
+        self.assertIn("--dry-run", report["recommended_commands"][0])
+
+    def test_incomplete_final_manifest_needs_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            self._write_json(artifact_dir / "final_manifest.json", {"complete": False})
+            self._write_jsonl(artifact_dir / "repair_tasks.jsonl", [{"id": "task-1"}])
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "NEEDS_REPAIR")
+        self.assertEqual(report["legacy_outcome"], "repair_needed")
+        self.assertEqual(report["known_facts"]["repair_task_count"], 1)
+        self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "repair-plan", "run-123"])
+
+    def test_malformed_finalizer_artifact_requires_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+            self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+            (artifact_dir / "final_manifest.json").write_text("{not json", encoding="utf-8")
+
+            report = evaluate_lifecycle_state(artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "FAILED_REVIEW_REQUIRED")
+        self.assertTrue(report["review_required"])
+        self.assertIn("valid_finalizer_artifacts", report["missing_facts"])
+        self.assertTrue(any(warning["code"] == "invalid_final_manifest" for warning in report["warnings"]))
+        self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "explain", "run-123"])
+
+    def test_mismatched_run_id_requires_review_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._run_state(artifact_dir)
+
+            report = evaluate_lifecycle_state(run_id="other-run", artifact_dir=artifact_dir, generated_at="2026-06-27T00:00:00Z")
+
+        self.assertValidReport(report)
+        self.assertEqual(report["state"], "FAILED_REVIEW_REQUIRED")
+        self.assertTrue(report["review_required"])
+        self.assertIn("valid_run_state_json", report["missing_facts"])
+        self.assertTrue(any(warning["code"] == "run_context_load_failed" for warning in report["warnings"]))
 
 
 if __name__ == "__main__":
