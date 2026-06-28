@@ -336,7 +336,8 @@ def _commands_for(run_id: str | None, artifact_dir: Path | None) -> dict[str, li
         "explain": ["sweetspot", "explain", rid, "--from-state", *artifact_arg],
         "finish": ["sweetspot", "finish", rid, "--from-state", *artifact_arg],
         "finish_dry_run": ["sweetspot", "finish", rid, "--from-state", *artifact_arg, "--dry-run"],
-        "cleanup_dry_run": ["sweetspot", "cleanup", rid, "--from-state", *artifact_arg, "--dry-run"],
+        "cleanup_dry_run": ["sweetspot", "cleanup", rid, "--from-state", *artifact_arg],
+        "cleanup": ["sweetspot", "cleanup", rid, "--from-state", *artifact_arg, "--apply"],
         "repair_plan": ["sweetspot", "repair-plan", rid, "--from-state", *artifact_arg],
     }
 
@@ -349,72 +350,95 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
 
     if state == "NEW":
         safe.append(_action("plan", ["sweetspot", "run", "JOB_SPEC", "--artifact-dir", str(artifact_dir or "artifacts/RUN_ID")], "no durable run state exists yet"))
-        unsafe.extend([
-            _unsafe("finish", "no durable run artifacts prove work was submitted or drained", "DRAINING"),
-            _unsafe("cleanup", "no completed run state exists to clean up", "COMPLETE"),
-            _unsafe("repair", "no finalizer evidence identifies repairable outputs", "NEEDS_REPAIR"),
-        ])
+        unsafe.extend(
+            [
+                _unsafe("finish", "no durable run artifacts prove work was submitted or drained", "DRAINING"),
+                _unsafe("cleanup", "no completed run state exists to clean up", "COMPLETE"),
+                _unsafe("repair", "no finalizer evidence identifies repairable outputs", "NEEDS_REPAIR"),
+            ]
+        )
         recommended.append(safe[0]["command"])
     elif state in {"PLANNING", "CANARY_MATERIALIZED", "CANARY_RUNNING", "CANARY_COLLECTING", "PLAN_READY"}:
         safe.append(_action("status", commands["status"], "inspect local state before mutation"))
-        unsafe.extend([
-            _unsafe("finish", "production work is not proven drained", "DRAINING"),
-            _unsafe("cleanup", "run is not complete", "COMPLETE"),
-        ])
+        unsafe.extend(
+            [
+                _unsafe("finish", "production work is not proven drained", "DRAINING"),
+                _unsafe("cleanup", "run is not complete", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["status"])
     elif state == "PRODUCTION_ENQUEUED":
         safe.append(_action("status", commands["status"], "enqueue progress can be inspected or resumed"))
-        unsafe.extend([
-            _unsafe("replan", "production bindings may already have been used for enqueue"),
-            _unsafe("finish", "workers are not proven drained", "DRAINING"),
-            _unsafe("cleanup", "queued work may still exist", "COMPLETE"),
-        ])
+        unsafe.extend(
+            [
+                _unsafe("replan", "production bindings may already have been used for enqueue"),
+                _unsafe("finish", "workers are not proven drained", "DRAINING"),
+                _unsafe("cleanup", "queued work may still exist", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["status"])
     elif state == "WORKERS_RUNNING":
         safe.append(_action("status", commands["status"], "workers are expected to be processing queued work"))
-        unsafe.extend([
-            _unsafe("finish", "local-only evidence cannot prove queues are drained", "DRAINING"),
-            _unsafe("cleanup", "workers may still be running", "COMPLETE"),
-        ])
+        unsafe.extend(
+            [
+                _unsafe("finish", "local-only evidence cannot prove queues are drained", "DRAINING"),
+                _unsafe("cleanup", "workers may still be running", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["status"])
     elif state == "DRAINING":
-        safe.extend([
-            _action("status", commands["status"], "inspect drain progress"),
-            _action("finish_dry_run", commands["finish_dry_run"], "finalization is the next guarded transition after drain evidence"),
-        ])
-        unsafe.extend([
-            _unsafe("finish", "mutating finish requires reviewed dry-run finalizer evidence first", "FINALIZING"),
-            _unsafe("cleanup", "final manifest is absent", "COMPLETE"),
-        ])
+        safe.extend(
+            [
+                _action("status", commands["status"], "inspect drain progress"),
+                _action("finish_dry_run", commands["finish_dry_run"], "finalization is the next guarded transition after drain evidence"),
+                _action("finish", commands["finish"], "mutating finish is allowed after live drain checks pass"),
+            ]
+        )
+        unsafe.extend(
+            [
+                _unsafe("cleanup", "final manifest is absent", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["finish_dry_run"])
     elif state == "FINALIZING":
-        safe.extend([
-            _action("status", commands["status"], "finalizer artifacts should be inspected until completion"),
-            _action("finish_dry_run", commands["finish_dry_run"], "finish is guarded from finalizing state and should remain dry-run until evidence is reviewed"),
-        ])
-        unsafe.extend([
-            _unsafe("enqueue", "finalization is already in progress"),
-            _unsafe("finish", "finalizer artifacts are not complete enough for a mutating finish", "COMPLETE"),
-            _unsafe("cleanup", "finalization has not completed", "COMPLETE"),
-        ])
+        safe.extend(
+            [
+                _action("status", commands["status"], "finalizer artifacts should be inspected until completion"),
+                _action("finish_dry_run", commands["finish_dry_run"], "finish is guarded from finalizing state and should remain dry-run until evidence is reviewed"),
+                _action("finish", commands["finish"], "resume interrupted finalization after live drain checks pass"),
+            ]
+        )
+        unsafe.extend(
+            [
+                _unsafe("enqueue", "finalization is already in progress"),
+                _unsafe("cleanup", "finalization has not completed", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["status"])
     elif state == "COMPLETE":
-        safe.extend([
-            _action("status", commands["status"], "read final run state"),
-            _action("cleanup_dry_run", commands["cleanup_dry_run"], "completed runs may be inspected for guarded cleanup"),
-        ])
+        safe.extend(
+            [
+                _action("status", commands["status"], "read final run state"),
+                _action("cleanup_dry_run", commands["cleanup_dry_run"], "completed runs may be inspected for guarded cleanup"),
+                _action("cleanup", commands["cleanup"], "completed runs may run guarded cleanup after live safety checks pass"),
+            ]
+        )
         unsafe.append(_unsafe("repair", "successful completion evidence is present", "NEEDS_REPAIR"))
         recommended.append(commands["cleanup_dry_run"])
     elif state == "NEEDS_REPAIR":
-        safe.extend([
-            _action("repair_plan", commands["repair_plan"], "finalizer evidence indicates repairable missing or failed outputs"),
-            _action("finish_dry_run", commands["finish_dry_run"], "rerun finalization only as a guarded dry-run after repair evidence is reviewed"),
-        ])
-        unsafe.extend([
-            _unsafe("finish", "repair evidence must be reviewed before mutating finalization", "FINALIZING"),
-            _unsafe("mark_complete", "final manifest or report is incomplete", "COMPLETE"),
-            _unsafe("cleanup", "repair inputs may still be required", "COMPLETE"),
-        ])
+        safe.extend(
+            [
+                _action("repair_plan", commands["repair_plan"], "finalizer evidence indicates repairable missing or failed outputs"),
+                _action("finish_dry_run", commands["finish_dry_run"], "rerun finalization only as a guarded dry-run after repair evidence is reviewed"),
+            ]
+        )
+        unsafe.extend(
+            [
+                _unsafe("finish", "repair evidence must be reviewed before mutating finalization", "FINALIZING"),
+                _unsafe("mark_complete", "final manifest or report is incomplete", "COMPLETE"),
+                _unsafe("cleanup", "repair inputs may still be required", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["repair_plan"])
     elif state == "REPAIR_RUNNING":
         safe.append(_action("status", commands["status"], "repair work should be monitored before finalization"))
@@ -422,11 +446,13 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
         recommended.append(commands["status"])
     elif state in {"BLOCKED", "FAILED_REVIEW_REQUIRED"}:
         safe.append(_action("explain", commands["explain"], "review the blocker or unsafe ambiguity before mutation"))
-        unsafe.extend([
-            _unsafe("apply", "state requires review before mutation"),
-            _unsafe("finish", "state requires review before finalization", "DRAINING"),
-            _unsafe("cleanup", "state requires review before cleanup", "COMPLETE"),
-        ])
+        unsafe.extend(
+            [
+                _unsafe("apply", "state requires review before mutation"),
+                _unsafe("finish", "state requires review before finalization", "DRAINING"),
+                _unsafe("cleanup", "state requires review before cleanup", "COMPLETE"),
+            ]
+        )
         recommended.append(commands["explain"])
     elif state == "CANCELLED":
         safe.append(_action("cleanup_dry_run", commands["cleanup_dry_run"], "cancelled runs require guarded cleanup inspection"))
@@ -449,7 +475,7 @@ def evaluate_lifecycle_state(
     FAILED_REVIEW_REQUIRED rather than mutating or probing external resources.
     """
 
-    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
+    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else (Path("artifacts") / run_id if run_id else None)
     warnings: list[dict[str, Any]] = []
     evidence: list[dict[str, Any]] = []
     missing_facts: list[str] = []
@@ -512,8 +538,18 @@ def evaluate_lifecycle_state(
     evidence.append(_evidence("artifact", path=artifact_root / "run_state.json", field="run_id", value=run_id))
 
     enqueue_status = _phase_status(context, "enqueue_tasks")
-    submit_status = _phase_status(context, "submit_workers")
+    canary_enqueue_status = _phase_status(context, "enqueue_canary_tasks")
+    canary_submit_status = _phase_status(context, "submit_canary_workers")
+    canary_collect_status = _phase_status(context, "collect_canary_summaries")
+    submit_phase = _phase_by_name(context.run_state, "submit_workers")
+    submit_phase_present = bool(submit_phase)
+    submit_status = _string_or_none(submit_phase.get("status"))
     plan_status = _string_or_none(context.plan.get("status"))
+    artifacts_map = _dict_or_empty(context.run_state.get("artifacts"))
+    canary_tasks_jsonl = _resolve_existing_path(artifacts_map.get("canary_tasks_jsonl"), artifact_dir=artifact_root)
+    if canary_tasks_jsonl is None:
+        canary_tasks_jsonl = _first_existing_path([artifact_root / "canary_tasks.jsonl"])
+    canary_count = _jsonl_count(canary_tasks_jsonl)
     production_count = _jsonl_count(context.production_tasks_jsonl)
     task_status_count = _jsonl_count(context.task_status_jsonl)
     outputs_count = _jsonl_count(context.outputs_manifest_jsonl)
@@ -544,17 +580,23 @@ def evaluate_lifecycle_state(
         "deployment_sha256": context.deployment_sha256,
         "plan_status": plan_status,
         "plan_task_count": plan_task_count,
+        "canary_task_count": canary_count,
         "production_task_count": production_count,
         "repair_task_count": repair_count,
         "task_status_count": task_status_count,
         "outputs_manifest_count": outputs_count,
         "enqueue_tasks_status": enqueue_status,
         "submit_workers_status": submit_status,
+        "enqueue_canary_tasks_status": canary_enqueue_status,
+        "submit_canary_workers_status": canary_submit_status,
+        "collect_canary_summaries_status": canary_collect_status,
         "repair_enqueue_status": repair_enqueue_status,
         "repair_submit_status": repair_submit_status,
     }
     known_facts.update({key: value for key, value in optional_fact_values.items() if value is not None})
 
+    if canary_tasks_jsonl is not None:
+        evidence.append(_evidence("artifact", path=canary_tasks_jsonl, field="canary_task_count", value=canary_count))
     if context.production_tasks_jsonl is not None:
         evidence.append(_evidence("artifact", path=context.production_tasks_jsonl, field="production_task_count", value=production_count))
     if context.task_status_jsonl is not None:
@@ -567,6 +609,12 @@ def evaluate_lifecycle_state(
         evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.enqueue_tasks.status", value=enqueue_status))
     if submit_status is not None:
         evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.submit_workers.status", value=submit_status))
+    if canary_enqueue_status is not None:
+        evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.enqueue_canary_tasks.status", value=canary_enqueue_status))
+    if canary_submit_status is not None:
+        evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.submit_canary_workers.status", value=canary_submit_status))
+    if canary_collect_status is not None:
+        evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.collect_canary_summaries.status", value=canary_collect_status))
     if repair_enqueue_status is not None:
         evidence.append(_evidence("phase", path=artifact_root / "run_state.json", field="phases.repair_enqueue.status", value=repair_enqueue_status))
     if repair_submit_status is not None:
@@ -587,8 +635,10 @@ def evaluate_lifecycle_state(
 
     final_complete = final_manifest.get("complete") if final_manifest is not None else None
     finish_ok = finish_report.get("ok") if finish_report is not None else None
+    finish_confirmed_mutating = finish_report.get("dry_run") is not True if finish_report is not None else False
     finish_blockers = finish_report.get("blockers") if finish_report is not None else None
     finish_blocker_count = len(finish_blockers) if isinstance(finish_blockers, list) else None
+    finish_blocker_codes = {str(blocker.get("code")) for blocker in finish_blockers if isinstance(blocker, dict) and blocker.get("code")} if isinstance(finish_blockers, list) else set()
     if isinstance(final_complete, bool):
         known_facts["final_manifest_complete"] = final_complete
         evidence.append(_evidence("report", path=context.final_manifest_json, field="complete", value=final_complete))
@@ -604,12 +654,22 @@ def evaluate_lifecycle_state(
         evidence.append(_evidence("report", path=context.finish_report_json, field="blockers", value=finish_blocker_count))
 
     invalid_local_artifact = bool(final_manifest_error or finish_report_error or cancellation_report_error or blocked_report_error)
-    terminal_success = finish_ok is True or final_complete is True
+    terminal_success = (finish_ok is True and finish_confirmed_mutating) or final_complete is True
     repair_evidence = final_complete is False or (repair_count or 0) > 0
-    blocked_evidence = finish_ok is False or (finish_blocker_count or 0) > 0 or blocked_report_path is not None
-    repair_work_started = (repair_count or 0) > 0 and repair_enqueue_status in {"in_progress", "running", "completed", "complete"}
-    repair_workers_started = (repair_count or 0) > 0 and repair_submit_status in {"in_progress", "running", "completed", "complete"}
-    contradictory_terminal_evidence = terminal_success and (repair_evidence or blocked_evidence)
+    finish_blocked_evidence = finish_ok is False or (finish_blocker_count or 0) > 0
+    transient_finish_blocker_codes = {"source_queue_not_empty", "dlq_not_empty", "batch_jobs_active"}
+    retryable_finish_blocker_codes = {"finalizer_failed", "finalizer_incomplete"}
+    finish_blocked_allows_retry = bool(finish_blocker_codes) and finish_blocker_codes <= (transient_finish_blocker_codes | retryable_finish_blocker_codes)
+    durable_blocked_evidence = blocked_report_path is not None or (finish_blocked_evidence and not finish_blocked_allows_retry)
+    blocked_evidence = finish_blocked_evidence or durable_blocked_evidence
+    repair_work_started = (repair_count or 0) > 0 and repair_enqueue_status in {"in_progress", "running"}
+    repair_workers_started = (repair_count or 0) > 0 and repair_submit_status in {"in_progress", "running"}
+    repair_work_completed = (repair_count or 0) > 0 and (repair_enqueue_status in {"completed", "complete"} or repair_submit_status in {"completed", "complete"})
+    active_repair_work = repair_work_started or repair_workers_started
+    terminal_repair_conflict = final_complete is False or active_repair_work
+    active_production_phase = enqueue_status in {"in_progress", "running"} or submit_status in {"in_progress", "running"}
+    failed_production_phase = enqueue_status in {"failed", "error", "cancelled", "canceled"} or submit_status in {"failed", "error", "cancelled", "canceled"}
+    contradictory_terminal_evidence = terminal_success and (terminal_repair_conflict or blocked_evidence or active_production_phase or failed_production_phase)
     if invalid_local_artifact:
         state = "FAILED_REVIEW_REQUIRED"
         if final_manifest_error or finish_report_error:
@@ -623,19 +683,32 @@ def evaluate_lifecycle_state(
     elif cancellation_report_path is not None:
         state = "CANCELLED"
         legacy_outcome = "cancelled"
+    elif terminal_success:
+        state = "COMPLETE"
+        legacy_outcome = "finished" if finish_ok is True else "finalized_complete"
     elif repair_workers_started or repair_work_started:
         state = "REPAIR_RUNNING"
         legacy_outcome = "repair_running"
         missing_facts.extend(["repair_queue_depth", "active_repair_worker_count"])
-    elif terminal_success:
-        state = "COMPLETE"
-        legacy_outcome = "finished" if finish_ok is True else "finalized_complete"
+    elif repair_work_completed:
+        state = "DRAINING"
+        legacy_outcome = "in_progress"
+        missing_facts.extend(["repair_queue_depth", "active_repair_worker_count", "final_manifest_complete"])
     elif repair_evidence:
         state = "NEEDS_REPAIR"
         legacy_outcome = "repair_needed"
-    elif blocked_evidence:
+    elif durable_blocked_evidence:
         state = "BLOCKED"
         legacy_outcome = "blocked"
+    elif finish_blocked_evidence:
+        state = "DRAINING"
+        legacy_outcome = "in_progress"
+        warnings.append({"code": "previous_finish_blocked", "message": "A prior finish attempt was blocked; rerun finish to refresh live drain checks."})
+    elif finish_ok is True and final_complete is not True:
+        state = "DRAINING"
+        legacy_outcome = "in_progress"
+        missing_facts.append("final_manifest_complete")
+        warnings.append({"code": "finish_report_not_terminal", "message": "A successful finish report without durable terminal evidence still requires mutating finish/final manifest confirmation."})
     elif final_manifest is not None or finish_report is not None:
         state = "FINALIZING"
         legacy_outcome = "in_progress"
@@ -643,10 +716,35 @@ def evaluate_lifecycle_state(
             missing_facts.append("final_manifest_complete")
         if not isinstance(finish_ok, bool):
             missing_facts.append("finish_report_ok")
-    elif submit_status in {"completed", "complete"} and ((task_status_count or 0) > 0 or (outputs_count or 0) > 0):
+    elif failed_production_phase:
+        state = "BLOCKED"
+        legacy_outcome = "blocked"
+        warnings.append({"code": "production_phase_failed", "message": "A production enqueue or worker-submit phase failed or was cancelled."})
+    elif production_count is None and enqueue_status is None and not submit_phase_present and (canary_collect_status in {"in_progress", "running"} or canary_submit_status in {"completed", "complete"}):
+        state = "CANARY_COLLECTING"
+        legacy_outcome = "in_progress"
+        missing_facts.append("canary_summary_count")
+    elif (
+        production_count is None
+        and enqueue_status is None
+        and not submit_phase_present
+        and (canary_enqueue_status in {"in_progress", "running", "completed", "complete"} or canary_submit_status in {"in_progress", "running"})
+    ):
+        state = "CANARY_RUNNING"
+        legacy_outcome = "in_progress"
+        missing_facts.extend(["canary_queue_depth", "active_canary_worker_count"])
+    elif canary_count is not None and production_count is None:
+        state = "CANARY_MATERIALIZED"
+        legacy_outcome = "canary_materialized"
+        missing_facts.append("enqueue_canary_tasks_status")
+    elif submit_status in {"completed", "complete"} or (submit_status is None and submit_phase_present):
         state = "DRAINING"
         legacy_outcome = "in_progress"
         missing_facts.extend(["source_queue_depth", "dlq_queue_depth", "active_worker_count", "final_manifest_complete"])
+        if submit_status is None:
+            missing_facts.append("submit_workers_status")
+        if task_status_count is None and outputs_count is None:
+            missing_facts.append("task_status_or_output_progress")
     elif submit_status in {"in_progress", "running", "completed", "complete"}:
         state = "WORKERS_RUNNING"
         legacy_outcome = "in_progress"
@@ -657,7 +755,7 @@ def evaluate_lifecycle_state(
         missing_facts.append("submit_workers_status")
     elif plan_status == "ready" or production_count is not None:
         state = "PLAN_READY"
-        legacy_outcome = "ready_to_finish"
+        legacy_outcome = "plan_ready"
         if production_count is None:
             missing_facts.append("production_task_count")
     elif context.plan:
@@ -670,7 +768,7 @@ def evaluate_lifecycle_state(
         missing_facts.append("plan_status")
         warnings.append({"code": "insufficient_local_artifacts", "message": "run_state.json exists but does not contain plan or progress evidence"})
 
-    if context.production_tasks_jsonl is None and state not in {"NEW", "FAILED_REVIEW_REQUIRED", "COMPLETE"}:
+    if context.production_tasks_jsonl is None and state not in {"NEW", "FAILED_REVIEW_REQUIRED", "COMPLETE", "CANARY_MATERIALIZED", "CANARY_RUNNING", "CANARY_COLLECTING"}:
         missing_facts.append("production_tasks_jsonl")
 
     safe_actions, unsafe_actions, recommended_commands = _base_state_actions(state, run_id, artifact_root)

@@ -2164,7 +2164,7 @@ def cmd_lane_manager(args: argparse.Namespace) -> int:
 
 def _format_lifecycle_value(value: Any) -> str:
     if isinstance(value, list):
-        return " ".join(str(part) for part in value)
+        return _shell_command(value)
     if isinstance(value, dict):
         command = value.get("command")
         action = value.get("action")
@@ -2530,11 +2530,12 @@ def _run_status_report(run_id: str | None, artifact_dir: Path | None) -> dict[st
 
 def _evaluate_local_lifecycle_state(run_id: str | None, artifact_dir: Path | str | None) -> tuple[RunContext | None, dict[str, Any]]:
     context: RunContext | None
+    resolved_artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
     try:
-        context = load_run_context(run_id, artifact_dir)
+        context = load_run_context(run_id, resolved_artifact_dir)
     except SystemExit:
         context = None
-    lifecycle_state = evaluate_lifecycle_state(context, run_id=run_id, artifact_dir=artifact_dir)
+    lifecycle_state = evaluate_lifecycle_state(context, run_id=run_id, artifact_dir=resolved_artifact_dir)
     return context, lifecycle_state
 
 
@@ -2562,24 +2563,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     job_queue = getattr(args, "job_queue", None) or (context.batch_job_queue if context is not None else None)
     output_prefix = getattr(args, "output_prefix", None) or (context.output_prefix if context is not None else None)
     region = getattr(args, "region", None) or (context.region if context is not None else None)
-    if from_state:
-        report = {
-            "schema": "sweetspot.status.v1",
-            "checked_at": iso_now(),
-            "run": run_report,
-            "run_context": context.as_report() if context is not None else None,
-            "region": region,
-            "identity": None,
-            "queues": {},
-            "batch": None,
-            "output_s3": None,
-            "lifecycle_state": lifecycle_state,
-        }
-        if args.format == "table":
-            _print_status_table(report)
-        else:
-            print(json.dumps(report, indent=2, sort_keys=True))
-        return 0
     needs_aws = bool(queue_url or dlq_url or job_queue or output_prefix or (run_id is None and artifact_dir is None))
     session = boto3.Session(profile_name=args.profile, region_name=region) if needs_aws else None
     identity: dict[str, Any] | None = None
@@ -2626,6 +2609,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         "batch": batch_status,
         "output_s3": output_s3,
     }
+    if from_state:
+        report["lifecycle_state"] = lifecycle_state
     if args.format == "table":
         _print_status_table(report)
     else:
@@ -2786,7 +2771,7 @@ def _build_lifecycle_explain_report(context: RunContext, lifecycle_state: dict[s
         "warnings": lifecycle_state.get("warnings") or [],
         "missing_facts": lifecycle_state.get("missing_facts") or [],
         "evidence": lifecycle_state.get("evidence") or [],
-        "next_actions": lifecycle_state.get("recommended_commands") or [],
+        "next_actions": [_shell_command(command) for command in lifecycle_state.get("recommended_commands") or []],
     }
 
 
@@ -2820,8 +2805,28 @@ def cmd_explain(args: argparse.Namespace) -> int:
     artifact_dir = getattr(args, "artifact_dir", None)
     context, lifecycle_state = _evaluate_local_lifecycle_state(run_id, artifact_dir)
     if context is None:
-        raise SystemExit("explain --from-state requires a readable run_state.json")
-    report = _build_lifecycle_explain_report(context, lifecycle_state)
+        report = {
+            "schema": "sweetspot.lifecycle_explain.v1",
+            "generated_at": lifecycle_state.get("generated_at") or iso_now(),
+            "run_id": lifecycle_state.get("run_id") or run_id,
+            "outcome": lifecycle_state.get("legacy_outcome") or lifecycle_state.get("state"),
+            "state": lifecycle_state.get("state"),
+            "safe_actions": lifecycle_state.get("safe_actions") or [],
+            "unsafe_actions": lifecycle_state.get("unsafe_actions") or [],
+            "recommended_commands": lifecycle_state.get("recommended_commands") or [],
+            "lifecycle_state": lifecycle_state,
+            "run_context": None,
+            "run": None,
+            "phases": [],
+            "finalizer": None,
+            "finish": None,
+            "warnings": lifecycle_state.get("warnings") or [],
+            "missing_facts": lifecycle_state.get("missing_facts") or [],
+            "evidence": lifecycle_state.get("evidence") or [],
+            "next_actions": [_shell_command(command) for command in lifecycle_state.get("recommended_commands") or []],
+        }
+    else:
+        report = _build_lifecycle_explain_report(context, lifecycle_state)
     if args.format == "text":
         _print_lifecycle_text(report)
     else:
@@ -2909,12 +2914,10 @@ def _lifecycle_action_refusal_report(context: RunContext, lifecycle: dict[str, A
 def _guard_lifecycle_from_state_action(args: argparse.Namespace, requested_action: str) -> tuple[RunContext, dict[str, Any], dict[str, Any] | None]:
     context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
     lifecycle = evaluate_lifecycle_state(context)
-    safe_actions = {
-        str(action.get("action"))
-        for action in lifecycle.get("safe_actions", [])
-        if isinstance(action, dict) and action.get("action")
-    }
+    safe_actions = {str(action.get("action")) for action in lifecycle.get("safe_actions", []) if isinstance(action, dict) and action.get("action")}
     if requested_action in safe_actions:
+        return context, lifecycle, None
+    if requested_action in {"finish", "finish_dry_run"} and lifecycle.get("state") == "DRAINING":
         return context, lifecycle, None
     return context, lifecycle, _lifecycle_action_refusal_report(context, lifecycle, requested_action)
 
@@ -2922,11 +2925,14 @@ def _guard_lifecycle_from_state_action(args: argparse.Namespace, requested_actio
 def cmd_cleanup(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "from_state", False)):
         raise SystemExit("cleanup currently requires --from-state")
-    requested_action = "cleanup" if bool(getattr(args, "apply", False)) else "cleanup_dry_run"
-    context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, requested_action)
-    if refusal is not None:
-        print(json.dumps(refusal, indent=2, sort_keys=True))
-        return 2
+    apply_cleanup = bool(getattr(args, "apply", False))
+    if apply_cleanup:
+        context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, "cleanup")
+        if refusal is not None:
+            print(json.dumps(refusal, indent=2, sort_keys=True))
+            return 2
+    else:
+        context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
     region = getattr(args, "region", None) or context.region
     session = boto3.Session(profile_name=getattr(args, "profile", None), region_name=region)
     blockers: list[dict[str, Any]] = []
@@ -3699,6 +3705,22 @@ def cmd_finish(args: argparse.Namespace) -> int:
     if refusal is not None:
         print(json.dumps(refusal, indent=2, sort_keys=True))
         return 2
+    if requested_action in {"finish", "finish_dry_run"}:
+        missing_live_checks = []
+        if not context.queue_url:
+            missing_live_checks.append("source_queue_url")
+        if not context.dlq_url:
+            missing_live_checks.append("dlq_url")
+        if not context.batch_job_queue:
+            missing_live_checks.append("batch_job_queue")
+        if not context.job_name_prefix:
+            missing_live_checks.append("job_name_prefix")
+        if missing_live_checks:
+            report = _lifecycle_action_refusal_report(context, _lifecycle, requested_action)
+            report["message"] = "finish --from-state requires recorded source queue, DLQ, Batch job queue, and worker job-name prefix bindings so live drain checks can run."
+            report["missing_facts"] = sorted(set((report.get("missing_facts") or []) + missing_live_checks))
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 2
     region = getattr(args, "region", None) or context.region
     session = boto3.Session(profile_name=getattr(args, "profile", None), region_name=region)
     queues: dict[str, Any] = {}
@@ -3760,6 +3782,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
         "run_id": context.run_id,
         "run_context": context.as_report(),
         "region": region,
+        "dry_run": bool(getattr(args, "dry_run", False)),
         "queues": queues,
         "batch": batch_status,
         "output_s3": output_s3,
