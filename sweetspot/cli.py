@@ -2469,6 +2469,16 @@ def _run_status_report(run_id: str | None, artifact_dir: Path | None) -> dict[st
     }
 
 
+def _evaluate_local_lifecycle_state(run_id: str | None, artifact_dir: Path | str | None) -> tuple[RunContext | None, dict[str, Any]]:
+    context: RunContext | None
+    try:
+        context = load_run_context(run_id, artifact_dir)
+    except SystemExit:
+        context = None
+    lifecycle_state = evaluate_lifecycle_state(context, run_id=run_id, artifact_dir=artifact_dir)
+    return context, lifecycle_state
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     run_id = getattr(args, "run_id", None)
     artifact_dir = getattr(args, "artifact_dir", None)
@@ -2476,11 +2486,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     context: RunContext | None = None
     lifecycle_state: dict[str, Any] | None = None
     if from_state:
-        try:
-            context = load_run_context(run_id, artifact_dir)
-        except SystemExit:
-            context = None
-        lifecycle_state = evaluate_lifecycle_state(context, run_id=run_id, artifact_dir=artifact_dir)
+        context, lifecycle_state = _evaluate_local_lifecycle_state(run_id, artifact_dir)
     if context is not None:
         run_id = context.run_id
         artifact_dir = context.artifact_dir
@@ -2672,6 +2678,59 @@ def _build_lifecycle_report(context: RunContext) -> dict[str, Any]:
     }
 
 
+def _build_lifecycle_explain_report(context: RunContext, lifecycle_state: dict[str, Any]) -> dict[str, Any]:
+    run_report = _run_status_report(context.run_id, context.artifact_dir)
+    final_manifest = _load_optional_json(context.final_manifest_json)
+    finish_report = _load_optional_json(context.finish_report_json)
+    phases_raw = context.run_state.get("phases")
+    phases = [_phase_digest(phase) for phase in phases_raw if isinstance(phase, dict)] if isinstance(phases_raw, list) else []
+    finalizer = None
+    if final_manifest is not None:
+        finalizer = {
+            "final_manifest_json": str(context.final_manifest_json) if context.final_manifest_json else None,
+            "finalized_at": final_manifest.get("finalized_at"),
+            "task_count": final_manifest.get("task_count"),
+            "done_count": final_manifest.get("done_count"),
+            "output_count": final_manifest.get("output_count"),
+            "missing_count": final_manifest.get("missing_count"),
+            "repair_task_count": final_manifest.get("repair_task_count"),
+            "complete": final_manifest.get("complete"),
+            "ready_s3": final_manifest.get("ready_s3"),
+            "final_manifest_s3": final_manifest.get("final_manifest_s3"),
+        }
+    finish = None
+    if finish_report is not None:
+        finish = {
+            "finish_report_json": str(context.finish_report_json) if context.finish_report_json else None,
+            "checked_at": finish_report.get("checked_at"),
+            "ok": finish_report.get("ok"),
+            "blocked": finish_report.get("blocked"),
+            "blockers": finish_report.get("blockers") or [],
+            "cleanup_recommendation": finish_report.get("cleanup_recommendation"),
+        }
+    state = lifecycle_state.get("state")
+    return {
+        "schema": "sweetspot.lifecycle_explain.v1",
+        "generated_at": lifecycle_state.get("generated_at") or iso_now(),
+        "run_id": context.run_id,
+        "outcome": lifecycle_state.get("legacy_outcome") or state,
+        "state": state,
+        "safe_actions": lifecycle_state.get("safe_actions") or [],
+        "unsafe_actions": lifecycle_state.get("unsafe_actions") or [],
+        "recommended_commands": lifecycle_state.get("recommended_commands") or [],
+        "lifecycle_state": lifecycle_state,
+        "run_context": context.as_report(),
+        "run": run_report,
+        "phases": phases,
+        "finalizer": finalizer,
+        "finish": finish,
+        "warnings": lifecycle_state.get("warnings") or [],
+        "missing_facts": lifecycle_state.get("missing_facts") or [],
+        "evidence": lifecycle_state.get("evidence") or [],
+        "next_actions": lifecycle_state.get("recommended_commands") or [],
+    }
+
+
 def _print_lifecycle_text(report: dict[str, Any]) -> None:
     print(f"SweetSpot lifecycle: {report['run_id']}")
     print(f"outcome: {report['outcome']}")
@@ -2703,8 +2762,12 @@ def _print_lifecycle_text(report: dict[str, Any]) -> None:
 def cmd_explain(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "from_state", False)):
         raise SystemExit("explain currently requires --from-state")
-    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
-    report = _build_lifecycle_report(context)
+    run_id = getattr(args, "run_id", None)
+    artifact_dir = getattr(args, "artifact_dir", None)
+    context, lifecycle_state = _evaluate_local_lifecycle_state(run_id, artifact_dir)
+    if context is None:
+        raise SystemExit("explain --from-state requires a readable run_state.json")
+    report = _build_lifecycle_explain_report(context, lifecycle_state)
     if args.format == "text":
         _print_lifecycle_text(report)
     else:
