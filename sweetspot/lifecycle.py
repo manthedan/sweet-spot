@@ -337,8 +337,8 @@ def _commands_for(run_id: str | None, artifact_dir: Path | None) -> dict[str, li
         "finish": ["sweetspot", "finish", rid, "--from-state", *artifact_arg],
         "finish_dry_run": ["sweetspot", "finish", rid, "--from-state", *artifact_arg, "--dry-run"],
         "cleanup_dry_run": ["sweetspot", "cleanup", rid, "--from-state", *artifact_arg],
-        "cleanup": ["sweetspot", "cleanup", rid, "--from-state", *artifact_arg, "--apply"],
-        "repair_plan": ["sweetspot", "repair-plan", rid, "--from-state", *artifact_arg],
+        "cleanup_write_plan": ["sweetspot", "cleanup", rid, "--from-state", *artifact_arg, "--write-plan"],
+        "repair": ["sweetspot", "repair", rid, "--from-state", *artifact_arg],
     }
 
 
@@ -420,7 +420,7 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
             [
                 _action("status", commands["status"], "read final run state"),
                 _action("cleanup_dry_run", commands["cleanup_dry_run"], "completed runs may be inspected for guarded cleanup"),
-                _action("cleanup", commands["cleanup"], "completed runs may run guarded cleanup after live safety checks pass"),
+                _action("cleanup_write_plan", commands["cleanup_write_plan"], "completed runs may write a local cleanup plan after live safety checks pass"),
             ]
         )
         unsafe.append(_unsafe("repair", "successful completion evidence is present", "NEEDS_REPAIR"))
@@ -428,7 +428,7 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
     elif state == "NEEDS_REPAIR":
         safe.extend(
             [
-                _action("repair_plan", commands["repair_plan"], "finalizer evidence indicates repairable missing or failed outputs"),
+                _action("repair", commands["repair"], "finalizer evidence indicates repairable missing or failed outputs"),
                 _action("finish_dry_run", commands["finish_dry_run"], "rerun finalization only as a guarded dry-run after repair evidence is reviewed"),
             ]
         )
@@ -439,7 +439,7 @@ def _base_state_actions(state: str, run_id: str | None, artifact_dir: Path | Non
                 _unsafe("cleanup", "repair inputs may still be required", "COMPLETE"),
             ]
         )
-        recommended.append(commands["repair_plan"])
+        recommended.append(commands["repair"])
     elif state == "REPAIR_RUNNING":
         safe.append(_action("status", commands["status"], "repair work should be monitored before finalization"))
         unsafe.append(_unsafe("cleanup", "repair work may still be running", "COMPLETE"))

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sweetspot.bootstrap_plan import BOOTSTRAP_PLAN_SCHEMA_V1, render_bootstrap_plan, render_opentofu_bootstrap_plan
+from sweetspot.bootstrap_plan import BOOTSTRAP_PLAN_SCHEMA_V1, _opentofu_files, render_bootstrap_plan, render_opentofu_bootstrap_plan
 from sweetspot.setup import SWEETSPOT_CONFIG_PATH, load_setup, scan_for_secrets, setup_to_dict, write_project_context
 
 
@@ -43,13 +43,15 @@ class BootstrapPlanContractTests(unittest.TestCase):
         self.assertEqual(plan["stderr_summary"], [])
         self.assertEqual(plan["intent"]["schema"], "sweetspot.bootstrap.intent.v1")
         self.assertEqual(plan["intent"]["auth"], {"method": "profile", "reference": "sweetspot-dev"})
+        self.assertEqual(plan["intent"]["resource_names"]["input_prefix"], "manifests/tasks.jsonl")
         groups = {group["group"]: group["resources"] for group in plan["resource_inventory"]}
         self.assertEqual(set(groups), {"iam", "batch", "sqs", "ecr", "s3", "logs", "outputs"})
         for group in ("iam", "batch", "sqs", "ecr", "s3", "logs", "outputs"):
             self.assertTrue(groups[group], group)
         all_resource_names = {resource["name"] for resources in groups.values() for resource in resources if "name" in resource}
-        self.assertIn("example-batch-project-bootstrap-operator-role", all_resource_names)
+        self.assertNotIn("example-batch-project-bootstrap-operator-role", all_resource_names)
         self.assertIn("example-batch-project-worker-task-role", all_resource_names)
+        self.assertIn("example-batch-project-x86_64-compute-spot-fleet-role", all_resource_names)
         self.assertIn("example-batch-project-x86_64-compute", all_resource_names)
         self.assertIn("example-batch-project-worker", all_resource_names)
         self.assertIn("example-batch-project-work-queue", all_resource_names)
@@ -121,7 +123,7 @@ class BootstrapPlanContractTests(unittest.TestCase):
         self.assertEqual(first, second)
         outputs = {resource["name"]: resource["value"] for group in first["resource_inventory"] if group["group"] == "outputs" for resource in group["resources"]}
         self.assertEqual(outputs["batch_job_queue"], "example-batch-project-x86_64-job-queue")
-        self.assertEqual(outputs["operator_role_arn"], "${aws_iam_role.operator_role.arn}")
+        self.assertNotIn("operator_role_arn", outputs)
         self.assertIn("${var.worker_image_sha256}", outputs["worker_image_digest"])
 
     def test_renderer_is_pure_and_does_not_execute_aws_or_opentofu(self) -> None:
@@ -173,15 +175,42 @@ class BootstrapPlanContractTests(unittest.TestCase):
         )
         self.assertIn('resource "aws_batch_job_queue" "job_queue"', rendered[".sweetspot/infra/main.tf"])
         self.assertIn('resource "aws_iam_instance_profile" "ecs_instance_profile"', rendered[".sweetspot/infra/main.tf"])
-        self.assertIn('type                = "EC2"', rendered[".sweetspot/infra/main.tf"])
-        self.assertNotIn('type                = "SPOT"', rendered[".sweetspot/infra/main.tf"])
+        self.assertNotIn('resource "aws_iam_role" "operator_role"', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('type                = "SPOT"', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('allocation_strategy = "SPOT_PRICE_CAPACITY_OPTIMIZED"', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('resource "aws_iam_role" "spot_fleet_role"', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn("spot_iam_fleet_role = aws_iam_role.spot_fleet_role.arn", rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('input_prefix_normalized  = trimsuffix(var.input_prefix, "/")', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('input_list_prefixes      = local.input_prefix_normalized == "" ? ["*"]', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('output_object_arns       = local.output_prefix_normalized == "" ? ["arn:aws:s3:::${var.output_bucket}/*"]', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn('"s3:prefix" = local.input_list_prefixes', rendered[".sweetspot/infra/main.tf"])
+        self.assertIn("Resource = local.output_object_arns", rendered[".sweetspot/infra/main.tf"])
+        self.assertNotIn('Resource = ["arn:aws:s3:::${var.input_bucket}", "arn:aws:s3:::${var.input_bucket}/*"]', rendered[".sweetspot/infra/main.tf"])
+        self.assertNotIn('type                = "EC2"', rendered[".sweetspot/infra/main.tf"])
         self.assertIn("subnets             = data.aws_subnets.default.ids", rendered[".sweetspot/infra/main.tf"])
         self.assertNotIn("subnets            = []", rendered[".sweetspot/infra/main.tf"])
         self.assertIn("profile = var.aws_profile", rendered[".sweetspot/infra/versions.tf"])
         self.assertIn('"aws_region": "us-west-2"', rendered[".sweetspot/infra/terraform.tfvars.json"])
         self.assertIn('"aws_profile": "sweetspot-dev"', rendered[".sweetspot/infra/terraform.tfvars.json"])
+        self.assertIn('"input_prefix": "manifests/tasks.jsonl"', rendered[".sweetspot/infra/terraform.tfvars.json"])
         self.assertIn('"output_prefix": "runs/example"', rendered[".sweetspot/infra/terraform.tfvars.json"])
+        self.assertEqual(first["bootstrap_classification"], "single_account_spot_starter")
+        self.assertTrue(any(finding["code"] == "starter_bootstrap_not_production_topology" for finding in first["findings"]))
         self.assertTrue(all(artifact["status"] == "rendered" for artifact in first["generated_artifacts"] if artifact["name"].startswith("opentofu_")))
+
+    def test_opentofu_tfvars_preserves_legacy_empty_input_prefix(self) -> None:
+        files = _opentofu_files(
+            {
+                "intent": {
+                    "region": "us-west-2",
+                    "auth": {"method": "env", "reference": None},
+                    "resource_names": {"input_bucket": "input-bucket", "input_prefix": "", "output_prefix": "runs/out"},
+                },
+                "resource_inventory": [],
+            }
+        )
+        tfvars = json.loads(files[".sweetspot/infra/terraform.tfvars.json"])
+        self.assertEqual(tfvars["input_prefix"], "")
 
     def test_opentofu_validation_success_records_command_attempts(self) -> None:
         config = load_setup(ROOT / "examples" / "setup.example.yaml")

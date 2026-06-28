@@ -18,6 +18,7 @@ from sweetspot.setup import (
     SWEETSPOT_DOC_PATH,
     WORKER_NOTES_PATH,
     WORKER_SCAFFOLD_PATH,
+    BootstrapResourceNames,
     SetupSpecError,
     bootstrap_intent_from_setup,
     bootstrap_intent_to_dict,
@@ -252,6 +253,7 @@ class SetupModelTests(unittest.TestCase):
                 "job_queue": "example-batch-project-x86_64-job-queue",
                 "container_image": "example-batch-project-x86_64-worker",
                 "input_bucket": "example-sweetspot-input",
+                "input_prefix": "manifests/tasks.jsonl",
                 "output_bucket": "example-sweetspot-output",
                 "output_prefix": "runs/example",
             },
@@ -259,6 +261,18 @@ class SetupModelTests(unittest.TestCase):
         self.assertEqual(scan_for_secrets(report), ())
         self.assertNotIn("AWS_ACCESS_KEY_ID", json.dumps(report))
         self.assertNotIn("opentofu", {error["code"] for error in report["errors"]})
+
+    def test_bootstrap_resource_names_keeps_legacy_input_prefix_optional(self) -> None:
+        names = BootstrapResourceNames(
+            project_slug="legacy",
+            job_definition="legacy-job",
+            job_queue="legacy-queue",
+            container_image="legacy-worker",
+            input_bucket="input-bucket",
+            output_bucket="output-bucket",
+            output_prefix="runs/legacy",
+        )
+        self.assertEqual(names.input_prefix, "")
 
     def test_load_bootstrap_intent_reports_missing_setup_without_throwing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

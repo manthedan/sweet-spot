@@ -132,7 +132,8 @@ class AdminCommandAliasTests(unittest.TestCase):
             self.assertEqual(main(["--help"]), 0)
         text = out.getvalue()
         self.assertIn("Primary controller workflow", text)
-        self.assertIn("{version,init,doctor,bootstrap,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin}", text)
+        self.assertIn("{version,init,doctor,bootstrap,plan,run,monitor,status,explain,finish,postmortem,cleanup,repair,cancel,admin}", text)
+        self.assertNotIn("  finalize  ", text)
         self.assertIn("init", text)
         self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
         self.assertIn("doctor", text)
@@ -2674,6 +2675,29 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(report["run"]["repair_task_count"], 1)
         self.assertIsNone(report["identity"])
 
+    def test_status_from_state_local_only_skips_recorded_aws_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "controller": {"run_queue": {"queue_url": "https://sqs.example/q", "dlq_url": "https://sqs.example/dlq"}, "production_binding": {"target": {"batch_job_queue": "jq"}}},
+                "plan": {"job": {"output_prefix": "s3://bucket/run-1"}},
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--local-only"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["queues"], {})
+        self.assertIsNone(report["identity"])
+        self.assertEqual(report["warnings"][0]["code"], "aws_checks_skipped")
+        self.assertEqual(report["run_context"]["queue_url"], "https://sqs.example/q")
+
     def test_status_run_id_ignores_queue_url_env_for_local_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "artifacts" / "run-1"
@@ -3522,7 +3546,7 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
                     "ok": True,
                     "blocked": False,
                     "blockers": [],
-                    "cleanup_recommendation": f"sweetspot cleanup {run_id} --from-state --dry-run",
+                    "cleanup_recommendation": f"sweetspot cleanup {run_id} --from-state --write-plan",
                 }
             )
             + "\n"
@@ -3768,9 +3792,9 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
         self.assertEqual(report["schema"], "sweetspot.cleanup_plan.v1")
         self.assertTrue(report["ok"])
         self.assertEqual(report["applied_actions"], [])
-        self.assertIn("report-only", report["note"])
+        self.assertIn("local cleanup plan", report["note"])
 
-    def test_cleanup_from_state_apply_runs_guarded_cleanup_for_complete_run(self) -> None:
+    def test_cleanup_from_state_write_plan_runs_guarded_cleanup_for_complete_run(self) -> None:
         class FakeSQS:
             def get_queue_attributes(self, **kwargs):
                 return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
@@ -3799,7 +3823,7 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
             self._write_finished_run(artifact_dir)
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(out):
-                rc = main(["cleanup", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--apply"])
+                rc = main(["cleanup", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--write-plan"])
         self.assertEqual(rc, 0)
         report = json.loads(out.getvalue())
         self.assertEqual(report["schema"], "sweetspot.cleanup_plan.v1")
@@ -4073,6 +4097,177 @@ class QueueAliasTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertEqual(sqs.queue_url, "alias-queue")
         self.assertEqual(report["backlog_used_for_sizing"], 3)
+
+
+class PremergeAlphaHappyPathTests(unittest.TestCase):
+    def test_init_bootstrap_state_closeout_and_cleanup_happy_path(self) -> None:
+        class FakeSQS:
+            def get_queue_attributes(self, **kwargs):
+                return {"Attributes": {"ApproximateNumberOfMessages": "0", "ApproximateNumberOfMessagesNotVisible": "0", "ApproximateNumberOfMessagesDelayed": "0"}}
+
+        class FakePaginator:
+            def paginate(self, **kwargs):
+                return [{"jobSummaryList": []}]
+
+        class FakeBatch:
+            def get_paginator(self, name):
+                return FakePaginator()
+
+        class FakeS3:
+            def list_objects_v2(self, **kwargs):
+                return {"Contents": [{"Key": "runs/alpha/done/t0.done.json", "LastModified": datetime(2026, 1, 1, tzinfo=timezone.utc)}], "IsTruncated": False}
+
+        class FakeSession:
+            def __init__(self, profile_name=None, region_name=None):
+                self.profile_name = profile_name
+                self.region_name = region_name
+
+            def client(self, service, region_name=None):
+                if service == "sqs":
+                    return FakeSQS()
+                if service == "batch":
+                    return FakeBatch()
+                if service == "s3":
+                    return FakeS3()
+                raise AssertionError(service)
+
+        def fake_finalizer(args, **kwargs):
+            args.artifact_dir.mkdir(parents=True, exist_ok=True)
+            (args.artifact_dir / "task_status.jsonl").write_text(json.dumps({"run_id": args.run_id, "task_id": "t0", "status": "done"}) + "\n", encoding="utf-8")
+            (args.artifact_dir / "repair_tasks.jsonl").write_text("", encoding="utf-8")
+            (args.artifact_dir / "outputs.jsonl").write_text(json.dumps({"run_id": args.run_id, "task_id": "t0", "output_s3": "s3://output-bucket/runs/alpha/outputs/t0.json"}) + "\n", encoding="utf-8")
+            manifest = {
+                "schema": "sweetspot.final_manifest.v1",
+                "run_id": args.run_id,
+                "task_count": 1,
+                "done_count": 1,
+                "output_count": 1,
+                "missing_count": 0,
+                "repair_task_count": 0,
+                "complete": True,
+                "ready_s3": "s3://output-bucket/runs/alpha/READY",
+                "final_manifest_s3": "s3://output-bucket/runs/alpha/manifests/final_manifest.json",
+            }
+            (args.artifact_dir / "final_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(json.dumps(manifest))
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            setup_path = root / "setup.yaml"
+            setup_path.write_text(
+                "\n".join(
+                    [
+                        "schema: sweetspot.project.v1",
+                        "project:",
+                        "  name: integration alpha",
+                        "  description: premerge happy path",
+                        "workload:",
+                        "  input_manifest: s3://input-bucket/manifests/tasks.jsonl",
+                        "  output_prefix: s3://output-bucket/runs/alpha",
+                        "  command: [python, worker.py]",
+                        "  architecture: x86_64",
+                        "aws:",
+                        "  region: us-west-2",
+                        "  auth:",
+                        "    method: profile",
+                        "    profile: test-profile",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["init", "--config", str(setup_path), "--project-dir", str(root)]), 0)
+            self.assertTrue((root / ".sweetspot" / "job.json").exists())
+
+            plan_out = io.StringIO()
+            with contextlib.redirect_stdout(plan_out):
+                self.assertEqual(main(["bootstrap", "plan", "--project-dir", str(root), "--format", "json"]), 0)
+            plan = json.loads(plan_out.getvalue())
+            self.assertEqual(plan["status"], "ready")
+            self.assertEqual(plan["bootstrap_classification"], "single_account_spot_starter")
+            self.assertEqual(plan["intent"]["resource_names"]["input_prefix"], "manifests/tasks.jsonl")
+            self.assertTrue((root / ".sweetspot" / "infra" / "main.tf").exists())
+
+            def fake_apply(project_root, *, confirmation, timeout_seconds, tofu_executable):
+                self.assertEqual(Path(project_root), root)
+                self.assertEqual(confirmation, plan["confirmation_token"])
+                deployment = {
+                    "schema": "sweetspot.deployment.v1",
+                    "regions": {
+                        "us-west-2": {
+                            "sqs_queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/integration-alpha-work-queue",
+                            "dlq_url": "https://sqs.us-west-2.amazonaws.com/123456789012/integration-alpha-work-dlq",
+                            "architectures": {
+                                "x86_64": {
+                                    "batch_job_queue": "integration-alpha-x86_64-job-queue",
+                                    "job_definition": "integration-alpha-x86_64-job-definition:1",
+                                    "image": "123456789012.dkr.ecr.us-west-2.amazonaws.com/integration-alpha-worker@sha256:" + "a" * 64,
+                                }
+                            },
+                        }
+                    },
+                    "bootstrap_outputs": {"worker_task_role_arn": "arn:aws:iam::123456789012:role/integration-alpha-worker-task-role"},
+                }
+                (root / ".sweetspot" / "deployment.json").write_text(json.dumps(deployment, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                return {"schema": "sweetspot.bootstrap.apply.v1", "status": "output_written", "category": "applied", "output_completeness": {"complete": True}}
+
+            apply_out = io.StringIO()
+            with patch("sweetspot.cli.apply_bootstrap_plan", side_effect=fake_apply), contextlib.redirect_stdout(apply_out):
+                self.assertEqual(main(["bootstrap", "apply", "--project-dir", str(root), "--confirm", plan["confirmation_token"], "--format", "json"]), 0)
+            self.assertEqual(json.loads(apply_out.getvalue())["status"], "output_written")
+            self.assertTrue((root / ".sweetspot" / "deployment.json").exists())
+
+            run_id = "alpha-run"
+            artifact_dir = root / "artifacts" / run_id
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"schema": "sweetspot.task.v1", "run_id": run_id, "task_id": "t0", "done_s3": "s3://output-bucket/runs/alpha/done/t0.done.json"}) + "\n", encoding="utf-8")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": run_id,
+                "status": "submitted",
+                "artifacts": {"production_task_count": 1, "production_tasks_jsonl": str(tasks), "run_state_json": str(artifact_dir / "run_state.json")},
+                "plan": {"job": {"output_prefix": "s3://output-bucket/runs/alpha"}},
+                "controller": {
+                    "run_queue": {"queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/integration-alpha-work-queue", "dlq_url": "https://sqs.us-west-2.amazonaws.com/123456789012/integration-alpha-work-dlq"},
+                    "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "integration-alpha-x86_64-job-queue"}},
+                },
+                "phases": [
+                    {"name": "enqueue_tasks", "status": "completed", "queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/integration-alpha-work-queue", "sent": 1, "remaining": 0},
+                    {"name": "submit_workers", "status": "completed", "batch_job_queue": "integration-alpha-x86_64-job-queue", "job_name_prefix": f"{run_id}-worker", "active_matching_workers": 0},
+                ],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            status_out = io.StringIO()
+            with contextlib.redirect_stdout(status_out):
+                self.assertEqual(main(["status", run_id, "--artifact-dir", str(artifact_dir), "--from-state", "--local-only"]), 0)
+            status = json.loads(status_out.getvalue())
+            self.assertEqual(status["run"]["run_id"], run_id)
+            self.assertEqual(status["warnings"][0]["code"], "aws_checks_skipped")
+
+            finish_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), patch("sweetspot.cli._run_finalizer_service", side_effect=fake_finalizer), contextlib.redirect_stdout(finish_out):
+                self.assertEqual(main(["finish", run_id, "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run", "--publish-ready"]), 0)
+            finish_report = json.loads(finish_out.getvalue())
+            self.assertTrue(finish_report["ok"])
+            self.assertEqual(finish_report["cleanup_recommendation"], f"sweetspot cleanup {run_id} --from-state --write-plan")
+
+            postmortem_path = artifact_dir / "postmortem.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["postmortem", run_id, "--artifact-dir", str(artifact_dir), "--from-state", "--out", str(postmortem_path)]), 0)
+            self.assertEqual(json.loads(postmortem_path.read_text(encoding="utf-8"))["schema"], "sweetspot.postmortem.v1")
+
+            cleanup_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", FakeSession), contextlib.redirect_stdout(cleanup_out):
+                self.assertEqual(main(["cleanup", run_id, "--artifact-dir", str(artifact_dir), "--from-state", "--write-plan"]), 0)
+            cleanup = json.loads(cleanup_out.getvalue())
+            self.assertTrue(cleanup["ok"])
+            self.assertTrue(cleanup["write_plan"])
+            self.assertEqual(cleanup["applied_actions"], [])
 
 
 class CanaryTests(unittest.TestCase):
@@ -5178,6 +5373,146 @@ class RepairPlanTests(unittest.TestCase):
             self.assertEqual(report["repair_task_count"], 1)
             self.assertEqual(report["sent"], 0)
             self.assertEqual(json.loads(out_path.read_text())["task_id"], "t1")
+
+    def test_repair_from_state_builds_run_scoped_repair_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = root / "artifacts" / "run"
+            artifact_dir.mkdir(parents=True)
+            tasks_path, status_path, _out_path = self._write_repair_inputs(str(artifact_dir))
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run",
+                "artifacts": {"production_tasks_jsonl": str(tasks_path), "task_status_jsonl": str(status_path)},
+                "controller": {"run_queue": {"queue_url": "https://sqs.example/q"}, "production_binding": {"target": {"batch_job_queue": "jq"}}},
+                "phases": [],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairSession()), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["repair", "run", "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["repair_task_count"], 1)
+            self.assertEqual(report["sqs_queue_url"], "https://sqs.example/q")
+            self.assertEqual(report["repair_plan"]["tasks_jsonl"], str(tasks_path))
+            self.assertEqual(report["repair_plan"]["task_status_jsonl"], str(status_path))
+
+    def test_repair_from_state_falls_back_to_finalizer_task_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = root / "artifacts" / "run"
+            finalizer_dir = artifact_dir / "finalizer"
+            finalizer_dir.mkdir(parents=True)
+            tasks_path = artifact_dir / "tasks.jsonl"
+            tasks_path.write_text(json.dumps({"schema": "sweetspot.task.v1", "run_id": "run", "task_id": "t1", "command": [sys.executable, "-c", "pass"], "done_s3": "s3://b/r/t1"}) + "\n")
+            status_path = finalizer_dir / "task_status.jsonl"
+            status_path.write_text(json.dumps({"task_id": "t1", "state": "incomplete"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run",
+                "artifacts": {"production_tasks_jsonl": str(tasks_path)},
+                "controller": {"run_queue": {"queue_url": "https://sqs.example/q"}, "production_binding": {"target": {"batch_job_queue": "jq"}}},
+                "phases": [],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", return_value=FakeRepairSession()), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["repair", "run", "--artifact-dir", str(artifact_dir), "--from-state"]), 0)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["repair_task_count"], 1)
+            self.assertEqual(report["repair_plan"]["task_status_jsonl"], str(status_path))
+
+    def test_repair_from_state_apply_is_lifecycle_guarded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = root / "artifacts" / "run"
+            finalizer_dir = artifact_dir / "finalizer"
+            finalizer_dir.mkdir(parents=True)
+            tasks_path, status_path, _out_path = self._write_repair_inputs(str(artifact_dir))
+            final_manifest = finalizer_dir / "final_manifest.json"
+            final_manifest.write_text(json.dumps({"schema": "sweetspot.final_manifest.v1", "run_id": "run", "complete": True, "task_count": 2, "done_count": 2, "missing_count": 0}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run",
+                "status": "finalized_complete",
+                "artifacts": {"production_tasks_jsonl": str(tasks_path), "task_status_jsonl": str(status_path), "final_manifest": str(final_manifest)},
+                "controller": {"run_queue": {"queue_url": "https://sqs.example/q"}, "production_binding": {"target": {"batch_job_queue": "jq"}}},
+                "phases": [],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+            out = io.StringIO()
+            with patch("sweetspot.cli._run_repair_service", side_effect=AssertionError("repair service must not run")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["repair", "run", "--artifact-dir", str(artifact_dir), "--from-state", "--apply"]), 2)
+            report = json.loads(out.getvalue())
+            self.assertEqual(report["requested_action"], "repair")
+            self.assertEqual(report["state"], "COMPLETE")
+
+    def test_repair_from_state_apply_without_artifact_dir_guards_original_run_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = root / "artifacts" / "run"
+            finalizer_dir = artifact_dir / "finalizer"
+            finalizer_dir.mkdir(parents=True)
+            tasks_path, _status_path, _out_path = self._write_repair_inputs(str(artifact_dir))
+            status_path = finalizer_dir / "task_status.jsonl"
+            status_path.write_text(json.dumps({"task_id": "t1", "state": "incomplete"}) + "\n")
+            final_manifest = finalizer_dir / "final_manifest.json"
+            final_manifest.write_text(json.dumps({"schema": "sweetspot.final_manifest.v1", "run_id": "run", "complete": False, "task_count": 2, "done_count": 1, "missing_count": 1}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run",
+                "artifacts": {"production_tasks_jsonl": str(tasks_path), "final_manifest": str(final_manifest)},
+                "controller": {"run_queue": {"queue_url": "https://sqs.example/q"}, "production_binding": {"target": {"batch_job_queue": "jq"}}},
+                "phases": [],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+            captured = {}
+
+            def fake_repair(args, **kwargs):
+                captured["artifact_dir"] = args.artifact_dir
+                return {"schema": "sweetspot.repair.v1", "run_id": "run", "apply": True, "repair_task_count": 1}
+
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                out = io.StringIO()
+                with patch("sweetspot.cli._run_repair_service", side_effect=fake_repair), contextlib.redirect_stdout(out):
+                    self.assertEqual(main(["repair", "run", "--from-state", "--apply"]), 0)
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(captured["artifact_dir"], Path("artifacts") / "run" / "repair")
+
+    def test_repair_from_state_refuses_conflicting_queue_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = root / "artifacts" / "run"
+            finalizer_dir = artifact_dir / "finalizer"
+            finalizer_dir.mkdir(parents=True)
+            tasks_path, _status_path, _out_path = self._write_repair_inputs(str(artifact_dir))
+            (finalizer_dir / "task_status.jsonl").write_text(json.dumps({"task_id": "t1", "state": "incomplete"}) + "\n")
+            (finalizer_dir / "final_manifest.json").write_text(json.dumps({"schema": "sweetspot.final_manifest.v1", "run_id": "run", "complete": False, "missing_count": 1}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run",
+                "artifacts": {"production_tasks_jsonl": str(tasks_path)},
+                "controller": {"run_queue": {"queue_url": "https://sqs.example/recorded"}, "production_binding": {"target": {"batch_job_queue": "jq"}}},
+                "phases": [],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+            with patch("sweetspot.cli._run_repair_service", side_effect=AssertionError("repair service must not run")), self.assertRaisesRegex(SystemExit, "sqs-queue-url overrides"):
+                main(["repair", "run", "--artifact-dir", str(artifact_dir), "--from-state", "--apply", "--sqs-queue-url", "https://sqs.example/other"])
+
+    def test_repair_requires_job_queue_after_from_state_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_dir = root / "artifacts" / "run"
+            artifact_dir.mkdir(parents=True)
+            tasks_path, status_path, _out_path = self._write_repair_inputs(str(artifact_dir))
+            state = {"schema": "sweetspot.run.v1", "run_id": "run", "artifacts": {"production_tasks_jsonl": str(tasks_path), "task_status_jsonl": str(status_path)}}
+            (artifact_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "recorded batch_job_queue"):
+                main(["repair", "run", "--artifact-dir", str(artifact_dir), "--from-state"])
 
     def test_repair_apply_enqueues_repair_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

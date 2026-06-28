@@ -132,6 +132,7 @@ class BootstrapResourceNames:
     input_bucket: str
     output_bucket: str
     output_prefix: str
+    input_prefix: str = ""
 
 
 @dataclass(frozen=True)
@@ -558,6 +559,7 @@ def bootstrap_intent_to_dict(intent: BootstrapIntent) -> dict[str, Any]:
             "input_bucket": intent.resource_names.input_bucket,
             "output_bucket": intent.resource_names.output_bucket,
             "output_prefix": intent.resource_names.output_prefix,
+            "input_prefix": intent.resource_names.input_prefix,
         }
     return {
         "schema": intent.schema,
@@ -696,6 +698,7 @@ def _bootstrap_intent_report(project: SweetSpotProject | None, errors: list[Boot
         job_queue=f"{slug}-{project.workload.architecture}-job-queue",
         container_image=f"{slug}-{project.workload.architecture}-worker",
         input_bucket=input_uri.netloc,
+        input_prefix=input_uri.path.strip("/"),
         output_bucket=output_uri.netloc,
         output_prefix=output_uri.path.strip("/"),
     )

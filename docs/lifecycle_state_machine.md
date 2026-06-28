@@ -219,9 +219,9 @@ Examples:
 | `PLAN_READY` | `sweetspot status RUN_ID --from-state --artifact-dir artifacts/RUN_ID`; production enqueue command when configured |
 | `WORKERS_RUNNING` | `sweetspot status RUN_ID --from-state --artifact-dir artifacts/RUN_ID`; monitor/supervise command |
 | `DRAINING` | `sweetspot finish RUN_ID --from-state --artifact-dir artifacts/RUN_ID --dry-run` |
-| `NEEDS_REPAIR` | `sweetspot repair-plan RUN_ID --from-state --artifact-dir artifacts/RUN_ID` |
+| `NEEDS_REPAIR` | `sweetspot repair RUN_ID --from-state --artifact-dir artifacts/RUN_ID` |
 | `BLOCKED` | `sweetspot explain RUN_ID --from-state --artifact-dir artifacts/RUN_ID` |
-| `COMPLETE` | `sweetspot cleanup RUN_ID --from-state --artifact-dir artifacts/RUN_ID --dry-run` |
+| `COMPLETE` | `sweetspot cleanup RUN_ID --from-state --artifact-dir artifacts/RUN_ID --write-plan` |
 
 ## Guard policy for finish and cleanup
 

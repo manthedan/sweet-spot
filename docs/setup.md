@@ -159,16 +159,44 @@ sweetspot bootstrap plan --project-dir .sweetspot --format json
 
 The command accepts either the generated `.sweetspot/` directory or the containing project root. It writes `.sweetspot/bootstrap-plan.json` and returns the same JSON report on stdout; guarded apply consumes that exact path, so alternate `--out` paths are rejected for this lifecycle.
 
-`bootstrap plan` is a review-before-apply surface. It renders deterministic OpenTofu configuration files and a deployment-output template, but it does not run `tofu apply`, create AWS resources, create Terraform/OpenTofu state, build or push images, write deployment outputs, contact AWS, or store secrets. Treat the generated files as the exact infrastructure intent to review before the S04 guarded-apply work, not as provisioned infrastructure.
+`bootstrap plan` is a review-before-apply surface. It renders deterministic OpenTofu configuration files and a deployment-output template, but it does not run `tofu apply`, create AWS resources, create Terraform/OpenTofu state, build or push images, write deployment outputs, contact AWS, or store secrets. Treat the generated files as exact starter infrastructure intent to review before guarded apply, not as provisioned infrastructure. The generated OpenTofu is a single-account Spot starter; production deployments should still review lane topology, IAM scope, budgets, alarms, and capacity limits before use. The starter worker task role scopes S3 access to the reviewed `input_prefix` and `output_prefix`; widen those prefixes only when the workload command demonstrably needs additional trusted inputs or outputs.
 
 Generated plan output includes:
 
 | Artifact | Role | Review notes |
 |---|---|---|
 | `.sweetspot/bootstrap-plan.json` | Versioned plan report with `schema: sweetspot.bootstrap.plan.v1`. | Review `status`, `findings`, `resource_inventory`, `generated_artifacts`, `command_attempts`, `stderr_summary`, and `next_actions` before any later mutation work. |
-| `.sweetspot/infra/opentofu/main.tf.json` | Deterministic OpenTofu configuration for IAM roles, Batch compute environment, Batch queue, Batch job definition, SQS queue, ECR repository, S3 bucket references, CloudWatch logs, and outputs. | Review resource names, tags, region, and references. This file is not applied by SweetSpot in S03. |
-| `.sweetspot/infra/opentofu/terraform.tfvars.json` | Sanitized variable values derived from setup intent. | It must not contain access keys, secret keys, session tokens, passwords, private keys, or bearer tokens. Auth remains reference-only. |
-| `.sweetspot/deployment.plan.json` | Review-only deployment-output skeleton using schema `sweetspot.deployment.v1`. | S04 owns guarded apply and writing real deployment outputs; do not use this skeleton as proof that resources exist. |
+| `.sweetspot/infra/versions.tf` | Provider and Terraform/OpenTofu version constraints for the starter bootstrap. | Review provider source/version before validation or apply. |
+| `.sweetspot/infra/variables.tf` | Variable schema for the starter bootstrap. | Review which values remain placeholders before apply. |
+| `.sweetspot/infra/main.tf` | Deterministic OpenTofu configuration for IAM roles, Batch Spot compute environment, Batch queue, Batch job definition, SQS queue, ECR repository, S3 bucket references, CloudWatch logs, and outputs. | Review resource names, tags, region, IAM trust/policy shape, and Spot settings. This file is not applied by `bootstrap plan`. |
+| `.sweetspot/infra/outputs.tf` | Deployment output definitions consumed by guarded apply. | Review output names before accepting generated deployment output. |
+| `.sweetspot/infra/terraform.tfvars.json` | Sanitized variable values derived from setup intent. | It must not contain access keys, secret keys, session tokens, passwords, private keys, or bearer tokens. Auth remains reference-only. |
+| `.sweetspot/deployment.template.json` | Review-only deployment-output skeleton using schema `sweetspot.deployment.v1`. | Guarded apply owns writing real `.sweetspot/deployment.json`; do not use this skeleton as proof that resources exist. |
+
+Starter apply operator permissions should be reviewed as an explicit allow list before any human runs OpenTofu. At minimum the applying principal needs the Terraform state/backend permissions you choose plus the create/describe/update permissions for the generated Batch, SQS, ECR, CloudWatch Logs, EC2 networking lookups, IAM role/profile/policy attachments, and S3 object-prefix checks. Keep `iam:PassRole` scoped to only the generated Batch service role, ECS instance role/profile role, Spot Fleet role, and worker task role, with an `iam:PassedToService` condition limited to the AWS services that consume them (`batch.amazonaws.com`, `ec2.amazonaws.com`, `ecs-tasks.amazonaws.com`, and `spotfleet.amazonaws.com`). Do not grant broad `iam:PassRole` or bucket-wide S3 access just to make the starter apply pass. The PassRole statement should look like this shape after replacing account/project placeholders with the reviewed generated names:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": [
+    "arn:aws:iam::<ACCOUNT_ID>:role/<project>-<arch>-compute-batch-service-role",
+    "arn:aws:iam::<ACCOUNT_ID>:role/<project>-<arch>-compute-ecs-instance-role",
+    "arn:aws:iam::<ACCOUNT_ID>:role/<project>-<arch>-compute-spot-fleet-role",
+    "arn:aws:iam::<ACCOUNT_ID>:role/<project>-worker-task-role"
+  ],
+  "Condition": {
+    "StringEquals": {
+      "iam:PassedToService": [
+        "batch.amazonaws.com",
+        "ec2.amazonaws.com",
+        "ecs-tasks.amazonaws.com",
+        "spotfleet.amazonaws.com"
+      ]
+    }
+  }
+}
+```
 
 Plan report statuses are intentionally reviewable even when setup is not yet deployable:
 
