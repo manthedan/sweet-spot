@@ -3035,13 +3035,15 @@ class FinishTests(unittest.TestCase):
             artifact_dir.mkdir(parents=True)
             tasks = artifact_dir / "production_tasks.jsonl"
             tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            task_status = artifact_dir / "task_status.jsonl"
+            task_status.write_text(json.dumps({"task_id": "t0", "status": "done"}) + "\n")
             state = {
                 "schema": "sweetspot.run.v1",
                 "run_id": "run-1",
-                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "artifacts": {"production_tasks_jsonl": str(tasks), "task_status_jsonl": str(task_status)},
                 "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
                 "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
-                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker"}],
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker"}],
             }
             (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
             out = io.StringIO()
@@ -3050,7 +3052,7 @@ class FinishTests(unittest.TestCase):
                 patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")),
                 contextlib.redirect_stdout(out),
             ):
-                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run"]), 2)
             self.assertTrue((artifact_dir / "finish_report.json").exists())
         report = json.loads(out.getvalue())
         self.assertTrue(report["blocked"])
@@ -3083,13 +3085,15 @@ class FinishTests(unittest.TestCase):
             artifact_dir.mkdir(parents=True)
             tasks = artifact_dir / "production_tasks.jsonl"
             tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            task_status = artifact_dir / "task_status.jsonl"
+            task_status.write_text(json.dumps({"task_id": "t0", "status": "done"}) + "\n")
             state = {
                 "schema": "sweetspot.run.v1",
                 "run_id": "run-1",
-                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "artifacts": {"production_tasks_jsonl": str(tasks), "task_status_jsonl": str(task_status)},
                 "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
                 "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
-                "phases": [{"name": "submit_workers", "job_name_prefix": "other-worker"}],
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "other-worker"}],
             }
             (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
             out = io.StringIO()
@@ -3098,11 +3102,43 @@ class FinishTests(unittest.TestCase):
                 patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")),
                 contextlib.redirect_stdout(out),
             ):
-                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run"]), 2)
         report = json.loads(out.getvalue())
         self.assertEqual(report["blockers"][0]["code"], "invalid_job_name_prefix")
 
-    def test_finish_from_state_runs_finalizer_after_drain_checks(self) -> None:
+    def test_finish_from_state_refuses_mutating_finish_before_aws_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            task_status = artifact_dir / "task_status.jsonl"
+            task_status.write_text(json.dumps({"task_id": "t0", "status": "done"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks), "task_status_jsonl": str(task_status)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")),
+                patch("sweetspot.cli._run_finalizer_service", side_effect=AssertionError("finalizer should not run")),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_action_refusal.v1")
+        self.assertEqual(report["requested_action"], "finish")
+        self.assertEqual(report["state"], "DRAINING")
+        self.assertTrue(report["blocked"])
+        self.assertIn(["sweetspot", "finish", "run-1", "--from-state", "--artifact-dir", str(artifact_dir), "--dry-run"], report["recommended_commands"])
+        self.assertFalse((artifact_dir / "finish_report.json").exists())
+
+    def test_finish_from_state_dry_run_runs_finalizer_after_drain_checks(self) -> None:
         captured = {}
 
         def fake_finalizer(args, **kwargs):
@@ -3144,22 +3180,25 @@ class FinishTests(unittest.TestCase):
             artifact_dir.mkdir(parents=True)
             tasks = artifact_dir / "production_tasks.jsonl"
             tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            task_status = artifact_dir / "task_status.jsonl"
+            task_status.write_text(json.dumps({"task_id": "t0", "status": "done"}) + "\n")
             state = {
                 "schema": "sweetspot.run.v1",
                 "run_id": "run-1",
-                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "artifacts": {"production_tasks_jsonl": str(tasks), "task_status_jsonl": str(task_status)},
                 "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
                 "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
-                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker"}],
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker"}],
             }
             (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.Session", FakeSession), patch("sweetspot.cli._run_finalizer_service", side_effect=fake_finalizer), contextlib.redirect_stdout(out):
-                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--publish-ready"]), 0)
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run", "--publish-ready"]), 0)
             self.assertTrue((artifact_dir / "finish_report.json").exists())
         report = json.loads(out.getvalue())
         self.assertFalse(report["blocked"])
         self.assertTrue(report["finalizer"]["complete"])
+        self.assertTrue(captured["args"].dry_run)
         self.assertTrue(captured["args"].upload)
         self.assertTrue(captured["args"].publish_ready)
         self.assertTrue(captured["args"].require_complete)
@@ -3204,18 +3243,20 @@ class FinishTests(unittest.TestCase):
             artifact_dir.mkdir(parents=True)
             tasks = artifact_dir / "production_tasks.jsonl"
             tasks.write_text(json.dumps({"task_id": "t0"}) + "\n")
+            task_status = artifact_dir / "task_status.jsonl"
+            task_status.write_text(json.dumps({"task_id": "t0", "status": "done"}) + "\n")
             state = {
                 "schema": "sweetspot.run.v1",
                 "run_id": "run-1",
-                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "artifacts": {"production_tasks_jsonl": str(tasks), "task_status_jsonl": str(task_status)},
                 "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
                 "controller": {"run_queue": {"queue_url": "q", "dlq_url": "dlq"}, "production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
-                "phases": [{"name": "submit_workers", "job_name_prefix": "run-1-worker"}],
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker"}],
             }
             (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.Session", FakeSession), patch("sweetspot.cli._run_finalizer_service", side_effect=fake_finalizer), contextlib.redirect_stdout(out):
-                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"]), 2)
+                self.assertEqual(main(["finish", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--dry-run"]), 2)
         report = json.loads(out.getvalue())
         self.assertTrue(report["blocked"])
         self.assertEqual(report["blockers"][0]["code"], "finalizer_failed")
@@ -3489,9 +3530,11 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
         self.assertEqual(status["run"]["production_task_count"], 2)
         self.assertEqual(status["run_context"]["region"], "us-west-2")
         self.assertEqual(status["run_context"]["deployment_sha256"], "9d1ff6ec839907901937b04de16af934b65ddb00e54dd82ece513c5864eef2db")
-        self.assertEqual(status["queues"]["source"]["depth"]["visible"], 0)
-        self.assertEqual(status["batch"]["active_count"], 0)
-        self.assertEqual(status["output_s3"]["done_markers"]["count"], 2)
+        self.assertIn("tiny-leela-cloud-sweetspot-canary-c7g-medium", status["run_context"]["queue_url"])
+        self.assertIn("tiny-leela-cloud-work-dlq", status["run_context"]["dlq_url"])
+        self.assertIsNone(status["batch"])
+        self.assertEqual(status["queues"], {})
+        self.assertIsNone(status["output_s3"])
         self.assertEqual(explain["outcome"], "finished")
         self.assertEqual(explain["finalizer"]["ready_s3"], f"s3://tiny-leela-distributed-ddbb/{run_id}/READY")
         self.assertIn("materialize_production_tasks", [phase["name"] for phase in explain["phases"]])
@@ -3513,7 +3556,8 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
         self.assertEqual(report["outcome"], "finished")
         self.assertEqual(report["finalizer"]["missing_count"], 0)
         self.assertEqual(report["finish"]["ok"], True)
-        self.assertIn("conservative cleanup review", report["next_actions"][-1])
+        self.assertEqual(report["next_actions"][-1][:4], ["sweetspot", "cleanup", "run-1", "--from-state"])
+        self.assertIn("--dry-run", report["next_actions"][-1])
 
     def test_postmortem_from_state_writes_json_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
