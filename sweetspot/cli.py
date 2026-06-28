@@ -2162,6 +2162,61 @@ def cmd_lane_manager(args: argparse.Namespace) -> int:
     return int(lane_manager.main(args.lane_manager_args, prog="sweetspot lane-manager"))
 
 
+def _format_lifecycle_value(value: Any) -> str:
+    if isinstance(value, list):
+        return " ".join(str(part) for part in value)
+    if isinstance(value, dict):
+        command = value.get("command")
+        action = value.get("action")
+        reason = value.get("reason")
+        required_state = value.get("required_state")
+        parts = []
+        if action:
+            parts.append(str(action))
+        if command:
+            parts.append(_format_lifecycle_value(command))
+        if reason:
+            parts.append(f"reason={reason}")
+        if required_state:
+            parts.append(f"required_state={required_state}")
+        if parts:
+            return " | ".join(parts)
+    return str(value)
+
+
+def _format_lifecycle_items(items: Any) -> str:
+    if not items:
+        return "none"
+    if isinstance(items, list):
+        return ", ".join(_format_lifecycle_value(item) for item in items) if items else "none"
+    return _format_lifecycle_value(items)
+
+
+def _print_lifecycle_report_sections(lifecycle_state: dict[str, Any]) -> None:
+    _print_key_values(
+        "lifecycle",
+        {
+            "state": lifecycle_state.get("state"),
+            "legacy_outcome": lifecycle_state.get("legacy_outcome"),
+            "missing_facts": _format_lifecycle_items(lifecycle_state.get("missing_facts")),
+            "warnings": _format_lifecycle_items(lifecycle_state.get("warnings")),
+        },
+    )
+    sections = [
+        ("evidence", lifecycle_state.get("evidence") or []),
+        ("safe_actions", lifecycle_state.get("safe_actions") or []),
+        ("unsafe_actions", lifecycle_state.get("unsafe_actions") or []),
+        ("recommended_commands", lifecycle_state.get("recommended_commands") or []),
+    ]
+    for title, items in sections:
+        print(title + ":")
+        if not items:
+            print("- none")
+            continue
+        for item in items:
+            print(f"- {_format_lifecycle_value(item)}")
+
+
 def _print_status_table(report: dict[str, Any]) -> None:
     identity = report.get("identity") or {}
     run = report.get("run") or {}
@@ -2199,6 +2254,10 @@ def _print_status_table(report: dict[str, Any]) -> None:
             print("status\tcount")
             for status, count in by_status.items():
                 print(f"{_format_table_value(status)}\t{_format_table_value(count)}")
+    lifecycle_state = report.get("lifecycle_state") or {}
+    if lifecycle_state:
+        print()
+        _print_lifecycle_report_sections(lifecycle_state)
     output_s3 = report.get("output_s3") or {}
     if output_s3:
         print()
@@ -2732,31 +2791,26 @@ def _build_lifecycle_explain_report(context: RunContext, lifecycle_state: dict[s
 
 
 def _print_lifecycle_text(report: dict[str, Any]) -> None:
+    lifecycle_state = report.get("lifecycle_state") or report
     print(f"SweetSpot lifecycle: {report['run_id']}")
-    print(f"outcome: {report['outcome']}")
+    print(f"state: {lifecycle_state.get('state')}")
+    print(f"outcome: {lifecycle_state.get('legacy_outcome') or lifecycle_state.get('state')}")
     run = report.get("run") or {}
     if run.get("status"):
         print(f"artifact status: {run['status']}")
-    finalizer = report.get("finalizer") or {}
-    if finalizer:
-        print(
-            "finalizer: "
-            f"complete={finalizer.get('complete')} "
-            f"tasks={finalizer.get('task_count')} "
-            f"done={finalizer.get('done_count')} "
-            f"outputs={finalizer.get('output_count')} "
-            f"missing={finalizer.get('missing_count')}"
-        )
-        if finalizer.get("ready_s3"):
-            print(f"ready: {finalizer['ready_s3']}")
-    finish = report.get("finish") or {}
-    if finish:
-        print(f"finish: ok={finish.get('ok')} blocked={finish.get('blocked')}")
-        for blocker in finish.get("blockers") or []:
-            print(f"  blocker: {blocker.get('code')}")
-    print("next actions:")
-    for action in report.get("next_actions") or []:
-        print(f"- {action}")
+    missing_facts = lifecycle_state.get("missing_facts") or []
+    warnings = lifecycle_state.get("warnings") or []
+    print("missing facts:")
+    if missing_facts:
+        for fact in missing_facts:
+            print(f"- {fact}")
+    else:
+        print("- none")
+    if warnings:
+        print("warnings:")
+        for warning in warnings:
+            print(f"- {warning}")
+    _print_lifecycle_report_sections(lifecycle_state)
 
 
 def cmd_explain(args: argparse.Namespace) -> int:

@@ -2920,6 +2920,9 @@ class StatusTests(unittest.TestCase):
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
                 self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--format", "json"]), 0)
+            table_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(table_out):
+                self.assertEqual(main(["status", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--format", "table"]), 0)
         report = json.loads(out.getvalue())
         self.assertEqual(report["schema"], "sweetspot.status.v1")
         self.assertEqual(report["region"], "us-west-2")
@@ -2933,6 +2936,15 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(lifecycle["state"], "WORKERS_RUNNING")
         self.assertTrue(lifecycle["recommended_commands"])
         self.assertIn("source_queue_depth", lifecycle["missing_facts"])
+        table = table_out.getvalue()
+        self.assertIn("lifecycle", table)
+        self.assertIn("state\tWORKERS_RUNNING", table)
+        self.assertIn("source_queue_depth", table)
+        self.assertIn("evidence:", table)
+        self.assertIn("safe_actions:", table)
+        self.assertIn("unsafe_actions:", table)
+        self.assertIn("recommended_commands:", table)
+        self.assertIn("sweetspot status run-1 --from-state", table)
 
     def test_explain_from_state_wraps_evaluator_report_without_aws_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2955,6 +2967,9 @@ class StatusTests(unittest.TestCase):
             out = io.StringIO()
             with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
                 self.assertEqual(main(["explain", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--format", "json"]), 0)
+            text_out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(text_out):
+                self.assertEqual(main(["explain", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--format", "text"]), 0)
         report = json.loads(out.getvalue())
         self.assertEqual(report["schema"], "sweetspot.lifecycle_explain.v1")
         lifecycle = report["lifecycle_state"]
@@ -2972,6 +2987,15 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(report["recommended_commands"])
         self.assertIn("source_queue_depth", report["missing_facts"])
         self.assertEqual(report["outcome"], "in_progress")
+        text = text_out.getvalue()
+        self.assertIn("state: WORKERS_RUNNING", text)
+        self.assertIn("missing facts:", text)
+        self.assertIn("- source_queue_depth", text)
+        self.assertIn("evidence:", text)
+        self.assertIn("safe_actions:", text)
+        self.assertIn("unsafe_actions:", text)
+        self.assertIn("recommended_commands:", text)
+        self.assertIn("sweetspot status run-1 --from-state", text)
 
 class FinishTests(unittest.TestCase):
     def test_finish_from_state_blocks_when_workers_are_active(self) -> None:
