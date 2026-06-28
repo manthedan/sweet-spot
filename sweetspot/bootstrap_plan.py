@@ -76,6 +76,16 @@ def render_opentofu_bootstrap_plan(
     root = Path(project_dir)
     plan = render_bootstrap_plan(root)
     if plan["status"] == "ready":
+        plan["bootstrap_classification"] = "single_account_spot_starter"
+        plan["findings"].append(
+            {
+                "code": "starter_bootstrap_not_production_topology",
+                "severity": "warning",
+                "field_path": "$.bootstrap_classification",
+                "message": "Generated OpenTofu is a single-account Spot starter, not the full production multi-lane SweetSpot topology.",
+            }
+        )
+        plan["next_actions"].append("Review and harden the starter OpenTofu before treating it as production infrastructure.")
         files = _opentofu_files(plan)
         if plan.get("expected_deployment") is not None:
             files[".sweetspot/deployment.template.json"] = _json_text(plan["expected_deployment"])
@@ -85,6 +95,7 @@ def render_opentofu_bootstrap_plan(
             "Review .sweetspot/infra/ and .sweetspot/bootstrap-plan.json before running any infrastructure command.",
             "Run `tofu init` and `tofu validate` locally from .sweetspot/infra when ready; this task never runs apply.",
             "Fill account-specific tfvars such as aws_account_id and worker_image_sha256 outside source control before applying manually.",
+            "Treat this as a single-account Spot starter; production deployments should review lane topology, IAM scope, budgets, alarms, and capacity limits.",
         ]
 
     plan["opentofu"] = {
@@ -170,6 +181,7 @@ def _opentofu_files(plan: dict[str, Any]) -> dict[str, str]:
         "aws_profile": auth_reference if auth_method in {"profile", "sso"} and auth_reference and not auth_reference.startswith("AWS SSO session") else "",
         "aws_role_arn": auth_reference if auth_method == "role" else "",
         "input_bucket": names.get("input_bucket", {}).get("name", "replace-me-input-bucket"),
+        "input_prefix": resource_names["input_prefix"] if "input_prefix" in resource_names else "manifests/",
         "output_bucket": names.get("output_bucket", {}).get("name", "replace-me-output-bucket"),
         "output_prefix": resource_names.get("output_prefix") or "runs/",
         "worker_image_sha256": "replace-with-worker-image-digest",
@@ -248,6 +260,11 @@ variable "input_bucket" {
   type        = string
 }
 
+variable "input_prefix" {
+  description = "S3 key or prefix containing the reviewed input manifest/workload inputs."
+  type        = string
+}
+
 variable "output_bucket" {
   description = "S3 bucket or bucket reference for SweetSpot output."
   type        = string
@@ -315,9 +332,14 @@ data "aws_iam_policy_document" "ec2_assume_role" {{
   }}
 }}
 
-resource "aws_iam_role" "operator_role" {{
-  name               = "{name('operator_role', 'sweetspot-bootstrap-operator-role')}"
-  assume_role_policy = data.aws_iam_policy_document.batch_assume_role.json
+data "aws_iam_policy_document" "spot_fleet_assume_role" {{
+  statement {{
+    actions = ["sts:AssumeRole"]
+    principals {{
+      type        = "Service"
+      identifiers = ["spotfleet.amazonaws.com"]
+    }}
+  }}
 }}
 
 resource "aws_iam_role" "batch_service_role" {{
@@ -350,14 +372,33 @@ resource "aws_iam_instance_profile" "ecs_instance_profile" {{
   role = aws_iam_role.ecs_instance_role.name
 }}
 
+resource "aws_iam_role" "spot_fleet_role" {{
+  name               = "{name('compute_environment', 'sweetspot-compute')}-spot-fleet-role"
+  assume_role_policy = data.aws_iam_policy_document.spot_fleet_assume_role.json
+}}
+
+resource "aws_iam_role_policy_attachment" "spot_fleet_role" {{
+  role       = aws_iam_role.spot_fleet_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
+}}
+
+locals {{
+  input_prefix_normalized  = trimsuffix(var.input_prefix, "/")
+  output_prefix_normalized = trimsuffix(var.output_prefix, "/")
+  input_list_prefixes      = local.input_prefix_normalized == "" ? ["*"] : [local.input_prefix_normalized, "${{local.input_prefix_normalized}}/*"]
+  input_object_arns        = local.input_prefix_normalized == "" ? ["arn:aws:s3:::${{var.input_bucket}}/*"] : ["arn:aws:s3:::${{var.input_bucket}}/${{local.input_prefix_normalized}}", "arn:aws:s3:::${{var.input_bucket}}/${{local.input_prefix_normalized}}/*"]
+  output_object_arns       = local.output_prefix_normalized == "" ? ["arn:aws:s3:::${{var.output_bucket}}/*"] : ["arn:aws:s3:::${{var.output_bucket}}/${{local.output_prefix_normalized}}", "arn:aws:s3:::${{var.output_bucket}}/${{local.output_prefix_normalized}}/*"]
+}}
+
 resource "aws_iam_role_policy" "worker_task_policy" {{
   name = "{name('worker_task_role', 'sweetspot-worker-task-role')}-policy"
   role = aws_iam_role.worker_task_role.id
   policy = jsonencode({{
     Version = "2012-10-17"
     Statement = [
-      {{ Effect = "Allow", Action = ["s3:GetObject", "s3:ListBucket"], Resource = ["arn:aws:s3:::${{var.input_bucket}}", "arn:aws:s3:::${{var.input_bucket}}/*"] }},
-      {{ Effect = "Allow", Action = ["s3:PutObject", "s3:GetObject"], Resource = ["arn:aws:s3:::${{var.output_bucket}}/${{var.output_prefix}}*"] }},
+      {{ Effect = "Allow", Action = ["s3:ListBucket"], Resource = ["arn:aws:s3:::${{var.input_bucket}}"], Condition = {{ StringLike = {{ "s3:prefix" = local.input_list_prefixes }} }} }},
+      {{ Effect = "Allow", Action = ["s3:GetObject"], Resource = local.input_object_arns }},
+      {{ Effect = "Allow", Action = ["s3:PutObject", "s3:GetObject"], Resource = local.output_object_arns }},
       {{ Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:SendMessage"], Resource = [aws_sqs_queue.queue.arn, aws_sqs_queue.dead_letter_queue.arn] }},
       {{ Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["${{aws_cloudwatch_log_group.worker_log_group.arn}}:*"] }}
     ]
@@ -369,17 +410,18 @@ resource "aws_batch_compute_environment" "compute_environment" {{
   type                     = "MANAGED"
   state                    = "ENABLED"
   compute_resources {{
-    type                = "EC2"
-    allocation_strategy = "BEST_FIT_PROGRESSIVE"
+    type                = "SPOT"
+    allocation_strategy = "SPOT_PRICE_CAPACITY_OPTIMIZED"
     min_vcpus           = 0
     max_vcpus           = 16
     instance_role       = aws_iam_instance_profile.ecs_instance_profile.arn
+    spot_iam_fleet_role = aws_iam_role.spot_fleet_role.arn
     instance_type       = ["optimal"]
     subnets             = data.aws_subnets.default.ids
     security_group_ids  = [data.aws_security_group.default.id]
   }}
   service_role = aws_iam_role.batch_service_role.arn
-  depends_on   = [aws_iam_role_policy_attachment.batch_service_role, aws_iam_role_policy_attachment.ecs_instance_role]
+  depends_on   = [aws_iam_role_policy_attachment.batch_service_role, aws_iam_role_policy_attachment.ecs_instance_role, aws_iam_role_policy_attachment.spot_fleet_role]
 }}
 
 resource "aws_batch_job_queue" "job_queue" {{
@@ -426,7 +468,6 @@ output "batch_job_definition" { value = aws_batch_job_definition.job_definition.
 output "dlq_url" { value = aws_sqs_queue.dead_letter_queue.url }
 output "ecr_repository_url" { value = aws_ecr_repository.worker_repository.repository_url }
 output "log_group" { value = aws_cloudwatch_log_group.worker_log_group.name }
-output "operator_role_arn" { value = aws_iam_role.operator_role.arn }
 output "sqs_queue_url" { value = aws_sqs_queue.queue.url }
 output "worker_image_digest" { value = "${aws_ecr_repository.worker_repository.repository_url}@sha256:${var.worker_image_sha256}" }
 output "worker_task_role_arn" { value = aws_iam_role.worker_task_role.arn }
@@ -597,8 +638,8 @@ def _resource_inventory(intent: BootstrapIntent, names: dict[str, str]) -> list[
         {
             "group": "iam",
             "resources": [
-                _resource("aws_iam_role", "operator_role", names["operator_role"], region="global", purpose="OpenTofu bootstrap operator role", auth_reference=auth_reference),
                 _resource("aws_iam_role", "worker_task_role", names["worker_task_role"], region="global", purpose="AWS Batch worker task role", auth_reference=auth_reference),
+                _resource("aws_iam_role", "spot_fleet_role", f"{names['compute_environment']}-spot-fleet-role", region="global", purpose="Required EC2 Spot Fleet tagging role for AWS Batch Spot compute"),
                 _resource("aws_iam_role_policy", "worker_task_policy", f"{names['worker_task_role']}-policy", region="global", purpose="Least-privilege access to input, output, queue, and logs"),
             ],
         },
@@ -678,7 +719,6 @@ def _deployment_outputs(names: dict[str, str]) -> dict[str, str]:
         "dlq_url": "${aws_sqs_queue.dead_letter_queue.url}",
         "ecr_repository_url": "${aws_ecr_repository.worker_repository.repository_url}",
         "log_group": names["log_group"],
-        "operator_role_arn": "${aws_iam_role.operator_role.arn}",
         "sqs_queue_url": "${aws_sqs_queue.queue.url}",
         "worker_image_digest": "${aws_ecr_repository.worker_repository.repository_url}@sha256:${var.worker_image_sha256}",
         "worker_task_role_arn": "${aws_iam_role.worker_task_role.arn}",
@@ -707,6 +747,7 @@ def _derived_names(intent: BootstrapIntent) -> dict[str, str]:
         "project_slug": project_slug,
         "architecture": architecture,
         "input_bucket": input_bucket,
+        "input_prefix": resource_names.input_prefix if resource_names is not None else "${var.input_prefix}",
         "output_bucket": output_bucket,
         "output_prefix": output_prefix,
         "job_definition": job_definition,
@@ -715,7 +756,6 @@ def _derived_names(intent: BootstrapIntent) -> dict[str, str]:
         "ecr_repository": f"{project_slug}-worker",
         "log_group": f"/aws/batch/sweetspot/{project_slug}",
         "compute_environment": f"{project_slug}-{architecture}-compute",
-        "operator_role": f"{project_slug}-bootstrap-operator-role",
         "worker_task_role": f"{project_slug}-worker-task-role",
         "sqs_queue": f"{project_slug}-work-queue",
         "dead_letter_queue": f"{project_slug}-work-dlq",

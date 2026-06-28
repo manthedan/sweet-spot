@@ -292,6 +292,7 @@ def _tfvars_immutable_mismatches(project_dir: Path, plan: dict[str, Any] | None)
         "aws_profile": auth_reference if auth_method in {"profile", "sso"} and auth_reference and not auth_reference.startswith("AWS SSO session") else "",
         "aws_role_arn": auth_reference if auth_method == "role" else "",
         "input_bucket": resource_names.get("input_bucket"),
+        "input_prefix": resource_names.get("input_prefix"),
         "output_bucket": resource_names.get("output_bucket"),
         "output_prefix": resource_names.get("output_prefix"),
     }
@@ -504,7 +505,6 @@ def _required_opentofu_outputs() -> list[str]:
         "dlq_url",
         "ecr_repository_url",
         "log_group",
-        "operator_role_arn",
         "sqs_queue_url",
         "worker_image_digest",
         "worker_task_role_arn",

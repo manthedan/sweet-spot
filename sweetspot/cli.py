@@ -2563,7 +2563,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     job_queue = getattr(args, "job_queue", None) or (context.batch_job_queue if context is not None else None)
     output_prefix = getattr(args, "output_prefix", None) or (context.output_prefix if context is not None else None)
     region = getattr(args, "region", None) or (context.region if context is not None else None)
-    needs_aws = bool(queue_url or dlq_url or job_queue or output_prefix or (run_id is None and artifact_dir is None))
+    local_only = bool(getattr(args, "local_only", False))
+    needs_aws = bool(queue_url or dlq_url or job_queue or output_prefix or (run_id is None and artifact_dir is None)) and not local_only
+    aws_warnings: list[dict[str, Any]] = []
+    if local_only:
+        aws_warnings.append({"code": "aws_checks_skipped", "message": "status --local-only skipped live SQS, S3, Batch, and STS checks."})
     session = boto3.Session(profile_name=args.profile, region_name=region) if needs_aws else None
     identity: dict[str, Any] | None = None
     if session is not None:
@@ -2571,23 +2575,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         raw_identity = sts.get_caller_identity()
         identity = {"account": raw_identity.get("Account"), "arn": raw_identity.get("Arn"), "user_id": raw_identity.get("UserId")}
     queues: dict[str, Any] = {}
-    if queue_url:
-        assert session is not None
+    if queue_url and session is not None:
         sqs = session.client("sqs", region_name=region)
         queues["source"] = {"queue_url": queue_url, "depth": queue_depth(sqs, queue_url)}
-    if dlq_url:
-        assert session is not None
+    if dlq_url and session is not None:
         sqs = session.client("sqs", region_name=region)
         queues["dlq"] = {"queue_url": dlq_url, "depth": queue_depth(sqs, dlq_url)}
     output_s3: dict[str, Any] | None = None
-    if output_prefix:
-        assert session is not None
+    if output_prefix and session is not None:
         s3 = session.client("s3", region_name=region)
         expected_count = run_report.get("production_task_count") if run_report else None
         output_s3 = {"output_prefix": output_prefix, "done_markers": _s3_done_marker_progress(s3, output_prefix, expected_count)}
     batch_status: dict[str, Any] | None = None
-    if job_queue:
-        assert session is not None
+    if job_queue and session is not None:
         batch = session.client("batch", region_name=region)
         active = active_jobs(batch, job_queue, effective_job_name_prefix)
         by_status = dict(Counter(str(job.get("status")) for job in active).most_common())
@@ -2608,6 +2608,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "queues": queues,
         "batch": batch_status,
         "output_s3": output_s3,
+        "warnings": aws_warnings,
     }
     if from_state:
         report["lifecycle_state"] = lifecycle_state
@@ -2925,9 +2926,9 @@ def _guard_lifecycle_from_state_action(args: argparse.Namespace, requested_actio
 def cmd_cleanup(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "from_state", False)):
         raise SystemExit("cleanup currently requires --from-state")
-    apply_cleanup = bool(getattr(args, "apply", False))
-    if apply_cleanup:
-        context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, "cleanup")
+    write_plan = bool(getattr(args, "write_plan", False) or getattr(args, "apply", False))
+    if write_plan:
+        context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, "cleanup_write_plan")
         if refusal is not None:
             print(json.dumps(refusal, indent=2, sort_keys=True))
             return 2
@@ -2989,8 +2990,9 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         "schema": "sweetspot.cleanup_plan.v1",
         "checked_at": iso_now(),
         "run_id": context.run_id,
+        "write_plan": write_plan,
         "apply_requested": bool(getattr(args, "apply", False)),
-        "dry_run": not bool(getattr(args, "apply", False)),
+        "dry_run": not write_plan,
         "ok": not blockers,
         "blocked": bool(blockers),
         "run_context": context.as_report(),
@@ -2999,7 +3001,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         "blockers": blockers,
         "recommendations": recommendations,
         "applied_actions": [],
-        "note": "This lifecycle cleanup layer is conservative and report-only; destructive queue, DLQ, S3, and Batch capacity mutations remain explicit admin/operator actions.",
+        "note": "This lifecycle cleanup layer writes a local cleanup plan only; destructive queue, DLQ, S3, and Batch capacity mutations remain explicit admin/operator actions.",
     }
     report_path = context.artifact_dir / "cleanup_report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -3789,7 +3791,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
         "finalizer_return_code": finalizer_return_code,
         "finalizer": finalizer_report,
         "blockers": blockers,
-        "cleanup_recommendation": f"sweetspot cleanup {context.run_id} --from-state --dry-run",
+        "cleanup_recommendation": f"sweetspot cleanup {context.run_id} --from-state --write-plan",
     }
     report_path = context.artifact_dir / "finish_report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -4095,7 +4097,49 @@ def cmd_repair_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bind_repair_from_state_args(args: argparse.Namespace) -> None:
+    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    if args.job_queue and context.batch_job_queue and args.job_queue != [context.batch_job_queue]:
+        raise SystemExit("repair --from-state refuses --job-queue overrides that differ from run_state.json")
+    if args.sqs_queue_url and context.queue_url and args.sqs_queue_url != context.queue_url:
+        raise SystemExit("repair --from-state refuses --sqs-queue-url overrides that differ from run_state.json")
+    if args.batch_job_queue and context.batch_job_queue and args.batch_job_queue != context.batch_job_queue:
+        raise SystemExit("repair --from-state refuses --batch-job-queue overrides that differ from run_state.json")
+    if args.job_name_prefix and context.job_name_prefix and args.job_name_prefix != context.job_name_prefix:
+        raise SystemExit("repair --from-state refuses --job-name-prefix overrides that differ from run_state.json")
+    if args.tasks_jsonl is None:
+        args.tasks_jsonl = context.production_tasks_jsonl
+    if args.task_status_jsonl is None:
+        args.task_status_jsonl = context.task_status_jsonl or _first_existing_path([context.artifact_dir / "task_status.jsonl", context.artifact_dir / "finalizer" / "task_status.jsonl"])
+    if args.artifact_dir is None:
+        args.artifact_dir = context.artifact_dir / "repair"
+    if args.region is None:
+        args.region = context.region
+    if not args.job_queue and context.batch_job_queue:
+        args.job_queue = [context.batch_job_queue]
+    if args.job_name_prefix is None and context.job_name_prefix:
+        args.job_name_prefix = context.job_name_prefix
+    if not args.sqs_queue_url and context.queue_url:
+        args.sqs_queue_url = context.queue_url
+    if args.tasks_jsonl is None:
+        raise SystemExit("repair --from-state requires production_tasks_jsonl in run_state.json or --tasks-jsonl")
+    if args.task_status_jsonl is None:
+        raise SystemExit("repair --from-state requires finalizer task_status_jsonl in run_state.json or --task-status-jsonl")
+
+
 def cmd_repair(args: argparse.Namespace) -> int:
+    from_state = bool(getattr(args, "from_state", False))
+    if from_state and bool(getattr(args, "apply", False)):
+        _context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, "repair")
+        if refusal is not None:
+            print(json.dumps(refusal, indent=2, sort_keys=True))
+            return 2
+    if from_state:
+        _bind_repair_from_state_args(args)
+    if args.tasks_jsonl is None or args.task_status_jsonl is None:
+        raise SystemExit("repair requires --tasks-jsonl and --task-status-jsonl, or --from-state with recorded artifacts")
+    if not args.job_queue:
+        raise SystemExit("repair requires --job-queue, or --from-state with a recorded batch_job_queue")
     report = _run_repair_service(
         args,
         read_jsonl=_read_jsonl,
@@ -5027,11 +5071,11 @@ def cmd_bootstrap_apply(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
-PRIMARY_COMMANDS = frozenset({"admin", "bootstrap", "cancel", "cleanup", "doctor", "explain", "finalize", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
+PRIMARY_COMMANDS = frozenset({"admin", "bootstrap", "cancel", "cleanup", "doctor", "explain", "finish", "init", "monitor", "plan", "postmortem", "repair", "run", "status", "version"})
 
 
 def _print_primary_help() -> None:
-    print("usage: sweetspot [--config CONFIG] {version,init,doctor,bootstrap,plan,run,monitor,status,explain,finalize,finish,postmortem,cleanup,repair,cancel,admin} ...")
+    print("usage: sweetspot [--config CONFIG] {version,init,doctor,bootstrap,plan,run,monitor,status,explain,finish,postmortem,cleanup,repair,cancel,admin} ...")
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
@@ -5039,9 +5083,8 @@ def _print_primary_help() -> None:
     print("  doctor    Validate local .sweetspot context with `doctor project` or render bootstrap status with `doctor bootstrap`; legacy AWS checks require explicit AWS flags")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")
-    print("  monitor   Emit non-blocking status/finalize checkpoint commands")
+    print("  monitor   Emit non-blocking status/finish checkpoint commands")
     print("  status    Show run artifacts, queue depth, DLQ depth, active workers, and S3 progress")
-    print("  finalize  Reconstruct finalization from run_state.json or explicit finalizer inputs")
     print("  finish    Run the production closeout checklist from run_state.json")
     print("  explain   Explain reconstructed lifecycle state and next actions")
     print("  postmortem Write a state-driven lifecycle postmortem")
@@ -5082,7 +5125,7 @@ ADMIN_COMMANDS = frozenset(
 CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
     "cancel": {"apply", "job_name_prefix", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
     "cancel-jobs": {"apply", "format", "job_name_regex", "job_queue", "max_jobs", "profile", "reason", "region", "status", "terminate_running"},
-    "cleanup": {"apply", "artifact_dir", "from_state", "max_messages", "profile", "region"},
+    "cleanup": {"apply", "artifact_dir", "from_state", "max_messages", "profile", "region", "write_plan"},
     "cleanup-stale-messages": {"allow_legacy_done_markers", "apply", "max_messages", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
     "derive-canary": {"out_dir", "run_id", "task_count", "tasks_jsonl"},
     "dlq": {"apply", "dlq_url", "format", "profile", "queue_url", "region", "run_id", "visibility_timeout"},
@@ -5156,6 +5199,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "artifact_dir",
         "batch_job_queue",
         "failed_status",
+        "from_state",
         "heartbeat_seconds",
         "include_active",
         "job_definition",
@@ -5246,7 +5290,7 @@ CONFIG_COMMAND_KEYS: dict[str, set[str]] = {
         "wait_interval_seconds",
     },
     "s3-delete-prefix": {"artifact_dir", "completion_marker_s3", "delete", "min_prefix_chars", "prefix", "profile", "region"},
-    "status": {"artifact_dir", "dlq_url", "format", "from_state", "job_name_prefix", "job_queue", "output_prefix", "profile", "queue_url", "region"},
+    "status": {"artifact_dir", "dlq_url", "format", "from_state", "job_name_prefix", "job_queue", "local_only", "output_prefix", "profile", "queue_url", "region"},
     "submit-workers": {
         "allow_legacy_done_markers",
         "allowed_s3_prefix",
@@ -5329,6 +5373,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "canary_summary_jsonl": ("--canary-summary-jsonl", False),
     "input_manifest_jsonl": ("--input-manifest-jsonl", False),
     "log_group": ("--log-group", False),
+    "local_only": ("--local-only", False),
     "log_stream": ("--log-stream", False),
     "max_inline_outputs": ("--max-inline-outputs", False),
     "max_jobs": ("--max-jobs", False),
@@ -5374,6 +5419,7 @@ CONFIG_FLAG_MAP: dict[str, tuple[str, bool]] = {
     "vcpus": ("--vcpus", False),
     "visibility_timeout": ("--visibility-timeout", False),
     "worker_job_name_prefix": ("--worker-job-name-prefix", False),
+    "write_plan": ("--write-plan", False),
     "workers": ("--workers", False),
 }
 
@@ -5752,16 +5798,17 @@ def main(argv: list[str] | None = None) -> int:
         sub,
         "repair",
         help="Dry-run/apply run-scoped repair planning and optional repair-task enqueueing",
-        examples="  sweetspot repair example-run --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --job-queue jq\n  sweetspot repair example-run --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --job-queue jq --sqs-queue-url https://sqs... --apply",
+        examples="  sweetspot repair example-run --from-state\n  sweetspot repair example-run --tasks-jsonl tasks.jsonl --task-status-jsonl artifacts/finalizer/task_status.jsonl --job-queue jq --sqs-queue-url https://sqs... --apply",
     )
     p.add_argument("run_id")
     p.add_argument("--profile")
     p.add_argument("--region")
-    p.add_argument("--tasks-jsonl", type=Path, required=True)
-    p.add_argument("--task-status-jsonl", type=Path, required=True)
+    p.add_argument("--from-state", action="store_true", help="Recover task/status artifacts and run-scoped queue settings from run_state.json")
+    p.add_argument("--tasks-jsonl", type=Path)
+    p.add_argument("--task-status-jsonl", type=Path)
     p.add_argument("--out-jsonl", type=Path)
     p.add_argument("--artifact-dir", type=Path)
-    p.add_argument("--job-queue", action="append", required=True, help="Batch queue to inspect for active/failed jobs; repeatable")
+    p.add_argument("--job-queue", action="append", help="Batch queue to inspect for active/failed jobs; repeatable; with --from-state defaults to recorded queue")
     p.add_argument("--job-name-prefix", help="Run-scoped Batch job-name prefix to inspect; must include RUN_ID. Defaults to RUN_ID.")
     p.add_argument("--active-status", action="append", choices=list(ACTIVE_STATUSES), help="active statuses to exclude; default all active statuses")
     p.add_argument("--failed-status", action="append", choices=["FAILED"], help="failed statuses to classify; default FAILED")
@@ -5798,6 +5845,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job-name-prefix", help="Batch job-name prefix to inspect; with RUN_ID it must start with RUN_ID- and defaults to RUN_ID-")
     p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory; defaults to artifacts/RUN_ID when RUN_ID is provided")
     p.add_argument("--from-state", action="store_true", help="Discover queue, DLQ, Batch queue, job-name prefix, output prefix, and artifact paths from run_state.json")
+    p.add_argument("--local-only", action="store_true", help="Use only local run_state/finalizer artifacts and skip live AWS SQS/S3/Batch/STS checks")
     p.add_argument("--output-prefix", help="Optional S3 output prefix; when set, status counts done markers and estimates remaining work")
     p.add_argument("--format", choices=["json", "table"], default="json")
     p.set_defaults(func=cmd_status)
@@ -5853,7 +5901,7 @@ def main(argv: list[str] | None = None) -> int:
         sub,
         "cleanup",
         help="Plan conservative state-driven lifecycle cleanup from run_state.json",
-        examples="  sweetspot cleanup run-1 --from-state --dry-run\n  sweetspot cleanup run-1 --from-state --apply",
+        examples="  sweetspot cleanup run-1 --from-state --dry-run\n  sweetspot cleanup run-1 --from-state --write-plan",
     )
     p.add_argument("run_id")
     p.add_argument("--profile")
@@ -5861,7 +5909,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--artifact-dir", type=Path, help="Local run artifact directory containing run_state.json; defaults to artifacts/RUN_ID")
     p.add_argument("--from-state", action="store_true", help="Load cleanup targets from run_state.json")
     p.add_argument("--dry-run", action="store_true", help="Preview cleanup recommendations; this is the default")
-    p.add_argument("--apply", action="store_true", help="Request cleanup application; currently emits an evidence report and keeps destructive admin actions explicit")
+    p.add_argument("--write-plan", action="store_true", help="Write cleanup_report.json after lifecycle and live safety checks; does not mutate AWS")
+    p.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--max-messages", type=int, default=100, help="Suggested scan limit for generated stale-message cleanup command")
     p.set_defaults(func=cmd_cleanup)
 

@@ -342,7 +342,7 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertValidReport(report)
         self.assertEqual(report["state"], "COMPLETE")
         self.assertTrue(report["terminal"])
-        self.assertTrue(any(action["action"] == "cleanup" for action in report["safe_actions"]))
+        self.assertTrue(any(action["action"] == "cleanup_write_plan" for action in report["safe_actions"]))
 
     def test_dry_run_finish_report_is_not_terminal_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -461,7 +461,8 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertEqual(report["state"], "NEEDS_REPAIR")
         self.assertEqual(report["legacy_outcome"], "repair_needed")
         self.assertEqual(report["known_facts"]["repair_task_count"], 1)
-        self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "repair-plan", "run-123"])
+        self.assertEqual(report["recommended_commands"][0][:3], ["sweetspot", "repair", "run-123"])
+        self.assertIn("--from-state", report["recommended_commands"][0])
 
     def test_needs_repair_actions_allow_guarded_finish_only_as_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -474,7 +475,7 @@ class LifecycleEvaluatorTests(unittest.TestCase):
 
         safe_by_action = {action["action"]: action for action in report["safe_actions"]}
         unsafe_by_action = {action["action"]: action for action in report["unsafe_actions"]}
-        self.assertIn("repair_plan", safe_by_action)
+        self.assertIn("repair", safe_by_action)
         self.assertIn("finish_dry_run", safe_by_action)
         self.assertIn("--dry-run", safe_by_action["finish_dry_run"]["command"])
         self.assertEqual(unsafe_by_action["mark_complete"]["required_state"], "COMPLETE")

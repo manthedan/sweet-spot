@@ -288,7 +288,6 @@ class BootstrapApplyPersistenceTests(BootstrapApplyGuardContractTests):
             "dlq_url": {"value": "https://sqs.us-west-2.amazonaws.com/123456789012/example-dlq"},
             "ecr_repository_url": {"value": "123456789012.dkr.ecr.us-west-2.amazonaws.com/example"},
             "log_group": {"value": "/aws/batch/sweetspot/example"},
-            "operator_role_arn": {"value": "arn:aws:iam::123456789012:role/example-bootstrap-operator-role"},
             "sqs_queue_url": {"value": "https://sqs.us-west-2.amazonaws.com/123456789012/example"},
             "worker_image_digest": {"value": "123456789012.dkr.ecr.us-west-2.amazonaws.com/example@sha256:" + "a" * 64},
             "worker_task_role_arn": {"value": "arn:aws:iam::123456789012:role/example-worker-task-role"},
