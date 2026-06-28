@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import sweetspot.cli as cli
 
 from sweetspot.lifecycle import (
     LIFECYCLE_STATE_REPORT_REQUIRED_FIELDS,
@@ -420,6 +426,75 @@ class LifecycleEvaluatorTests(unittest.TestCase):
         self.assertTrue(report["review_required"])
         self.assertIn("valid_run_state_json", report["missing_facts"])
         self.assertTrue(any(warning["code"] == "run_context_load_failed" for warning in report["warnings"]))
+
+
+class LifecycleCliGuardTests(unittest.TestCase):
+    def _write_json(self, path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _write_jsonl(self, path: Path, rows: list[dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def _write_run_state(self, artifact_dir: Path, *, phases: list[dict[str, object]] | None = None) -> None:
+        self._write_json(
+            artifact_dir / "run_state.json",
+            {
+                "run_id": "run-123",
+                "plan": {"status": "ready", "tasks": [{"id": "task-1"}]},
+                "controller": {
+                    "run_queue": {"queue_url": "https://sqs.example.invalid/q", "dlq_url": "https://sqs.example.invalid/dlq"},
+                    "production_binding": {"target": {"batch_job_queue": "queue", "region": "us-east-1"}},
+                },
+                "artifacts": {"production_tasks_jsonl": "production_tasks.jsonl"},
+                "phases": phases or [],
+            },
+        )
+        self._write_jsonl(artifact_dir / "production_tasks.jsonl", [{"id": "task-1"}])
+
+    def test_finish_from_state_refuses_unsafe_action_before_aws_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._write_run_state(artifact_dir, phases=[{"name": "submit_workers", "status": "completed"}])
+            self._write_jsonl(artifact_dir / "task_status.jsonl", [{"id": "task-1", "status": "done"}])
+            args = argparse.Namespace(run_id="run-123", artifact_dir=artifact_dir, from_state=True, dry_run=False, region=None, profile=None)
+
+            stdout = io.StringIO()
+            with mock.patch.object(cli.boto3, "Session", side_effect=AssertionError("AWS session should not be constructed")):
+                with contextlib.redirect_stdout(stdout):
+                    rc = cli.cmd_finish(args)
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(rc, 2)
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_action_refusal.v1")
+        self.assertEqual(report["requested_action"], "finish")
+        self.assertEqual(report["state"], "DRAINING")
+        self.assertTrue(report["blocked"])
+        self.assertTrue(any(action["action"] == "finish_dry_run" for action in report["safe_actions"]))
+        self.assertTrue(any(action["action"] == "finish" for action in report["unsafe_actions"]))
+        self.assertIn(["sweetspot", "finish", "run-123", "--from-state", "--artifact-dir", str(artifact_dir), "--dry-run"], report["recommended_commands"])
+
+    def test_cleanup_from_state_refuses_unsafe_dry_run_before_aws_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "run-123"
+            self._write_run_state(artifact_dir)
+            args = argparse.Namespace(run_id="run-123", artifact_dir=artifact_dir, from_state=True, apply=False, region=None, profile=None)
+
+            stdout = io.StringIO()
+            with mock.patch.object(cli.boto3, "Session", side_effect=AssertionError("AWS session should not be constructed")):
+                with contextlib.redirect_stdout(stdout):
+                    rc = cli.cmd_cleanup(args)
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(rc, 2)
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_action_refusal.v1")
+        self.assertEqual(report["requested_action"], "cleanup_dry_run")
+        self.assertEqual(report["state"], "PLAN_READY")
+        self.assertTrue(report["blocked"])
+        self.assertTrue(any(action["action"] == "cleanup" for action in report["unsafe_actions"]))
+        self.assertEqual(report["safe_actions"][0]["action"], "status")
+        self.assertIn(["sweetspot", "status", "run-123", "--from-state", "--artifact-dir", str(artifact_dir)], report["recommended_commands"])
 
 
 if __name__ == "__main__":

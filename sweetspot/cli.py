@@ -2884,10 +2884,49 @@ def cmd_postmortem(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lifecycle_action_refusal_report(context: RunContext, lifecycle: dict[str, Any], requested_action: str) -> dict[str, Any]:
+    matching_unsafe = [action for action in lifecycle.get("unsafe_actions", []) if isinstance(action, dict) and action.get("action") == requested_action]
+    if not matching_unsafe and requested_action.endswith("_dry_run"):
+        base_action = requested_action.removesuffix("_dry_run")
+        matching_unsafe = [action for action in lifecycle.get("unsafe_actions", []) if isinstance(action, dict) and action.get("action") == base_action]
+    return {
+        "schema": "sweetspot.lifecycle_action_refusal.v1",
+        "checked_at": iso_now(),
+        "ok": False,
+        "blocked": True,
+        "run_id": context.run_id,
+        "requested_action": requested_action,
+        "state": lifecycle.get("state"),
+        "message": f"Lifecycle state {lifecycle.get('state')} does not mark {requested_action!r} as safe.",
+        "unsafe_actions": matching_unsafe,
+        "safe_actions": lifecycle.get("safe_actions", []),
+        "recommended_commands": lifecycle.get("recommended_commands", []),
+        "missing_facts": lifecycle.get("missing_facts", []),
+        "warnings": lifecycle.get("warnings", []),
+    }
+
+
+def _guard_lifecycle_from_state_action(args: argparse.Namespace, requested_action: str) -> tuple[RunContext, dict[str, Any], dict[str, Any] | None]:
+    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    lifecycle = evaluate_lifecycle_state(context)
+    safe_actions = {
+        str(action.get("action"))
+        for action in lifecycle.get("safe_actions", [])
+        if isinstance(action, dict) and action.get("action")
+    }
+    if requested_action in safe_actions:
+        return context, lifecycle, None
+    return context, lifecycle, _lifecycle_action_refusal_report(context, lifecycle, requested_action)
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "from_state", False)):
         raise SystemExit("cleanup currently requires --from-state")
-    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    requested_action = "cleanup" if bool(getattr(args, "apply", False)) else "cleanup_dry_run"
+    context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, requested_action)
+    if refusal is not None:
+        print(json.dumps(refusal, indent=2, sort_keys=True))
+        return 2
     region = getattr(args, "region", None) or context.region
     session = boto3.Session(profile_name=getattr(args, "profile", None), region_name=region)
     blockers: list[dict[str, Any]] = []
@@ -3655,7 +3694,11 @@ def _finish_finalizer_args(args: argparse.Namespace, context: RunContext) -> arg
 def cmd_finish(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "from_state", False)):
         raise SystemExit("finish currently requires --from-state")
-    context = load_run_context(getattr(args, "run_id", None), getattr(args, "artifact_dir", None))
+    requested_action = "finish_dry_run" if bool(getattr(args, "dry_run", False)) else "finish"
+    context, _lifecycle, refusal = _guard_lifecycle_from_state_action(args, requested_action)
+    if refusal is not None:
+        print(json.dumps(refusal, indent=2, sort_keys=True))
+        return 2
     region = getattr(args, "region", None) or context.region
     session = boto3.Session(profile_name=getattr(args, "profile", None), region_name=region)
     queues: dict[str, Any] = {}
