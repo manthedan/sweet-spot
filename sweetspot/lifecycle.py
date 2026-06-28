@@ -6,6 +6,77 @@ from pathlib import Path
 from typing import Any
 
 
+LIFECYCLE_STATE_SCHEMA_V1 = "sweetspot.lifecycle_state.v1"
+
+LIFECYCLE_STATES: tuple[str, ...] = (
+    "NEW",
+    "PLANNING",
+    "CANARY_MATERIALIZED",
+    "CANARY_RUNNING",
+    "CANARY_COLLECTING",
+    "PLAN_READY",
+    "PRODUCTION_ENQUEUED",
+    "WORKERS_RUNNING",
+    "DRAINING",
+    "FINALIZING",
+    "COMPLETE",
+    "NEEDS_REPAIR",
+    "REPAIR_RUNNING",
+    "BLOCKED",
+    "CANCELLED",
+    "FAILED_REVIEW_REQUIRED",
+)
+
+TERMINAL_LIFECYCLE_STATES = frozenset({"COMPLETE", "CANCELLED"})
+REVIEW_REQUIRED_LIFECYCLE_STATES = frozenset({"FAILED_REVIEW_REQUIRED"})
+
+LIFECYCLE_STATE_REPORT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "schema",
+    "run_id",
+    "artifact_dir",
+    "state",
+    "legacy_outcome",
+    "terminal",
+    "review_required",
+    "generated_at",
+    "known_facts",
+    "missing_facts",
+    "safe_actions",
+    "unsafe_actions",
+    "recommended_commands",
+    "evidence",
+    "warnings",
+)
+
+
+def validate_lifecycle_state_report(report: dict[str, Any]) -> list[str]:
+    """Return contract violations for a lifecycle state report.
+
+    This pins the M007 S01 contract without implementing state evaluation yet.
+    S02 should call this from tests when it starts producing real reports.
+    """
+
+    errors: list[str] = []
+    for field in LIFECYCLE_STATE_REPORT_REQUIRED_FIELDS:
+        if field not in report:
+            errors.append(f"missing required field: {field}")
+    if report.get("schema") != LIFECYCLE_STATE_SCHEMA_V1:
+        errors.append(f"schema must be {LIFECYCLE_STATE_SCHEMA_V1}")
+    state = report.get("state")
+    if state not in LIFECYCLE_STATES:
+        errors.append(f"state must be one of {', '.join(LIFECYCLE_STATES)}")
+    if "terminal" in report and not isinstance(report.get("terminal"), bool):
+        errors.append("terminal must be a boolean")
+    if "review_required" in report and not isinstance(report.get("review_required"), bool):
+        errors.append("review_required must be a boolean")
+    for field in ("missing_facts", "safe_actions", "unsafe_actions", "recommended_commands", "evidence", "warnings"):
+        if field in report and not isinstance(report.get(field), list):
+            errors.append(f"{field} must be a list")
+    if "known_facts" in report and not isinstance(report.get("known_facts"), dict):
+        errors.append("known_facts must be an object")
+    return errors
+
+
 @dataclass(frozen=True)
 class RunContext:
     run_id: str
