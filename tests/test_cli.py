@@ -2933,6 +2933,46 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(lifecycle["state"], "WORKERS_RUNNING")
         self.assertTrue(lifecycle["recommended_commands"])
         self.assertIn("source_queue_depth", lifecycle["missing_facts"])
+
+    def test_explain_from_state_wraps_evaluator_report_without_aws_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            artifact_dir.mkdir(parents=True)
+            tasks = artifact_dir / "production_tasks.jsonl"
+            tasks.write_text(json.dumps({"task_id": "t0"}) + "\n" + json.dumps({"task_id": "t1"}) + "\n")
+            state = {
+                "schema": "sweetspot.run.v1",
+                "run_id": "run-1",
+                "artifacts": {"production_tasks_jsonl": str(tasks)},
+                "plan": {"job": {"output_prefix": "s3://bucket/runs/r1"}},
+                "controller": {
+                    "run_queue": {"queue_url": "run-queue", "dlq_url": "dlq"},
+                    "production_binding": {"target": {"region": "us-west-2", "sqs_queue_url": "fallback-queue", "dlq_url": "dlq", "batch_job_queue": "jq"}},
+                },
+                "phases": [{"name": "submit_workers", "status": "completed", "job_name_prefix": "run-1-worker", "batch_job_queue": "jq"}],
+            }
+            (artifact_dir / "run_state.json").write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")), contextlib.redirect_stdout(out):
+                self.assertEqual(main(["explain", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--format", "json"]), 0)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_explain.v1")
+        lifecycle = report["lifecycle_state"]
+        self.assertEqual(lifecycle["schema"], "sweetspot.lifecycle_state.v1")
+        self.assertEqual(lifecycle["state"], "WORKERS_RUNNING")
+        self.assertEqual(report["state"], lifecycle["state"])
+        self.assertEqual(report["safe_actions"], lifecycle["safe_actions"])
+        self.assertEqual(report["unsafe_actions"], lifecycle["unsafe_actions"])
+        self.assertEqual(report["recommended_commands"], lifecycle["recommended_commands"])
+        self.assertEqual(report["warnings"], lifecycle["warnings"])
+        self.assertEqual(report["missing_facts"], lifecycle["missing_facts"])
+        self.assertEqual(report["evidence"], lifecycle["evidence"])
+        self.assertTrue(report["safe_actions"])
+        self.assertTrue(report["unsafe_actions"])
+        self.assertTrue(report["recommended_commands"])
+        self.assertIn("source_queue_depth", report["missing_facts"])
+        self.assertEqual(report["outcome"], "in_progress")
+
 class FinishTests(unittest.TestCase):
     def test_finish_from_state_blocks_when_workers_are_active(self) -> None:
         class FakeSQS:
