@@ -3610,6 +3610,53 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
         self.assertEqual(report["applied_actions"], [])
         self.assertIn("report-only", report["note"])
 
+    def test_cleanup_from_state_refuses_mutating_cleanup_before_aws_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            self._write_finished_run(artifact_dir)
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")),
+                contextlib.redirect_stdout(out),
+            ):
+                rc = main(["cleanup", "run-1", "--artifact-dir", str(artifact_dir), "--from-state", "--apply"])
+        self.assertEqual(rc, 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_action_refusal.v1")
+        self.assertEqual(report["requested_action"], "cleanup")
+        self.assertEqual(report["state"], "COMPLETE")
+        self.assertIn(["sweetspot", "cleanup", "run-1", "--from-state", "--artifact-dir", str(artifact_dir), "--dry-run"], report["recommended_commands"])
+        self.assertTrue(report["blocked"])
+
+    def test_cleanup_from_state_refuses_dry_run_before_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp) / "artifacts" / "run-1"
+            self._write_finished_run(artifact_dir)
+            state_path = artifact_dir / "run_state.json"
+            state = json.loads(state_path.read_text())
+            state["artifacts"].pop("final_manifest_json", None)
+            state["artifacts"].pop("finish_report_json", None)
+            state["phases"] = [{"name": "drain", "status": "running", "job_name_prefix": "run-1-worker"}]
+            (artifact_dir / "finalizer" / "final_manifest.json").unlink()
+            finish_report = artifact_dir / "finish_report.json"
+            if finish_report.exists():
+                finish_report.unlink()
+            state_path.write_text(json.dumps(state) + "\n")
+            out = io.StringIO()
+            with (
+                patch("sweetspot.cli.boto3.Session", side_effect=AssertionError("AWS should not be contacted")),
+                contextlib.redirect_stdout(out),
+            ):
+                rc = main(["cleanup", "run-1", "--artifact-dir", str(artifact_dir), "--from-state"])
+        self.assertEqual(rc, 2)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["schema"], "sweetspot.lifecycle_action_refusal.v1")
+        self.assertEqual(report["requested_action"], "cleanup_dry_run")
+        self.assertEqual(report["state"], "PLAN_READY")
+        self.assertIn(["sweetspot", "status", "run-1", "--from-state", "--artifact-dir", str(artifact_dir)], report["recommended_commands"])
+        self.assertTrue(report["unsafe_actions"])
+        self.assertIn("run is not complete", report["unsafe_actions"][0]["reason"])
+
     def test_cleanup_from_state_blocks_non_empty_dlq(self) -> None:
         class FakeSQS:
             def get_queue_attributes(self, **kwargs):
