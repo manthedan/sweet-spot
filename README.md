@@ -1,12 +1,28 @@
 # SweetSpot
 
-SweetSpot is a cost-aware AWS Batch Spot work runner for trusted, idempotent, embarrassingly parallel workloads. It packages a rock-solid reliability pattern for massive, retryable batch jobs using SQS and S3.
+SweetSpot runs millions of trusted, idempotent tasks on AWS Batch Spot as cheaply as possible, with SQS retries, S3 done markers, repair manifests, and cost-aware lane selection.
 
-SweetSpot is an **at-least-once** runner, not an exactly-once transaction system. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent.
+It is **not** a general ETL orchestrator. SweetSpot is the low-level execution harness you reach for when the work is already a large set of independent commands and the hard part is making a cheap Spot run durable, observable, and recoverable.
 
-![SweetSpot architecture](docs/assets/sweetspot_architecture.webp)
+## The problem
 
-## Core design
+You have a huge batch job:
+
+- annotate 10M chess positions,
+- run batch inference,
+- generate self-play games,
+- convert a dataset,
+- run simulation sweeps,
+- scrape or enrich many independent records,
+- or process CPU-heavy rows where each unit can be retried safely.
+
+Raw AWS Batch gives you containers and scheduling, but you still have to build task fanout, retry semantics, completion ledgers, repair manifests, finalization, and cost-aware lane choices. Airflow, Dagster, Prefect, Glue, Ray, Dask, and Step Functions are useful tools, but they are not specialized for cheap, homogeneous, at-least-once AWS Batch Spot fanout.
+
+SweetSpot fills that gap.
+
+## What SweetSpot does
+
+SweetSpot packages a boring durable protocol:
 
 ```text
 SQS task message
@@ -18,72 +34,89 @@ SQS task message
 -> only then delete/ack message
 ```
 
-If a Spot host dies before ack, SQS visibility timeout returns the task. If a task repeatedly fails, SQS redrives it to the DLQ.
+If a Spot host dies before ack, SQS visibility timeout returns the task. If a task repeatedly fails, SQS redrives it to the DLQ. Finalization walks the task list and S3 done markers to build durable manifests and repair plans.
 
-### Ideal workloads
+SweetSpot is **at-least-once**, not exactly-once. The SQS queue is a trusted control plane: anyone who can enqueue a task can choose the command executed by the worker task role. Commands must therefore be trusted and idempotent.
 
-- Batch inference / annotation
-- Dataset conversion and CPU-heavy ETL
-- Web scraping and simulation sweeps
-- Self-play generation
+## Five nouns to learn
 
-### What it is not
+- **JobSpec**: the run request: workload, task shape, budget/deadline hints, and deployment references.
+- **Task**: one trusted command plus S3 output, summary, and done-marker paths.
+- **Run**: one execution attempt for a JobSpec, with local `run_state.json` and cloud resources.
+- **Done marker**: the deterministic S3 object written last by a successful task.
+- **Manifest**: the final ledger proving which tasks completed, which are missing, and what to repair.
 
-- Not cloud agnostic
-- Not a scheduler replacing AWS Batch
-- Not exactly-once for arbitrary external side effects
+Everything else -- canaries, lifecycle reports, doctors, repair, cleanup, and admin commands -- is operator machinery around those five ideas.
 
-Chess/Stockfish workflows live under `examples/`.
+## 90-second architecture
 
-## Architecture
+![SweetSpot architecture](docs/assets/sweetspot_architecture.webp)
 
 ```mermaid
 flowchart LR
-    A[Agent submits JobSpec]
-    B[SweetSpot plans and controls run]
+    A[JobSpec]
+    B[SweetSpot planner/controller]
     C[SQS task queue]
     D[AWS Batch Spot workers]
-    E[S3 outputs and completion markers]
+    E[S3 outputs, summaries, done markers]
+    F[Final manifest / repair manifest]
 
     A --> B
     B --> C
     C --> D
     D --> E
     E --> B
+    B --> F
 ```
 
-```mermaid
-flowchart TD
-    A[Agent provides JobSpec<br/>workload, budget, deadline]
-    B[SweetSpot planner]
-    C{Enough workload telemetry?}
-    D[Run small canaries<br/>x86 / ARM and resource shapes]
-    E[Create production plan<br/>shard size, CPU, memory, workers]
-    F[Enqueue tasks in SQS]
-    G[AWS Batch Spot workers]
-    H[S3 outputs, summaries<br/>and done markers]
-    I{Run complete?}
-    J[Retry, top up workers<br/>or create repair tasks]
-    K[Finalize run]
+## When to use SweetSpot
 
-    A --> B
-    B --> C
-    C -- No --> D
-    D --> H
-    H --> B
-    C -- Yes --> E
-    E --> F
-    F --> G
-    G --> H
-    H --> I
-    I -- No --> J
-    J --> F
-    I -- Yes --> K
+Use SweetSpot when:
+
+- the workload is embarrassingly parallel,
+- each task is trusted and idempotent,
+- results can be written to S3,
+- at-least-once execution is acceptable,
+- AWS Batch Spot cost matters,
+- and you want machine-readable recovery surfaces instead of one-off glue scripts.
+
+Do **not** use SweetSpot when you need:
+
+- arbitrary external side effects with exactly-once semantics,
+- an asset graph, lineage UI, catalog, or human workflow scheduler,
+- multi-cloud abstraction,
+- untrusted user-submitted commands,
+- or interactive distributed Python compute.
+
+## Happy path
+
+The public path is intentionally small:
+
+```bash
+# 1. Create local project context and starter artifacts.
+sweetspot init --config examples/setup.example.yaml --project-dir .sweetspot
+
+# 2. Validate local setup without touching AWS.
+sweetspot doctor project --project-dir .sweetspot --format json
+
+# 3. Render AWS bootstrap intent for review.
+sweetspot bootstrap plan --project-dir .sweetspot --format json
+
+# 4. After reviewing the plan, apply with the exact confirmation token.
+sweetspot bootstrap apply --project-dir .sweetspot --confirm apply:<token> --format json
+
+# 5. Plan and launch a run from a JobSpec/deployment.
+sweetspot plan .sweetspot/job.json
+sweetspot run .sweetspot/job.json --deployment .sweetspot/deployment.json --apply --kickoff-only
+
+# 6. Monitor and close out.
+sweetspot status RUN_ID --from-state
+sweetspot finish RUN_ID --from-state --publish-ready
 ```
 
-## Quickstart
+For agent or CI operation, keep long polling out of the foreground: launch with `--kickoff-only`, then checkpoint with `sweetspot monitor RUN_ID --emit-command` or `sweetspot status RUN_ID --from-state` from a scheduler.
 
-### Dev installation
+## Install for development
 
 ```bash
 python -m venv .venv
@@ -92,23 +125,21 @@ pip install --constraint requirements.lock -e '.[dev]'
 ruff check . && mypy sweetspot && python -m unittest discover -s tests -v
 ```
 
-For full release closeout (also runs OpenTofu checks when tofu is installed): `scripts/verify_release.sh`.
-
-### First-run local setup
-
-Initialize a contained `.sweetspot/` starter bundle from the example config, inspect the generated JobSpec, then run the agent-readable local setup doctor:
+For full release closeout, including OpenTofu checks when `tofu` is installed, run:
 
 ```bash
-sweetspot init --config examples/setup.example.yaml --project-dir /tmp/example
-sweetspot plan /tmp/example/.sweetspot/job.json
-sweetspot doctor project --project-dir /tmp/example/.sweetspot --format json
+scripts/verify_release.sh
 ```
 
-`init` writes local setup state and starter artifacts only. It records AWS region/auth profile or role references for review, but does not provision AWS resources, create queues/buckets/roles, deploy workers, perform live AWS checks, or store credentials. `sweetspot doctor project --format json` emits the `sweetspot.project.doctor.v1` local validation surface with top-level `ok`, `checks`, and `summary`; each check includes an ID/status/severity for agent triage. Invalid setup and secret-looking material fail closed, while review placeholders can remain warnings until customized.
+## Local setup contract
 
-See `docs/setup.md` for the full first-run handoff, generated `.sweetspot/` layout, AWS auth boundary, and M002 bootstrap limits.
+`init` writes local setup state and starter artifacts only. It records AWS region/auth profile or role references for review, but does not provision AWS resources, create queues/buckets/roles, deploy workers, perform live AWS checks, or store credentials.
 
-### Task schema (`sweetspot.task.v1`)
+`sweetspot doctor project --format json` emits the `sweetspot.project.doctor.v1` local validation surface with top-level `ok`, `checks`, and `summary`. Invalid setup and secret-looking material fail closed; review placeholders can remain warnings until customized.
+
+See `docs/setup.md` for the full first-run handoff, generated `.sweetspot/` layout, AWS auth boundary, bootstrap plan/apply lifecycle, and troubleshooting.
+
+## Task schema (`sweetspot.task.v1`)
 
 Each SQS message is a JSON object:
 
@@ -127,7 +158,7 @@ Each SQS message is a JSON object:
 
 The worker sets environment variables for the command (`SWEETSPOT_TASK_JSON`, `SWEETSPOT_TASK_ID`, `SWEETSPOT_RUN_ID`, `SWEETSPOT_OUTPUT_PATH`, `SWEETSPOT_METRICS_PATH`, `SWEETSPOT_TASK_HASH`, `SWEETSPOT_ATTEMPT_ID`, `SWEETSPOT_DONE_S3`). See `docs/reliability_contract.md` for the full protocol.
 
-## CLI reference
+## Advanced CLI reference
 
 The primary agent interface uses a high-level controller workflow. Lower-level operator utilities are grouped under `sweetspot admin ...`.
 
