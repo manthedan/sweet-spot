@@ -14,9 +14,16 @@ sweetspot init
 sweetspot doctor project --format json
 ```
 
-Until the package is published, install from GitHub instead:
+For a one-shot, npx-like run without persistent install:
 
 ```bash
+uvx --from sweetspot-runner sweetspot init
+```
+
+Until the package is published, use GitHub instead:
+
+```bash
+uvx --from git+https://github.com/manthedan/sweet-spot.git sweetspot init
 uv tool install git+https://github.com/manthedan/sweet-spot.git
 # or: pipx install git+https://github.com/manthedan/sweet-spot.git
 ```
