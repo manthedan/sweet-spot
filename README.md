@@ -156,6 +156,12 @@ sweetspot finish RUN_ID --from-state --publish-ready
 
 For agent or CI operation, keep long polling out of the foreground: launch with `--kickoff-only`, then checkpoint with `sweetspot monitor RUN_ID --emit-command` or `sweetspot status RUN_ID --from-state` from a scheduler.
 
+## Agent-first repository guidance
+
+SweetSpot ships repo-local agent guidance so a coding agent can be pointed at the project and learn the safe workflow before touching AWS. Start with `AGENTS.md`, which points normal runs to `agent-skills/sweetspot-run.md` and keeps lower-level operator skills under `agent-skills/` for explicit debugging/admin work.
+
+If you change setup, lifecycle, cloud safety, or first-run UX, update the matching agent skill alongside the CLI/docs so future agents inherit the correct procedure.
+
 ## Install for development
 
 ```bash
