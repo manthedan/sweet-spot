@@ -90,26 +90,39 @@ Do **not** use SweetSpot when you need:
 
 ## Happy path
 
-The public path is intentionally small:
+The public path is intentionally small, but the first bootstrap output is a **single-account Spot starter**, not a turnkey production topology:
 
 ```bash
-# 1. Create local project context and starter artifacts.
-sweetspot init --config examples/setup.example.yaml --project-dir .sweetspot
+# 1. Create local project context and starter artifacts under .sweetspot/.
+sweetspot init --config examples/setup.example.yaml
 
 # 2. Validate local setup without touching AWS.
 sweetspot doctor project --project-dir .sweetspot --format json
 
-# 3. Render AWS bootstrap intent for review.
+# 3. Render single-account Spot starter infrastructure intent for review.
 sweetspot bootstrap plan --project-dir .sweetspot --format json
 
 # 4. After reviewing the plan, apply with the exact confirmation token.
 sweetspot bootstrap apply --project-dir .sweetspot --confirm apply:<token> --format json
 
-# 5. Plan and launch a run from a JobSpec/deployment.
+# 5. Check the starter JobSpec. Without canary telemetry this reports a blocked
+#    production plan and tells you what calibration is missing.
 sweetspot plan .sweetspot/job.json
-sweetspot run .sweetspot/job.json --deployment .sweetspot/deployment.json --apply --kickoff-only
 
-# 6. Monitor and close out.
+# 6. Do a local run dry-run/state handoff before cloud mutation.
+sweetspot run .sweetspot/job.json --artifact-dir artifacts/example-run
+```
+
+A production launch needs a reviewed deployment registry, a local input-manifest JSONL copy, canary telemetry, and an artifact directory so `run_state.json` can drive resume/closeout:
+
+```bash
+sweetspot run .sweetspot/job.json \
+  --deployment .sweetspot/deployment.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --canary-summary-jsonl artifacts/example-run/canary_summaries.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --apply --kickoff-only
+
 sweetspot status RUN_ID --from-state
 sweetspot finish RUN_ID --from-state --publish-ready
 ```

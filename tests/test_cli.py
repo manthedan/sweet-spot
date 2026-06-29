@@ -2311,6 +2311,13 @@ class InitCommandTests(unittest.TestCase):
         self.assertEqual(plan["schema"], "sweetspot.plan.v1")
         self.assertEqual(plan["status"], "blocked")
 
+    def test_init_rejects_generated_sweetspot_dir_as_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generated_dir = Path(tmpdir) / ".sweetspot"
+            with self.assertRaisesRegex(SystemExit, "containing project root"):
+                main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml"), "--project-dir", str(generated_dir)])
+            self.assertFalse((generated_dir / ".sweetspot" / "job.json").exists())
+
     def test_init_config_writes_starter_bundle_and_plan_compatible_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -6866,6 +6873,51 @@ class ProjectDoctorCliIntegrationTests(unittest.TestCase):
         rendered_report = json.dumps(report, sort_keys=True)
         for value in forbidden:
             self.assertNotIn(value, rendered_report)
+
+    def test_documented_local_first_run_path_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                rc, stdout, stderr = self._run_main(["init", "--config", str(ROOT / "examples" / "setup.example.yaml")])
+                self.assertEqual(rc, 0, stderr or stdout)
+                self.assertTrue(Path(".sweetspot/job.json").exists())
+                self.assertFalse(Path(".sweetspot/.sweetspot/job.json").exists())
+
+                rc, stdout, stderr = self._run_main(["doctor", "project", "--project-dir", ".sweetspot", "--format", "json"])
+                self.assertEqual(rc, 0, stderr or stdout)
+                self.assertEqual(json.loads(stdout)["schema"], "sweetspot.project.doctor.v1")
+
+                rc, stdout, stderr = self._run_main(["bootstrap", "plan", "--project-dir", ".sweetspot", "--format", "json"])
+                self.assertEqual(rc, 0, stderr or stdout)
+                self.assertEqual(json.loads(stdout)["bootstrap_classification"], "single_account_spot_starter")
+
+                rc, stdout, stderr = self._run_main(["plan", ".sweetspot/job.json"])
+                self.assertEqual(rc, 0, stderr or stdout)
+                self.assertEqual(json.loads(stdout)["status"], "blocked")
+
+                artifact_dir = Path("artifacts/smoke-run")
+                artifact_dir.mkdir(parents=True)
+                tasks = artifact_dir / "production_tasks.jsonl"
+                tasks.write_text(json.dumps({"task_id": "t0"}) + "\n", encoding="utf-8")
+                (artifact_dir / "run_state.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": "sweetspot.run.v1",
+                            "run_id": "smoke-run",
+                            "artifacts": {"production_tasks_jsonl": str(tasks)},
+                            "controller": {"production_binding": {"target": {"region": "us-west-2", "batch_job_queue": "jq"}}},
+                            "phases": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                rc, stdout, stderr = self._run_main(["status", "smoke-run", "--from-state", "--local-only", "--format", "json"])
+                self.assertEqual(rc, 0, stderr or stdout)
+                self.assertEqual(json.loads(stdout)["warnings"][0]["code"], "aws_checks_skipped")
+            finally:
+                os.chdir(old_cwd)
 
     def test_init_rerun_without_overwrite_fails_closed_and_preserves_existing_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

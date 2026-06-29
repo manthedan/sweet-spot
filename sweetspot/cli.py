@@ -4848,6 +4848,9 @@ def _prompt_setup_data() -> dict[str, Any]:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    requested_project_dir = Path(args.project_dir).expanduser()
+    if requested_project_dir.name == ".sweetspot":
+        raise SystemExit("init --project-dir expects the containing project root, not the generated .sweetspot directory; use --project-dir . or omit it")
     try:
         config = load_setup(args.config) if args.config else validate_setup(_prompt_setup_data())
         written = write_project_context(config, args.project_dir, overwrite=args.overwrite)

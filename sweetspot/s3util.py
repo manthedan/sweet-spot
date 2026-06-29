@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 try:
     from botocore.exceptions import ClientError
 except ModuleNotFoundError:  # pragma: no cover - exercised in environments without optional AWS SDK deps
+
     class ClientError(Exception):  # type: ignore[no-redef]
         """Fallback so pure URI helpers can be imported without botocore installed."""
 

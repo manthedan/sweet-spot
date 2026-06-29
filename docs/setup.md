@@ -10,7 +10,7 @@ Use the example config when you want repeatable, noninteractive setup:
 
 ```bash
 sweetspot init --config examples/setup.example.yaml
-sweetspot plan --job .sweetspot/job.json --format json
+sweetspot plan .sweetspot/job.json --format json
 sweetspot doctor project --format json
 ```
 
@@ -57,7 +57,7 @@ After init, the starter bundle contains these files:
 |---|---|---|
 | `.sweetspot/sweetspot.yaml` | Canonical local setup config generated from your init inputs. | Confirm project name, workload S3 URIs, command tokens, architecture, region, and auth method/reference are correct. Keep only references to external auth configuration. |
 | `.sweetspot/SWEETSPOT.md` | Human/agent summary of setup status, workload intent, AWS auth intent, and bootstrap artifact paths. | Read this first when resuming a project. It should explain that the bundle is initialized but not deployed. |
-| `.sweetspot/job.json` | Starter SweetSpot job spec for planning. | Review `run_id`, image placeholder, command, input/output locations, constraints, architecture, region, and validation contract. Use `sweetspot plan --job .sweetspot/job.json --format json` to check planner compatibility. |
+| `.sweetspot/job.json` | Starter SweetSpot job spec for planning. | Review `run_id`, image placeholder, command, input/output locations, constraints, architecture, region, and validation contract. Use `sweetspot plan .sweetspot/job.json --format json` to check planner compatibility. |
 | `.sweetspot/deployment.template.json` | Review-only deployment template with placeholder queue, job-definition, image, and SQS values. | Replace placeholders only during later bootstrap work. Do not treat this file as deployable infrastructure after init. |
 | `.sweetspot/worker/README.md` | Notes for adapting the worker scaffold to the workload. | Use it to align the starter command, done-marker expectation, and auth-reference boundary before touching worker code. |
 | `.sweetspot/worker/worker.py` | Review-only Python worker scaffold that writes a local summary and done marker. | Replace the scaffold body with real workload logic later. Keep AWS auth values outside the worker source. |
@@ -82,7 +82,7 @@ Do not paste access-key values, secret-key values, session tokens, generated cre
 Run the planner against the generated job spec:
 
 ```bash
-sweetspot plan --job .sweetspot/job.json --format json
+sweetspot plan .sweetspot/job.json --format json
 ```
 
 This verifies that the starter `job.json` still conforms to the planner's job schema. If you customize the job file and planning fails, fix `job.json` before moving on; later runtime commands depend on a planner-compatible job spec.
@@ -405,7 +405,7 @@ What to do:
 
 ### Planner-incompatible `job.json`
 
-Symptom: `planner_job` fails or `sweetspot plan --job .sweetspot/job.json --format json` exits with a schema error.
+Symptom: `planner_job` fails or `sweetspot plan .sweetspot/job.json --format json` exits with a schema error.
 
 What to do:
 
@@ -508,7 +508,7 @@ What to do:
 Before moving from setup into runtime-first commands or future bootstrap work, confirm:
 
 - `sweetspot init` has produced the complete `.sweetspot/` layout.
-- `.sweetspot/job.json` passes `sweetspot plan --job .sweetspot/job.json --format json`.
+- `.sweetspot/job.json` passes `sweetspot plan .sweetspot/job.json --format json`.
 - `sweetspot doctor project --format json` returns schema `sweetspot.project.doctor.v1`.
 - `ok` is `true`, or every failure finding has been fixed.
 - Any placeholder warnings are understood as review-only M001 artifacts.
