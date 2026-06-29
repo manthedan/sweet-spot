@@ -7,28 +7,73 @@ description: 'Use the simplified SweetSpot planner/controller workflow: JobSpec,
 
 Thin guide for the preferred SweetSpot agent workflow. Use this skill for new manifest-based Spot workloads unless you are explicitly debugging lower-level operator phases.
 
-## Preferred workflow
+## First-run setup
+
+Start with a local, non-mutating setup bundle and reviewed bootstrap intent:
 
 ```bash
-sweetspot plan job.json
-sweetspot run job.json --artifact-dir artifacts/RUN_ID
-sweetspot run job.json --artifact-dir artifacts/RUN_ID \
-  --deployment deployment.json \
+sweetspot init
+sweetspot doctor project --format json
+sweetspot bootstrap plan --format json
+```
+
+Apply starter infrastructure only after reviewing the bootstrap report and receiving explicit approval:
+
+```bash
+sweetspot bootstrap apply --confirm apply:<token> --format json
+```
+
+## Preferred workflow
+
+Stage canaries, production kickoff, and closeout explicitly. Agents should copy the stage they are in, not the whole block blindly.
+
+```bash
+# 1. Local plan / canary materialization; no AWS mutation.
+sweetspot run job.json \
   --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID
+
+# 2. Launch canaries, after deployment routes are reviewed.
+sweetspot run job.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --deployment deployment.json \
   --apply
+
+# 3. Collect canary summaries and produce/refresh production plan artifacts.
+sweetspot run job.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --deployment deployment.json \
+  --apply \
+  --collect-canary-summaries
+
+# 4. Production kickoff, only once Plan is ready and approved.
+sweetspot run job.json \
+  --canary-summary-jsonl artifacts/RUN_ID/canary_summaries.jsonl \
+  --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --deployment deployment.json \
+  --dedicated-run-queue \
+  --create-run-queue \
+  --apply \
+  --kickoff-only
+
+# 5. Non-blocking monitoring and closeout from persisted state.
 sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command
 sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state
-sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready
 sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format text
+sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run
+sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready
 sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format markdown
-sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run
+sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --write-plan
 sweetspot repair RUN_ID --tasks-jsonl artifacts/RUN_ID/production_tasks.jsonl \
   --task-status-jsonl artifacts/RUN_ID/finalizer/task_status.jsonl \
   --job-queue batch-queue
 sweetspot cancel RUN_ID --job-queue batch-queue
 ```
 
-Mutating commands are dry-run by default. Add `--apply` only after reviewing the emitted JSON plan/report.
+Mutating commands are dry-run by default. Add `--apply` / `--publish-ready` only after reviewing the emitted JSON plan/report.
 
 ## JobSpec contract
 
@@ -102,7 +147,10 @@ sweetspot run job.json \
   --input-manifest-jsonl manifest.jsonl \
   --artifact-dir artifacts/RUN_ID \
   --deployment deployment.json \
-  --apply
+  --dedicated-run-queue \
+  --create-run-queue \
+  --apply \
+  --kickoff-only
 ```
 
 Legacy `--queue-url`/`--batch-job-queue`/`--job-definition` production targets remain compatibility fallbacks for operator debugging, but they bypass deployment-registry image/job-definition binding and should not be the primary agent path. Rerunning the same apply command resumes from `run_state.json` and refuses unsafe config drift. With `--deployment`, the local `--input-manifest-jsonl` must verify against the S3 `input_manifest` by size plus SHA256 metadata/checksum or single-part ETag before any mutation.
@@ -115,11 +163,11 @@ Dedicated-queue top-up submits are persisted as in-flight before each Batch muta
 
 - `sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command` is the preferred way to generate non-blocking scheduler/CI checkpoint commands.
 - `sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state` reconstructs queue, DLQ, Batch queue, job-name prefix, output prefix, and task artifacts from `run_state.json`; it calls AWS only for the recovered queue/Batch/S3 checks.
-- `sweetspot finalize RUN_ID --artifact-dir artifacts/RUN_ID --from-state` is the explicit state-driven finalizer path when you do not want the full finish checklist. If an operator passes a conflicting `--output-prefix`, `--tasks-jsonl`, or `--tasks-s3`, SweetSpot returns a structured `binding_drift` report with the recorded value, override value, unsafe reason, and recovery command; follow the recovery command instead of forcing overrides.
+- `sweetspot admin finalize RUN_ID --artifact-dir artifacts/RUN_ID --from-state` is the explicit advanced state-driven finalizer path when you do not want the full finish checklist. If an operator passes a conflicting `--output-prefix`, `--tasks-jsonl`, or `--tasks-s3`, SweetSpot returns a structured `binding_drift` report with the recorded value, override value, unsafe reason, and recovery command; follow the recovery command instead of forcing overrides.
 - `sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready` runs the production drain checks before finalization/READY and writes `finish_report.json`.
 - `sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state` explains the reconstructed lifecycle state and next actions without mutating AWS.
 - `sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state` writes a JSON or Markdown closeout report from state/finalizer/finish artifacts.
-- `sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run` writes `cleanup_report.json`; it is conservative/report-only and leaves destructive SQS/DLQ/S3/Batch capacity mutations as explicit admin/operator actions. See `docs/lifecycle_reports.md` for `status`, `finish`, `explain`, `postmortem`, `cleanup`, and lifecycle-error schemas.
+- `sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --write-plan` writes `cleanup_report.json`; it is conservative/report-only and leaves destructive SQS/DLQ/S3/Batch capacity mutations as explicit admin/operator actions. See `docs/lifecycle_reports.md` for `status`, `finish`, `explain`, `postmortem`, `cleanup`, and lifecycle-error schemas.
 - `sweetspot repair RUN_ID ...` builds a run-scoped repair plan. Add `--apply` only after reviewing the repair JSON.
 - `sweetspot cancel RUN_ID ...` is run-scoped. Broad regex cancellation belongs to the advanced `cancel-jobs` command.
 
@@ -129,4 +177,4 @@ Keep x86 as the safe default, but do not assume larger instances are cheaper. Be
 
 ## Advanced commands
 
-`enqueue-jsonl`, `submit-workers`, `finalize`, `repair-plan`, `cleanup-stale-messages`, `scout`, and `lane-manager` remain available for debugging/admin workflows, but they are not the primary interface for new agents. Prefer the explicit aliases such as `sweetspot admin enqueue-jsonl`, `sweetspot admin finalize`, and `sweetspot admin scout` when intentionally leaving the primary controller workflow.
+`enqueue-jsonl`, `submit-workers`, `finalize`, `repair-plan`, `cleanup-stale-messages`, `scout`, and `lane-manager` remain available behind `sweetspot admin ...` for debugging/admin workflows, but they are not the primary interface for new agents. Legacy top-level aliases may exist for migration, but agent Skills should use `sweetspot admin ...` when intentionally leaving the controller workflow.

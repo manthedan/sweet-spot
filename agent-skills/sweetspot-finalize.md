@@ -9,6 +9,8 @@ Advanced/admin guide for finalizing SweetSpot runs, planning repairs, and cleani
 
 ## When to use
 
+Do not use this skill for normal lifecycle closeout. Use `sweetspot-run` plus `sweetspot status RUN_ID --from-state`, `sweetspot finish RUN_ID --from-state`, and `sweetspot repair RUN_ID` instead; manual finalization bypasses the primary controller workflow.
+
 Invoke this skill for advanced/operator workflows. For normal run lifecycle checks, prefer `sweetspot-run` plus `sweetspot status RUN_ID` and `sweetspot repair RUN_ID`.
 
 Use this skill when an agent explicitly needs to:
@@ -23,11 +25,11 @@ Use this skill when an agent explicitly needs to:
 ## Finalization workflow
 
 ```
-1. Run finalize to check all done markers
+1. Run `sweetspot admin finalize` to check all done markers
 2. If incomplete: examine repair_tasks.jsonl
-3. Run repair-plan to exclude tasks owned by active workers
+3. Run `sweetspot admin repair-plan` to exclude tasks owned by active workers
 4. Enqueue repair tasks and submit repair workers
-5. Re-run finalize to confirm completion
+5. Re-run `sweetspot admin finalize` to confirm completion
 6. Optionally publish READY marker
 7. Clean up stale SQS messages
 8. Clean up old S3 prefixes
@@ -39,7 +41,7 @@ Use this skill when an agent explicitly needs to:
 
 Basic finalization (local artifacts only):
 ```bash
-sweetspot finalize \
+sweetspot admin finalize \
   --run-id my-run-001 \
   --output-prefix s3://my-bucket/runs/my-run-001 \
   --tasks-jsonl artifacts/my-run-001/tasks.jsonl \
@@ -50,7 +52,7 @@ sweetspot finalize \
 
 Upload manifests and publish READY:
 ```bash
-sweetspot finalize \
+sweetspot admin finalize \
   --run-id my-run-001 \
   --output-prefix s3://my-bucket/runs/my-run-001 \
   --tasks-jsonl artifacts/my-run-001/tasks.jsonl \
@@ -79,7 +81,7 @@ Key arguments:
 
 Excludes tasks that are still owned by active workers:
 ```bash
-sweetspot repair-plan \
+sweetspot admin repair-plan \
   --tasks-jsonl artifacts/my-run-001/tasks.jsonl \
   --task-status-jsonl artifacts/my-run-001/finalizer/task_status.jsonl \
   --out-jsonl artifacts/my-run-001/repair_plan.jsonl \
@@ -98,12 +100,12 @@ Key arguments:
 Removes visible SQS messages whose S3 done marker already exists:
 ```bash
 # Dry-run (default)
-sweetspot cleanup-stale-messages \
+sweetspot admin cleanup-stale-messages \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --run-id my-run-001
 
 # Apply deletion
-sweetspot cleanup-stale-messages \
+sweetspot admin cleanup-stale-messages \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --run-id my-run-001 \
   --apply
@@ -114,12 +116,12 @@ sweetspot cleanup-stale-messages \
 Inspect and optionally delete an S3 prefix:
 ```bash
 # Dry-run inspection
-sweetspot s3-delete-prefix \
+sweetspot admin s3-delete-prefix \
   --prefix s3://my-bucket/runs/old-run-001/ \
   --artifact-dir artifacts/old-run-001/delete-dryrun
 
 # Actual deletion (requires exact confirmation)
-sweetspot s3-delete-prefix \
+sweetspot admin s3-delete-prefix \
   --prefix s3://my-bucket/runs/old-run-001/ \
   --delete \
   --confirm-prefix s3://my-bucket/runs/old-run-001/ \
@@ -221,13 +223,13 @@ s3://<output_prefix>/manifests/repair_tasks.jsonl  (only if missing tasks)
 
 ## Repair workflow
 
-1. Run finalize to identify incomplete tasks
+1. Run `sweetspot admin finalize` to identify incomplete tasks
 2. If `missing_count > 0`:
-   a. Run repair-plan to exclude tasks owned by active workers
-   b. Enqueue the repair plan output: `sweetspot enqueue-jsonl --tasks-jsonl repair_plan.jsonl --queue-url <url> --submit`
+   a. Run `sweetspot admin repair-plan` to exclude tasks owned by active workers
+   b. Enqueue the repair plan output: `sweetspot admin enqueue-jsonl --tasks-jsonl repair_plan.jsonl --queue-url <url> --submit`
    c. Submit repair workers or use an On-Demand repair queue
    d. Wait for repair workers to finish
-   e. Re-run finalize to confirm completion
+   e. Re-run `sweetspot admin finalize` to confirm completion
 3. If `output_without_done_count > 0`: These tasks have output but no/invalid done markers. The repair plan will fix them.
 4. If `invalid_marker_count > 0`: Done markers failed validation. Repair tasks use a `.repair-<timestamp>` suffix to avoid colliding with the invalid marker.
 
@@ -235,6 +237,6 @@ s3://<output_prefix>/manifests/repair_tasks.jsonl  (only if missing tasks)
 
 1. **Not using `--use-listing-index` for large runs**: Without it, each task requires a separate HeadObject call. For 10k+ tasks, this is slow and expensive.
 2. **Forgetting `--require-complete`**: Without it, finalize exits 0 even if tasks are incomplete. Use this in CI to detect incomplete runs.
-3. **Repairing while workers are still active**: Use repair-plan with `--job-queue` to exclude tasks that active workers are processing.
+3. **Repairing while workers are still active**: Use `sweetspot admin repair-plan` with `--job-queue` to exclude tasks that active workers are processing.
 4. **Not cleaning up stale messages**: After a run completes, visible messages in SQS with existing done markers should be cleaned up to avoid phantom work.
 5. **Publishing READY too early**: `--publish-ready --require-complete` exits 2 and does NOT publish READY if any task is incomplete (unless `--allow-incomplete-ready` is set).

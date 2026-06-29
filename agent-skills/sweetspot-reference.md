@@ -1,17 +1,19 @@
 ---
 name: sweetspot-reference
-description: 'Advanced/admin master SweetSpot CLI reference. Use for lower-level commands, task schemas, worker environments, output schemas, or safety rules; for new runs, prefer sweetspot-run.'
+description: 'Advanced/admin SweetSpot CLI reference. Use for lower-level commands, task schemas, worker environments, output schemas, or safety rules; for new runs, prefer sweetspot-run.'
 ---
 
 # Skill: sweetspot-reference
 
-Master CLI reference for SweetSpot, a cost-aware AWS Batch Spot work runner for trusted, idempotent, embarrassingly parallel workloads.
+Admin/compatibility CLI reference for SweetSpot, a cost-aware AWS Batch Spot work runner for trusted, idempotent, embarrassingly parallel workloads.
 
 ## When to use
 
-Invoke this skill when an agent needs to understand, reference, or execute any SweetSpot CLI command. This is the comprehensive reference covering all current `sweetspot` subcommands plus the standalone `sweetspot-scout` and `sweetspot-lane-manager` compatibility entry points.
+Do not use this skill for a normal new run. Use `sweetspot-run` instead.
 
-For new runs, prefer the thin `sweetspot-run` skill and the controller workflow: `plan`, `run`, `status`, `repair`, and `cancel`. The lower-level phase commands documented here remain advanced/operator controls for debugging, migration, and manual recovery.
+Invoke this skill when an agent explicitly needs lower-level command details, task schemas, worker environments, output schemas, or admin/debug controls. The lower-level phase commands documented here are advanced/operator controls for debugging, migration, and manual recovery.
+
+Legacy top-level aliases may exist for migration, but agent Skills should use `sweetspot admin ...` when intentionally leaving the controller workflow.
 
 ## Architecture
 
@@ -28,7 +30,7 @@ SQS task message
 ```
 
 Three console-script entry points:
-- `sweetspot` - main CLI, including nested `sweetspot scout` and `sweetspot lane-manager`
+- `sweetspot` - main CLI, including primary workflow commands and `sweetspot admin ...` advanced commands
 - `sweetspot-scout` - standalone compatibility entry point for the read-only Spot pool ranking tool
 - `sweetspot-lane-manager` - standalone compatibility entry point for the multi-region lane allocator
 
@@ -45,30 +47,54 @@ Three console-script entry points:
 - `--task-timeout-seconds`: Per-task timeout cap (default 39600s / 11h)
 - `--vcpus` / `--memory`: Batch container overrides
 
-## Complete command reference
+## Primary command surface
+
+For normal operations, prefer these top-level controller/lifecycle commands:
+
+```bash
+sweetspot init
+sweetspot doctor project --format json
+sweetspot bootstrap plan --format json
+sweetspot plan job.json
+sweetspot run job.json --artifact-dir artifacts/RUN_ID
+sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command
+sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state
+sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run
+sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format text
+sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format markdown
+sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --write-plan
+sweetspot repair RUN_ID --tasks-jsonl artifacts/RUN_ID/production_tasks.jsonl \
+  --task-status-jsonl artifacts/RUN_ID/finalizer/task_status.jsonl
+sweetspot cancel RUN_ID --job-queue <queue>
+```
+
+See `agent-skills/sweetspot-run.md` for staged canary, production kickoff, and closeout instructions.
+
+## Admin compatibility command reference
 
 ### Version and status
 ```bash
 sweetspot version
+sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state [--format json|table]
 sweetspot status --queue-url <url> --job-queue <queue> [--dlq-url <dlq-url>] [--format json|table]
 ```
-`status` reports AWS identity, queue depth, DLQ depth, and active Batch worker summary. JSON is the default; table output is opt-in.
+`status --from-state` reconstructs run bindings from `run_state.json`. Legacy explicit-flag status reports AWS identity, queue depth, DLQ depth, and active Batch worker summary. JSON is the default; table output is opt-in.
 
 ### Worker
 ```bash
-sweetspot worker --queue-url <url> [--max-messages N] [--visibility-timeout S]
+sweetspot admin worker --queue-url <url> [--max-messages N] [--visibility-timeout S]
 ```
 Runs an SQS worker inside AWS Batch. Usually invoked by the Batch job definition, not manually.
 
 ### Enqueue
 ```bash
 # Validate and optionally submit tasks
-sweetspot enqueue-jsonl --tasks-jsonl tasks.jsonl [--queue-url <url>] [--submit]
+sweetspot admin enqueue-jsonl --tasks-jsonl tasks.jsonl [--queue-url <url>] [--submit]
                         [--run-id <id>] [--artifact-dir <dir>]
                         [--allowed-s3-prefix s3://bucket/prefix]
 
 # Atomic enqueue + wait + submit workers
-sweetspot enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url <url>
+sweetspot admin enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url <url>
                              --batch-job-queue <queue> --job-definition <def>
                              [--wait-for-visible-seconds 30] --submit
 ```
@@ -76,11 +102,11 @@ sweetspot enqueue-and-submit --tasks-jsonl tasks.jsonl --queue-url <url>
 ### Canary, telemetry, and estimation
 ```bash
 # Derive a deterministic canary subset
-sweetspot derive-canary --tasks-jsonl tasks.jsonl --out-dir ./canary
+sweetspot admin derive-canary --tasks-jsonl tasks.jsonl --out-dir ./canary
                         [--task-count 4] [--include-dlq-probe]
 
 # Estimate runtime/cost from telemetry
-sweetspot estimate-runtime --sample-jsonl summaries.jsonl
+sweetspot admin estimate-runtime --sample-jsonl summaries.jsonl
                            [--target-units N | --task-count N --units-per-task M]
                            [--active-workers W] [--price-per-vcpu-hour P]
 ```
@@ -90,13 +116,13 @@ Use small, idempotent tasks that are cheap to replay after Spot interruption. Ha
 ### Worker submission
 ```bash
 # Dry-run worker sizing (add --submit to actually submit)
-sweetspot submit-workers --sqs-queue-url <url> --batch-job-queue <queue>
+sweetspot admin submit-workers --sqs-queue-url <url> --batch-job-queue <queue>
                          --job-definition <def> --job-name-prefix <prefix>
                          [--messages-per-worker 4] [--max-workers 64]
                          [--subtract-active] --submit
 
 # Multi-loop supervisor
-sweetspot supervise-workers --sqs-queue-url <url> --batch-job-queue <queue>
+sweetspot admin supervise-workers --sqs-queue-url <url> --batch-job-queue <queue>
                             --job-definition <def> --job-name-prefix <prefix>
                             --target-active-workers 64 [--loops 10]
                             [--interval-seconds 60] [--stop-on-dlq --dlq-url <url>]
@@ -106,51 +132,51 @@ sweetspot supervise-workers --sqs-queue-url <url> --batch-job-queue <queue>
 ### Finalization
 ```bash
 # Stream tasks, check done markers, write manifests
-sweetspot finalize --run-id <id> --output-prefix s3://bucket/runs/<id>
+sweetspot admin finalize --run-id <id> --output-prefix s3://bucket/runs/<id>
                    --tasks-jsonl tasks.jsonl [--workers 32]
                    [--use-listing-index] [--upload] [--publish-ready]
                    [--write-repair-jsonl repair.jsonl] [--require-complete]
 
 # Build repair plan excluding active-worker tasks
-sweetspot repair-plan --tasks-jsonl tasks.jsonl
+sweetspot admin repair-plan --tasks-jsonl tasks.jsonl
                       --task-status-jsonl task_status.jsonl
                       --out-jsonl repair.jsonl
                       [--job-queue <queue> --job-name-regex <pattern>]
 
 # Clean up stale SQS messages
-sweetspot cleanup-stale-messages --queue-url <url> [--run-id <id>] [--apply]
+sweetspot admin cleanup-stale-messages --queue-url <url> [--run-id <id>] [--apply]
 ```
 
 ### Job and log inspection
 ```bash
-sweetspot jobs --job-queue <queue> [--status RUNNING] [--name-regex <pattern>]
-sweetspot describe-job --job-id <id>
-sweetspot logs --job-id <id> [--last 50] [--max-events 500] [--filter-regex <pattern>]
-sweetspot watch-job --job-id <id> [--max-seconds 3600]
+sweetspot admin jobs --job-queue <queue> [--status RUNNING] [--name-regex <pattern>]
+sweetspot admin describe-job --job-id <id>
+sweetspot admin logs --job-id <id> [--last 50] [--max-events 500] [--filter-regex <pattern>]
+sweetspot admin watch-job --job-id <id> [--max-seconds 3600]
 ```
 
 ### DLQ
 ```bash
 # Inspect DLQ
-sweetspot dlq --dlq-url <url> [--run-id <id>]
+sweetspot admin dlq --dlq-url <url> [--run-id <id>]
 
 # Manual filtered redrive
-sweetspot dlq --dlq-url <url> --queue-url <main-url> --run-id <id> --apply
+sweetspot admin dlq --dlq-url <url> --queue-url <main-url> --run-id <id> --apply
 
 # Native whole-DLQ redrive
-sweetspot dlq --dlq-url <url> --queue-url <main-url> --native-redrive --apply
+sweetspot admin dlq --dlq-url <url> --queue-url <main-url> --native-redrive --apply
 ```
 
 ### S3 cleanup
 ```bash
 # Dry-run prefix inspection (add --delete --confirm-prefix to mutate)
-sweetspot s3-delete-prefix --prefix s3://bucket/runs/old-run/
+sweetspot admin s3-delete-prefix --prefix s3://bucket/runs/old-run/
                            [--include-versions] [--artifact-dir <dir>]
 ```
 
 ### Doctor
 ```bash
-sweetspot doctor --queue-url <url> --dlq-url <dlq-url>
+sweetspot admin doctor --queue-url <url> --dlq-url <dlq-url>
                  --job-queue <queue> --job-definition <def>
                  --s3-prefix s3://bucket/prefix [--write-probe]
                  [--validate-batch-metrics]
@@ -158,7 +184,7 @@ sweetspot doctor --queue-url <url> --dlq-url <dlq-url>
 
 ### Spot scouting
 ```bash
-sweetspot scout --preset mixed --regions us-west-2 us-east-2
+sweetspot admin scout --preset mixed --regions us-west-2 us-east-2
                --target-vcpus 256 512 --bucket my-data-bucket
                [--observed-summaries summaries/]
                [--json-out scout.json]
@@ -169,7 +195,7 @@ sweetspot scout --preset mixed --regions us-west-2 us-east-2
 
 ### Lane management
 ```bash
-sweetspot lane-manager --config lanes.json
+sweetspot admin lane-manager --config lanes.json
 # Standalone compatibility entry point also works: sweetspot-lane-manager --config lanes.json
 ```
 

@@ -10,23 +10,52 @@ For normal SweetSpot use, read and follow:
 
 Use these only when explicitly doing advanced operator/debugging work:
 
-- `agent-skills/sweetspot-reference.md` — full CLI reference.
+- `agent-skills/sweetspot-reference.md` — admin/compatibility CLI reference.
 - `agent-skills/sweetspot-ops.md` — AWS/SQS/S3/Batch diagnostics.
 - `agent-skills/sweetspot-enqueue.md` — manual task enqueueing.
 - `agent-skills/sweetspot-workers.md` — manual worker submission/supervision.
 - `agent-skills/sweetspot-finalize.md` — manual closeout/finalization.
 - `agent-skills/sweetspot-scout.md` — Spot lane/cost investigation.
 
-Prefer the high-level controller workflow over lower-level admin commands:
+Prefer the high-level controller workflow over lower-level admin commands.
+
+## Safe local / read-only first steps
+
+These commands are the expected first copy-paste path. They do not apply AWS infrastructure, submit workers, publish READY markers, or delete cloud resources.
 
 ```bash
 sweetspot init
 sweetspot doctor project --format json
 sweetspot bootstrap plan --format json
 sweetspot plan .sweetspot/job.json
-sweetspot run .sweetspot/job.json --artifact-dir artifacts/RUN_ID
-sweetspot monitor RUN_ID --artifact-dir artifacts/RUN_ID --emit-command
-sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state
+sweetspot run .sweetspot/job.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --artifact-dir artifacts/RUN_ID
+sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state --local-only
+```
+
+## Requires human review / explicit approval
+
+Use these only after reviewing the emitted JSON plans/reports and receiving explicit approval for the cloud mutation or READY publication.
+
+```bash
+# Apply reviewed starter infrastructure with the exact token from bootstrap plan.
+sweetspot bootstrap apply --confirm apply:<token> --format json
+
+# Production kickoff: reviewed deployment, verified local input manifest, run-owned queue,
+# no foreground long polling in the interactive agent.
+sweetspot run .sweetspot/job.json \
+  --input-manifest-jsonl manifest.jsonl \
+  --canary-summary-jsonl artifacts/RUN_ID/canary_summaries.jsonl \
+  --artifact-dir artifacts/RUN_ID \
+  --deployment .sweetspot/deployment.json \
+  --dedicated-run-queue \
+  --create-run-queue \
+  --apply \
+  --kickoff-only
+
+# Closeout: dry-run/read the finish report first, then publish READY only when approved.
+sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --dry-run
 sweetspot finish RUN_ID --artifact-dir artifacts/RUN_ID --from-state --publish-ready
 sweetspot postmortem RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format markdown
 sweetspot cleanup RUN_ID --artifact-dir artifacts/RUN_ID --from-state --write-plan
@@ -48,7 +77,7 @@ For code changes, run the relevant local checks before proposing or pushing:
 ```bash
 ruff check .
 mypy sweetspot
-python -m unittest discover
+python -m unittest discover -s tests -v
 ```
 
 If a change affects first-run UX, setup, lifecycle state, or cloud safety, also update the matching agent skill and README/docs references so future agents see the new workflow.

@@ -6058,7 +6058,7 @@ def main(argv: list[str] | None = None) -> int:
         sub,
         "finalize",
         help=argparse.SUPPRESS,
-        examples="  sweetspot finalize run-1 --from-state --upload --publish-ready\n  sweetspot admin finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
+        examples="  sweetspot admin finalize run-1 --from-state --upload --publish-ready\n  sweetspot admin finalize --run-id run-1 --output-prefix s3://bucket/run-1 --tasks-jsonl tasks.jsonl --upload --publish-ready",
     )
     p.add_argument("run_id_arg", nargs="?", help="Run id; with --from-state this is used to locate artifacts/RUN_ID/run_state.json unless --artifact-dir is set")
     p.add_argument("--profile")

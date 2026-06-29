@@ -9,6 +9,8 @@ Advanced/admin guide for creating, validating, and enqueuing SweetSpot tasks to 
 
 ## When to use
 
+Do not use this skill for a normal new run. Use `sweetspot-run` instead; manual enqueueing bypasses the primary controller workflow.
+
 Invoke this skill for advanced/operator workflows. For new manifest-based runs, prefer `sweetspot-run` and let `sweetspot plan`/`sweetspot run` materialize canary and production tasks.
 
 Use this skill when an agent explicitly needs to:
@@ -25,8 +27,8 @@ Before preparing a large Spot run, design tasks to be **small, idempotent, and c
 1. Split large inputs into bounded shards with stable `task_id`s and deterministic output/done-marker paths.
 2. Keep per-task runtime comfortably below `timeout_seconds`; if the estimate is close to the timeout, split smaller or add checkpointing.
 3. Run a canary subset before the full enqueue.
-4. Have the worker command write `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, and `output_bytes` so `sweetspot estimate-runtime` and `sweetspot scout` can rank pools by useful work, not just hourly price.
-5. After the canary, run `sweetspot scout --preset mixed --observed-summaries ...` to surface potential ARM/Graviton savings. Use ARM only after an ARM canary proves the workload and image are compatible.
+4. Have the worker command write `SWEETSPOT_METRICS_PATH` with `completed_units`, `useful_compute_seconds`, `input_bytes`, and `output_bytes` so `sweetspot admin estimate-runtime` and `sweetspot admin scout` can rank pools by useful work, not just hourly price.
+5. After the canary, run `sweetspot admin scout --preset mixed --observed-summaries ...` to surface potential ARM/Graviton savings. Use ARM only after an ARM canary proves the workload and image are compatible.
 
 ## Task schema
 
@@ -109,14 +111,14 @@ with open("tasks.jsonl", "w") as f:
 ### Validate and enqueue
 ```bash
 # Dry-run: validates tasks and writes artifacts without sending to SQS
-sweetspot enqueue-jsonl \
+sweetspot admin enqueue-jsonl \
   --tasks-jsonl tasks.jsonl \
   --run-id my-run-001 \
   --artifact-dir artifacts/my-run-001 \
   --allowed-s3-prefix s3://my-bucket/runs/my-run-001
 
 # Submit: validates, writes artifacts, and sends to SQS
-sweetspot enqueue-jsonl \
+sweetspot admin enqueue-jsonl \
   --tasks-jsonl tasks.jsonl \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --run-id my-run-001 \
@@ -127,7 +129,7 @@ sweetspot enqueue-jsonl \
 
 ### Derive a canary subset
 ```bash
-sweetspot derive-canary \
+sweetspot admin derive-canary \
   --tasks-jsonl artifacts/my-run-001/tasks.jsonl \
   --out-dir artifacts/my-run-001/canary \
   --task-count 4 \
@@ -137,7 +139,7 @@ sweetspot derive-canary \
 
 ### Estimate runtime from canary telemetry
 ```bash
-sweetspot estimate-runtime \
+sweetspot admin estimate-runtime \
   --sample-jsonl artifacts/my-run-001/canary/summaries.jsonl \
   --target-units 1000000 \
   --active-workers 64 \
@@ -149,7 +151,7 @@ sweetspot estimate-runtime \
 
 ### Atomic enqueue + submit
 ```bash
-sweetspot enqueue-and-submit \
+sweetspot admin enqueue-and-submit \
   --tasks-jsonl tasks.jsonl \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --batch-job-queue my-batch-spot-queue \
@@ -196,7 +198,7 @@ sweetspot enqueue-and-submit \
 }
 ```
 
-Check the `warnings` array. If it contains messages about timeout safety or Spot task length, the tasks need to be split smaller before the full enqueue. The same canary summaries should be passed to `sweetspot scout --observed-summaries` so pool choice accounts for real throughput and retry/discard overhead.
+Check the `warnings` array. If it contains messages about timeout safety or Spot task length, the tasks need to be split smaller before the full enqueue. The same canary summaries should be passed to `sweetspot admin scout --observed-summaries` so pool choice accounts for real throughput and retry/discard overhead.
 
 ## Common pitfalls
 

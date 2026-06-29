@@ -9,6 +9,8 @@ Advanced/admin guide for Spot pool ranking, cost estimation, and multi-lane work
 
 ## When to use
 
+Do not use this skill as the primary path for a normal new run. Use `sweetspot-run` instead; scout is an advanced read-only cost/capacity investigation tool.
+
 Invoke this skill for advanced/operator workflows. For new manifest-based runs, prefer `sweetspot-run`; `sweetspot plan` consumes measured canary telemetry for architecture/resource selection, while scout remains a read-only capacity/cost investigation tool.
 
 Use this skill when an agent explicitly needs to:
@@ -50,12 +52,12 @@ Scout uses these to compute pool-specific replay fractions and throughput rates.
 
 ## CLI commands
 
-### sweetspot scout / sweetspot-scout
+### sweetspot admin scout / sweetspot-scout
 
-Read-only Spot pool ranking tool. Does not submit jobs or mutate resources. Prefer the nested `sweetspot scout` command; the standalone `sweetspot-scout` entry point remains available for compatibility.
+Read-only Spot pool ranking tool. Does not submit jobs or mutate resources. Prefer the nested `sweetspot admin scout` command; the standalone `sweetspot-scout` entry point remains available for compatibility.
 
 ```bash
-sweetspot scout \
+sweetspot admin scout \
   --preset smallest \
   --worker-memory-mib 1536 \
   --regions us-west-2 us-east-2 eu-north-1 \
@@ -84,12 +86,12 @@ Key arguments:
 - `--nat-gb-per-1m-units`: NAT data processing cost per 1M units
 - `--json-out`: Write JSON results to this path
 
-### sweetspot lane-manager / sweetspot-lane-manager
+### sweetspot admin lane-manager / sweetspot-lane-manager
 
-Multi-region lane allocator. Reads a config file and allocates workers across pre-existing lanes. Prefer the nested `sweetspot lane-manager` command; the standalone `sweetspot-lane-manager` entry point remains available for compatibility.
+Multi-region lane allocator. Reads a config file and allocates workers across pre-existing lanes. Prefer the nested `sweetspot admin lane-manager` command; the standalone `sweetspot-lane-manager` entry point remains available for compatibility.
 
 ```bash
-sweetspot lane-manager --config lanes.json
+sweetspot admin lane-manager --config lanes.json
 ```
 
 Lane config format:
@@ -201,6 +203,6 @@ Use for workloads that are ARM-compatible or container-based:
 
 1. **Running scout without telemetry**: Price-only ranking is misleading. Always try to provide `--observed-summaries` from canary or prior runs.
 2. **No placement score gating**: Without `min_placement_score`, lanes may be allocated to pools where AWS cannot fulfill capacity, causing `RUNNABLE` stalls.
-3. **Lane manager dry-run**: Like other SweetSpot commands, `sweetspot lane-manager` / `sweetspot-lane-manager` is dry-run by default. Check the output before adding `--submit`.
+3. **Lane manager dry-run**: Like other SweetSpot commands, `sweetspot admin lane-manager` / `sweetspot-lane-manager` is dry-run by default. Check the output before adding `--submit`.
 4. **Forgetting transfer costs**: Cross-region or NAT costs can erase Spot savings for data-intensive workloads. Use `--cross-region-gb-per-1m-units` and `--nat-gb-per-1m-units`.
 5. **ARM compatibility**: Test workloads on Graviton with a canary before committing to ARM-only lanes.

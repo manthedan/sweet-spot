@@ -9,7 +9,9 @@ Guide for operational diagnostics, DLQ management, and troubleshooting SweetSpot
 
 ## When to use
 
-Invoke this skill for advanced/operator workflows. For normal run visibility, prefer `sweetspot-run` plus `sweetspot status RUN_ID`; use this skill when diagnosis goes beyond the simplified workflow.
+Do not use this skill for normal new-run operation. Use `sweetspot-run` instead.
+
+Invoke this skill for advanced/operator workflows. For normal run visibility, prefer `sweetspot-run` plus `sweetspot status RUN_ID --from-state`; use this skill when diagnosis goes beyond the simplified workflow.
 
 Use this skill when an agent explicitly needs to:
 - Diagnose SweetSpot or AWS infrastructure issues
@@ -21,14 +23,21 @@ Use this skill when an agent explicitly needs to:
 
 ## Diagnostic workflow
 
-When something goes wrong, follow this diagnostic sequence:
+When something goes wrong, start from persisted lifecycle state before escalating into AWS operator mode:
 
-1. **Run status** for a quick identity, queue depth, DLQ depth, and active-worker snapshot
-2. **Run doctor** to validate AWS prerequisites
+```bash
+sweetspot status RUN_ID --artifact-dir artifacts/RUN_ID --from-state
+sweetspot explain RUN_ID --artifact-dir artifacts/RUN_ID --from-state --format text
+```
+
+Then follow this diagnostic sequence when the lifecycle report points to AWS/SQS/Batch/S3 trouble:
+
+1. **Run state-driven status/explain** for bindings, progress, and next actions
+2. **Run admin doctor** to validate AWS prerequisites
 3. **Check DLQ** for failed tasks
 4. **Inspect jobs** for FAILED status or RUNNABLE stalls
 5. **Read logs** for error details
-6. **Finalize** to get a complete picture of task states
+6. **Use finish/admin finalize** to get a complete picture of task states
 7. **Plan repairs** for incomplete tasks
 
 ## CLI commands
@@ -37,7 +46,7 @@ When something goes wrong, follow this diagnostic sequence:
 
 Validates SQS, S3, Batch, CloudWatch configuration:
 ```bash
-sweetspot doctor \
+sweetspot admin doctor \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --dlq-url https://sqs.us-west-2.amazonaws.com/123456789012/my-dlq \
   --job-queue my-batch-spot-queue \
@@ -85,7 +94,7 @@ Use JSON output for automation and `--format table` for operator snapshots.
 
 Read-only inspection:
 ```bash
-sweetspot dlq \
+sweetspot admin dlq \
   --dlq-url https://sqs.us-west-2.amazonaws.com/123456789012/my-dlq \
   --run-id my-run-001
 ```
@@ -96,7 +105,7 @@ Output shows message breakdown by run_id, schema, receive counts, and examples.
 
 Manual filtered redrive (small targeted repairs):
 ```bash
-sweetspot dlq \
+sweetspot admin dlq \
   --dlq-url https://sqs.us-west-2.amazonaws.com/123456789012/my-dlq \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --run-id my-run-001 \
@@ -105,7 +114,7 @@ sweetspot dlq \
 
 Native whole-DLQ redrive (uses SQS StartMessageMoveTask):
 ```bash
-sweetspot dlq \
+sweetspot admin dlq \
   --dlq-url https://sqs.us-west-2.amazonaws.com/123456789012/my-dlq \
   --queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --native-redrive \
@@ -118,18 +127,18 @@ Native redrive moves the entire DLQ. Use manual redrive with `--run-id` for filt
 
 List jobs by status:
 ```bash
-sweetspot jobs --job-queue my-batch-spot-queue \
+sweetspot admin jobs --job-queue my-batch-spot-queue \
   --status RUNNING --name-regex 'my-run-001'
 ```
 
 Describe a specific job:
 ```bash
-sweetspot describe-job --job-id <id>
+sweetspot admin describe-job --job-id <id>
 ```
 
 Watch a job to completion:
 ```bash
-sweetspot watch-job --job-id <id> --max-seconds 3600
+sweetspot admin watch-job --job-id <id> --max-seconds 3600
 ```
 
 ### Log inspection
@@ -137,13 +146,13 @@ sweetspot watch-job --job-id <id> --max-seconds 3600
 Fetch logs for a job:
 ```bash
 # Last 50 log events
-sweetspot logs --job-id <id> --last 50
+sweetspot admin logs --job-id <id> --last 50
 
 # Filtered log events
-sweetspot logs --job-id <id> --filter-regex 'ERROR|WARN|traceback' --max-events 200
+sweetspot admin logs --job-id <id> --filter-regex 'ERROR|WARN|traceback' --max-events 200
 
 # From a specific log stream
-sweetspot logs --log-stream <stream-name> --log-group /aws/batch/job
+sweetspot admin logs --log-stream <stream-name> --log-group /aws/batch/job
 ```
 
 If `--job-id` is given and `--log-group` is omitted, the CLI auto-detects the log group from the job definition.
@@ -196,13 +205,13 @@ Workers emit structured JSON events to stdout (visible in CloudWatch):
 
 **Diagnosis**:
 ```bash
-sweetspot jobs --job-queue my-batch-spot-queue --status RUNNABLE
-sweetspot describe-job --job-id <stalled-job-id>
+sweetspot admin jobs --job-queue my-batch-spot-queue --status RUNNABLE
+sweetspot admin describe-job --job-id <stalled-job-id>
 ```
 
 Check `statusReason` for quota or capacity messages.
 
-**Resolution**: Use `sweetspot scout` to find better pools, or add an On-Demand repair queue.
+**Resolution**: Use `sweetspot admin scout` to find better pools, or add an On-Demand repair queue.
 
 ### 2. Tasks going to DLQ
 
@@ -210,7 +219,7 @@ Check `statusReason` for quota or capacity messages.
 
 **Diagnosis**:
 ```bash
-sweetspot dlq --dlq-url <dlq-url> --run-id my-run-001
+sweetspot admin dlq --dlq-url <dlq-url> --run-id my-run-001
 ```
 
 Check `by_run` and `by_schema` in the output. Look at receive counts in examples.
@@ -221,7 +230,7 @@ Check `by_run` and `by_schema` in the output. Look at receive counts in examples
 
 **Cause**: Done marker exists but its task hash, schema, or output checksum don't match.
 
-**Diagnosis**: Run finalize and check for `invalid_marker_count` in the output.
+**Diagnosis**: Run `sweetspot finish --from-state --dry-run` first; escalate to `sweetspot admin finalize` and check for `invalid_marker_count` in the output if manual finalizer details are needed.
 
 **Resolution**: Repair tasks automatically use a `.repair-<timestamp>` suffix for the done marker, avoiding collision with the invalid canonical marker.
 
@@ -229,7 +238,7 @@ Check `by_run` and `by_schema` in the output. Look at receive counts in examples
 
 **Cause**: Worker uploaded output but was interrupted before writing the done marker.
 
-**Diagnosis**: Run finalize and check `output_without_done_count`.
+**Diagnosis**: Run `sweetspot finish --from-state --dry-run` first; escalate to `sweetspot admin finalize` and check `output_without_done_count` if manual finalizer details are needed.
 
 **Resolution**: Repair tasks re-run the work. The existing orphan output is safe to garbage-collect after retention.
 
@@ -239,12 +248,12 @@ Check `by_run` and `by_schema` in the output. Look at receive counts in examples
 
 **Diagnosis**:
 ```bash
-sweetspot jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex 'my-run'
+sweetspot admin jobs --job-queue my-batch-spot-queue --status RUNNING --name-regex 'my-run'
 ```
 
 Check active worker count. If zero, submit more workers.
 
-**Resolution**: Use `sweetspot supervise-workers` to maintain a target pool size.
+**Resolution**: Use `sweetspot admin supervise-workers` to maintain a target pool size.
 
 ### 6. Supervisor stopped due to DLQ
 
@@ -258,10 +267,10 @@ Check active worker count. If zero, submit more workers.
 
 | Scenario | Command |
 |---|---|
-| Need to redrive specific run's messages | `sweetspot dlq --dlq-url <url> --queue-url <main> --run-id <id> --apply` |
-| Need to redrive entire DLQ | `sweetspot dlq --dlq-url <url> --queue-url <main> --native-redrive --apply` |
-| Need to inspect before redriving | `sweetspot dlq --dlq-url <url> --run-id <id>` (no --apply) |
-| Need rate-limited native redrive | `sweetspot dlq --dlq-url <url> --native-redrive --max-messages-per-second 100 --apply` |
+| Need to redrive specific run's messages | `sweetspot admin dlq --dlq-url <url> --queue-url <main> --run-id <id> --apply` |
+| Need to redrive entire DLQ | `sweetspot admin dlq --dlq-url <url> --queue-url <main> --native-redrive --apply` |
+| Need to inspect before redriving | `sweetspot admin dlq --dlq-url <url> --run-id <id>` (no --apply) |
+| Need rate-limited native redrive | `sweetspot admin dlq --dlq-url <url> --native-redrive --max-messages-per-second 100 --apply` |
 
 ## Common pitfalls
 
@@ -269,4 +278,4 @@ Check active worker count. If zero, submit more workers.
 2. **Ignoring RUNNABLE stalls**: Jobs in RUNNABLE for more than a few minutes usually means capacity or quota issues. Don't wait hoping they'll start.
 3. **Manual redrive of large DLQ**: Manual receive/send/delete is slow and can hit API rate limits. Use `--native-redrive` for large DLQs.
 4. **Not checking `statusReason`**: When jobs fail, `describe-job` shows `statusReason` and container `exitCode`. These are the primary diagnostic signals.
-5. **Forgetting that done marker is source of truth**: S3 output existing does not mean a task is complete. Always finalize to verify done markers.
+5. **Forgetting that done marker is source of truth**: S3 output existing does not mean a task is complete. Use `sweetspot finish --from-state --dry-run` or `sweetspot admin finalize` to verify done markers.

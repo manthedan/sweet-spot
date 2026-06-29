@@ -9,6 +9,8 @@ Advanced/admin guide for submitting, supervising, and monitoring SweetSpot Batch
 
 ## When to use
 
+Do not use this skill for a normal new run. Use `sweetspot-run` instead; manual worker submission bypasses the primary controller workflow.
+
 Invoke this skill for advanced/operator workflows. For new manifest-based runs, prefer `sweetspot-run`; the controller should choose shard size, resource shape, and initial worker submission from canary evidence.
 
 Use this skill when an agent explicitly needs to:
@@ -49,7 +51,7 @@ All worker-submission commands support `--config <path.json>` (or `SWEETSPOT_CON
 
 Dry-run (default) shows sizing without submitting:
 ```bash
-sweetspot submit-workers \
+sweetspot admin submit-workers \
   --sqs-queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --batch-job-queue my-batch-spot-queue \
   --job-definition my-worker-jobdef:1 \
@@ -76,7 +78,7 @@ Key arguments:
 
 Keeps a bounded pool topped across multiple polling loops:
 ```bash
-sweetspot supervise-workers \
+sweetspot admin supervise-workers \
   --sqs-queue-url https://sqs.us-west-2.amazonaws.com/123456789012/my-work-queue \
   --batch-job-queue my-batch-spot-queue \
   --job-definition my-worker-jobdef:1 \
@@ -106,7 +108,7 @@ Key arguments:
 ### Watch a job to completion
 
 ```bash
-sweetspot watch-job --job-id <id> --max-seconds 3600
+sweetspot admin watch-job --job-id <id> --max-seconds 3600
 ```
 
 Polls every 30 seconds. Exit code 0 = SUCCEEDED, 2 = FAILED, 3 = timeout.
@@ -114,24 +116,24 @@ Polls every 30 seconds. Exit code 0 = SUCCEEDED, 2 = FAILED, 3 = timeout.
 ### List jobs
 
 ```bash
-sweetspot jobs --job-queue my-batch-spot-queue \
+sweetspot admin jobs --job-queue my-batch-spot-queue \
   --status RUNNING --name-regex 'my-run-001'
 ```
 
 ### Describe a job
 
 ```bash
-sweetspot describe-job --job-id <id>
+sweetspot admin describe-job --job-id <id>
 ```
 
 ### View logs
 
 ```bash
 # Last 50 events from a job's logs
-sweetspot logs --job-id <id> --last 50
+sweetspot admin logs --job-id <id> --last 50
 
 # Filter for errors or progress
-sweetspot logs --job-id <id> --filter-regex 'progress|ERROR' --max-events 200
+sweetspot admin logs --job-id <id> --filter-regex 'progress|ERROR' --max-events 200
 ```
 
 ## Output interpretation
