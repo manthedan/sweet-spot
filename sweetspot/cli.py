@@ -279,11 +279,16 @@ def _add_worker_runtime_args(parser: argparse.ArgumentParser, *, legacy_done_mar
 
 
 def cmd_version(args: argparse.Namespace) -> int:
-    try:
-        version = importlib_metadata.version("sweetspot")
-    except importlib_metadata.PackageNotFoundError:
-        version = "0+unknown"
-    print(json.dumps({"schema": "sweetspot.version.v1", "package": "sweetspot", "version": version}, indent=2, sort_keys=True))
+    package_name = "sweetspot-runner"
+    version = "0+unknown"
+    for candidate in ("sweetspot-runner", "sweetspot"):
+        try:
+            version = importlib_metadata.version(candidate)
+            package_name = candidate
+            break
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    print(json.dumps({"schema": "sweetspot.version.v1", "package": package_name, "command": "sweetspot", "version": version}, indent=2, sort_keys=True))
     return 0
 
 
@@ -5082,7 +5087,7 @@ def _print_primary_help() -> None:
     print()
     print("Primary controller workflow:")
     print("  version   Print the installed SweetSpot package version")
-    print("  init      Initialize local SweetSpot project context from setup YAML")
+    print("  init      Initialize local SweetSpot project context interactively or from setup YAML")
     print("  doctor    Validate local .sweetspot context with `doctor project` or render bootstrap status with `doctor bootstrap`; legacy AWS checks require explicit AWS flags")
     print("  plan      Validate a JobSpec and emit a machine-readable Plan JSON envelope")
     print("  run       Dry-run or apply the Plan-authoritative run controller")

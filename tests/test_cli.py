@@ -121,7 +121,8 @@ class VersionTests(unittest.TestCase):
             self.assertEqual(cmd_version(types.SimpleNamespace()), 0)
         report = json.loads(out.getvalue())
         self.assertEqual(report["schema"], "sweetspot.version.v1")
-        self.assertEqual(report["package"], "sweetspot")
+        self.assertEqual(report["package"], "sweetspot-runner")
+        self.assertEqual(report["command"], "sweetspot")
         self.assertEqual(report["version"], "1.2.3")
 
 
@@ -135,7 +136,7 @@ class AdminCommandAliasTests(unittest.TestCase):
         self.assertIn("{version,init,doctor,bootstrap,plan,run,monitor,status,explain,finish,postmortem,cleanup,repair,cancel,admin}", text)
         self.assertNotIn("  finalize  ", text)
         self.assertIn("init", text)
-        self.assertIn("Initialize local SweetSpot project context from setup YAML", text)
+        self.assertIn("Initialize local SweetSpot project context interactively or from setup YAML", text)
         self.assertIn("doctor", text)
         self.assertIn("Validate local .sweetspot context with `doctor project` or render bootstrap status with `doctor bootstrap`; legacy AWS checks require explicit AWS flags", text)
         self.assertIn("sweetspot admin --help", text)

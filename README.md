@@ -88,28 +88,48 @@ Do **not** use SweetSpot when you need:
 - untrusted user-submitted commands,
 - or interactive distributed Python compute.
 
-## Happy path
+## Install
 
-The public path is intentionally small, but the first bootstrap output is a **single-account Spot starter**, not a turnkey production topology:
+For the normal user path, install the isolated CLI tool and create local project context. This is local-only: it does not create AWS resources, ask for AWS secret keys, build images, or launch canaries.
 
 ```bash
-# 1. Create local project context and starter artifacts under .sweetspot/.
-sweetspot init --config examples/setup.example.yaml
+# Install the CLI.
+uv tool install sweetspot-runner
 
-# 2. Validate local setup without touching AWS.
-sweetspot doctor project --project-dir .sweetspot --format json
+# Create local project context under .sweetspot/; no AWS mutation.
+sweetspot init
 
-# 3. Render single-account Spot starter infrastructure intent for review.
-sweetspot bootstrap plan --project-dir .sweetspot --format json
+# Validate local setup; no AWS calls.
+sweetspot doctor project --format json
 
-# 4. After reviewing the plan, apply with the exact confirmation token.
-sweetspot bootstrap apply --project-dir .sweetspot --confirm apply:<token> --format json
+# Render reviewable AWS bootstrap intent; still no apply.
+sweetspot bootstrap plan --format json
+```
 
-# 5. Check the starter JobSpec. Without canary telemetry this reports a blocked
-#    production plan and tells you what calibration is missing.
+Until the package is published, install from GitHub instead:
+
+```bash
+uv tool install git+https://github.com/manthedan/sweet-spot.git
+# or: pipx install git+https://github.com/manthedan/sweet-spot.git
+```
+
+## Happy path
+
+The public path is intentionally staged. First success is a safe local project bundle; the first bootstrap output is a **single-account Spot starter**, not a turnkey production topology. If you want repeatable noninteractive setup, pass a setup config with the project root, not the generated `.sweetspot/` directory:
+
+```bash
+sweetspot init --config examples/setup.example.yaml --project-dir .
+sweetspot doctor project --format json
+sweetspot bootstrap plan --format json
+
+# After reviewing .sweetspot/bootstrap-plan.json, apply with the exact confirmation token.
+sweetspot bootstrap apply --confirm apply:<token> --format json
+
+# Check the starter JobSpec. Without canary telemetry this reports a blocked
+# production plan and tells you what calibration is missing.
 sweetspot plan .sweetspot/job.json
 
-# 6. Do a local run dry-run/state handoff before cloud mutation.
+# Do a local run dry-run/state handoff before cloud mutation.
 sweetspot run .sweetspot/job.json --artifact-dir artifacts/example-run
 ```
 
@@ -177,7 +197,7 @@ The primary agent interface uses a high-level controller workflow. Lower-level o
 
 | Command | Purpose | Key flags |
 | --- | --- | --- |
-| `sweetspot init` | Initialize a local `.sweetspot/` starter bundle from a setup config without provisioning AWS. | `--config`, `--project-dir`, `--force` |
+| `sweetspot init` | Initialize a local `.sweetspot/` starter bundle interactively or from a setup config without provisioning AWS. | `--config`, `--project-dir`, `--overwrite` |
 | `sweetspot doctor project` | Validate local setup artifacts and emit failure-closed project diagnostics for agents. | `--project-dir`, `--format json` |
 | `sweetspot plan` | Generate canary and production plans from a JobSpec. | `--input-manifest-jsonl`, `--out-canary-tasks-jsonl`, `--canary-summary-jsonl` |
 | `sweetspot run` | Execute canaries, submit production workers, reconcile. | `--deployment`, `--apply`, `--kickoff-only`, `--reconcile-until-drained`, `--finalize` |

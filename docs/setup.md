@@ -1,15 +1,39 @@
 # SweetSpot setup and first run handoff
 
-This guide is for a cold human or agent starting from an existing SweetSpot checkout. It explains how to create a contained local `.sweetspot/` starter bundle, what each generated artifact means, how AWS authentication is represented safely, and how to validate the project before continuing to runtime-first commands.
+This guide is for a cold human or agent starting from an installed SweetSpot CLI or an existing checkout. It explains how to create a contained local `.sweetspot/` starter bundle, what each generated artifact means, how AWS authentication is represented safely, and how to validate the project before continuing to runtime-first commands.
 
 `SweetSpot init` is local setup only. It does not create AWS queues, buckets, roles, Batch job definitions, container images, Terraform state, deployments, or live AWS checks. Treat the generated files as reviewable starter context for later milestones, not as provisioned infrastructure.
 
-## Quick path from example config to validation
+## Install and first safe success
 
-Use the example config when you want repeatable, noninteractive setup:
+The recommended install shape is an isolated CLI tool. First success should be local, safe, and fast:
 
 ```bash
-sweetspot init --config examples/setup.example.yaml
+uv tool install sweetspot-runner
+sweetspot init
+sweetspot doctor project --format json
+```
+
+Until the package is published, install from GitHub instead:
+
+```bash
+uv tool install git+https://github.com/manthedan/sweet-spot.git
+# or: pipx install git+https://github.com/manthedan/sweet-spot.git
+```
+
+AWS bootstrap remains a separate explicit stage:
+
+```bash
+sweetspot bootstrap plan --format json
+sweetspot bootstrap apply --confirm apply:<token> --format json
+```
+
+## Quick path from example config to validation
+
+Use the example config when you want repeatable, noninteractive setup. `--project-dir` is the containing project root where `.sweetspot/` will be written; do not pass `.sweetspot` itself.
+
+```bash
+sweetspot init --config examples/setup.example.yaml --project-dir .
 sweetspot plan .sweetspot/job.json --format json
 sweetspot doctor project --format json
 ```
@@ -34,7 +58,7 @@ If `.sweetspot/` already exists, `sweetspot init` fails closed rather than silen
 Run config-driven init when an agent, CI-like local script, or repeatable onboarding path needs deterministic output:
 
 ```bash
-sweetspot init --config examples/setup.example.yaml
+sweetspot init --config examples/setup.example.yaml --project-dir .
 ```
 
 The config must be valid YAML, must use `schema: sweetspot.project.v1`, must keep bootstrap paths under `.sweetspot/`, and must not contain secret-looking keys or values. Auth is configuration intent only; keep real credentials in your normal AWS tooling outside this repository.

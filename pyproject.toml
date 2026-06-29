@@ -1,5 +1,5 @@
 [project]
-name = "sweetspot"
+name = "sweetspot-runner"
 version = "0.1.0"
 description = "SweetSpot: durable AWS Batch + SQS + S3 runner for cost-aware Spot workloads."
 readme = "README.md"
