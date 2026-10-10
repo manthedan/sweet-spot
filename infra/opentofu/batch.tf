@@ -4,187 +4,47 @@ resource "aws_cloudwatch_log_group" "batch" {
   tags              = local.tags
 }
 
-resource "aws_batch_compute_environment" "spot" {
-  compute_environment_name = "${var.project_name}-cpu-spot"
+resource "aws_batch_compute_environment" "lane" {
+  for_each                 = var.lanes
+  compute_environment_name = "${var.project_name}-${each.key}"
   type                     = "MANAGED"
   service_role             = aws_iam_role.batch_service.arn
 
   compute_resources {
-    type                = "SPOT"
-    allocation_strategy = var.spot_allocation_strategy
-    bid_percentage      = var.spot_bid_percentage
+    type                = each.value.type
+    allocation_strategy = coalesce(each.value.allocation_strategy, each.value.type == "SPOT" ? "SPOT_PRICE_CAPACITY_OPTIMIZED" : "BEST_FIT_PROGRESSIVE")
+    spot_iam_fleet_role = each.value.type == "SPOT" ? aws_iam_role.spot_fleet.arn : null
     min_vcpus           = 0
-    max_vcpus           = var.max_vcpus_spot
+    max_vcpus           = each.value.max_vcpus
     desired_vcpus       = 0
-    instance_type       = var.spot_instance_types
+    instance_type       = each.value.instance_types
     subnets             = local.subnet_ids
     security_group_ids  = local.security_group_ids
     instance_role       = aws_iam_instance_profile.ecs_instance.arn
-
+    ec2_configuration {
+      image_type = each.value.gpu ? "ECS_AL2023_NVIDIA" : "ECS_AL2023"
+    }
     launch_template {
       launch_template_id = aws_launch_template.batch.id
-      version            = "$Latest"
+      version            = tostring(aws_launch_template.batch.latest_version)
     }
   }
-
   tags = local.tags
-
+  depends_on = [aws_iam_role_policy_attachment.batch_service, aws_iam_role_policy_attachment.ecs_instance,
+  aws_iam_role_policy_attachment.spot_fleet]
   lifecycle {
-    precondition {
-      condition     = !var.require_explicit_subnets || length(var.subnet_ids) > 0
-      error_message = "require_explicit_subnets=true requires non-empty subnet_ids."
-    }
-    precondition {
-      condition     = var.sqs_dlq_message_retention_seconds > var.sqs_message_retention_seconds
-      error_message = "sqs_dlq_message_retention_seconds must be greater than sqs_message_retention_seconds."
-    }
+    ignore_changes = [compute_resources[0].desired_vcpus]
   }
 }
 
-resource "aws_batch_job_queue" "spot" {
-  name     = "${var.project_name}-cpu-spot-queue"
+resource "aws_batch_job_queue" "lane" {
+  for_each = var.lanes
+  name     = "${var.project_name}-${each.key}"
   state    = "ENABLED"
   priority = 100
   compute_environment_order {
     order               = 1
-    compute_environment = aws_batch_compute_environment.spot.arn
+    compute_environment = aws_batch_compute_environment.lane[each.key].arn
   }
-  tags = local.tags
-}
-
-resource "aws_batch_compute_environment" "spot_arm" {
-  count                    = var.create_arm_spot_queue ? 1 : 0
-  compute_environment_name = "${var.project_name}-cpu-spot-arm64"
-  type                     = "MANAGED"
-  service_role             = aws_iam_role.batch_service.arn
-
-  compute_resources {
-    type                = "SPOT"
-    allocation_strategy = var.spot_allocation_strategy
-    bid_percentage      = var.spot_bid_percentage
-    min_vcpus           = 0
-    max_vcpus           = var.max_vcpus_spot_arm
-    desired_vcpus       = 0
-    instance_type       = var.spot_arm_instance_types
-    subnets             = local.subnet_ids
-    security_group_ids  = local.security_group_ids
-    instance_role       = aws_iam_instance_profile.ecs_instance.arn
-
-    launch_template {
-      launch_template_id = aws_launch_template.batch.id
-      version            = "$Latest"
-    }
-  }
-
-  tags = local.tags
-}
-
-resource "aws_batch_job_queue" "spot_arm" {
-  count    = var.create_arm_spot_queue ? 1 : 0
-  name     = "${var.project_name}-cpu-spot-arm64-queue"
-  state    = "ENABLED"
-  priority = 90
-  compute_environment_order {
-    order               = 1
-    compute_environment = aws_batch_compute_environment.spot_arm[0].arn
-  }
-  tags = local.tags
-}
-
-resource "aws_batch_compute_environment" "ondemand" {
-  count                    = var.create_ondemand_queue ? 1 : 0
-  compute_environment_name = "${var.project_name}-cpu-ondemand"
-  type                     = "MANAGED"
-  service_role             = aws_iam_role.batch_service.arn
-
-  compute_resources {
-    type               = "EC2"
-    min_vcpus          = 0
-    max_vcpus          = var.max_vcpus_ondemand
-    desired_vcpus      = 0
-    instance_type      = ["optimal"]
-    subnets            = local.subnet_ids
-    security_group_ids = local.security_group_ids
-    instance_role      = aws_iam_instance_profile.ecs_instance.arn
-
-    launch_template {
-      launch_template_id = aws_launch_template.batch.id
-      version            = "$Latest"
-    }
-  }
-
-  tags = local.tags
-}
-
-resource "aws_batch_job_queue" "ondemand" {
-  count    = var.create_ondemand_queue ? 1 : 0
-  name     = "${var.project_name}-cpu-ondemand-queue"
-  state    = "ENABLED"
-  priority = 10
-  compute_environment_order {
-    order               = 1
-    compute_environment = aws_batch_compute_environment.ondemand[0].arn
-  }
-  tags = local.tags
-}
-
-resource "aws_batch_job_definition" "worker" {
-  name = "${var.project_name}-worker"
-  type = "container"
-
-  container_properties = jsonencode({
-    image      = var.worker_image_uri
-    vcpus      = var.worker_vcpus
-    memory     = var.worker_memory_mib
-    jobRoleArn = aws_iam_role.worker_task.arn
-    command    = ["sweetspot", "worker"]
-    environment = [
-      { name = "SWEETSPOT_SQS_QUEUE_URL", value = aws_sqs_queue.work.url },
-      { name = "SWEETSPOT_MAX_MESSAGES", value = "1" },
-      { name = "SWEETSPOT_WORKER_VCPUS", value = tostring(var.worker_vcpus) },
-      { name = "SWEETSPOT_WORKER_MEMORY_MIB", value = tostring(var.worker_memory_mib) },
-      { name = "SWEETSPOT_ALLOWED_S3_PREFIXES", value = join(",", local.worker_allowed_s3_prefixes_effective) }
-    ]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.batch.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "sweetspot"
-      }
-    }
-  })
-
-  tags = local.tags
-}
-
-resource "aws_batch_job_definition" "worker_arm" {
-  count = var.create_arm_spot_queue ? 1 : 0
-  name  = "${var.project_name}-worker-arm64"
-  type  = "container"
-
-  container_properties = jsonencode({
-    image      = local.worker_image_uri_arm_effective
-    vcpus      = var.worker_vcpus
-    memory     = var.worker_memory_mib
-    jobRoleArn = aws_iam_role.worker_task.arn
-    command    = ["sweetspot", "worker"]
-    environment = [
-      { name = "SWEETSPOT_SQS_QUEUE_URL", value = aws_sqs_queue.work.url },
-      { name = "SWEETSPOT_MAX_MESSAGES", value = "1" },
-      { name = "SWEETSPOT_WORKER_VCPUS", value = tostring(var.worker_vcpus) },
-      { name = "SWEETSPOT_WORKER_MEMORY_MIB", value = tostring(var.worker_memory_mib) },
-      { name = "SWEETSPOT_ALLOWED_S3_PREFIXES", value = join(",", local.worker_allowed_s3_prefixes_effective) }
-    ]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.batch.name
-        "awslogs-region"        = var.aws_region
-        "awslogs-stream-prefix" = "sweetspot-arm64"
-      }
-    }
-  })
-
   tags = local.tags
 }

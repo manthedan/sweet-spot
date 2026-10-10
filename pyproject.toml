@@ -1,7 +1,7 @@
 [project]
 name = "sweetspot-runner"
-version = "0.1.0"
-description = "SweetSpot: durable AWS Batch + SQS + S3 runner for cost-aware Spot workloads."
+version = "0.2.0.dev0"
+description = "Run thousands of independent commands on AWS Batch Spot: cheap, retried, and verifiable."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: System :: Distributed Computing",
 ]
-dependencies = ["boto3==1.43.36", "botocore==1.43.36", "PyYAML==6.0.2"]
+dependencies = ["boto3>=1.35.10"]  # S3 conditional writes (If-None-Match)
 
 [project.urls]
 Homepage = "https://github.com/manthedan/sweet-spot"
@@ -24,12 +24,10 @@ Repository = "https://github.com/manthedan/sweet-spot"
 Issues = "https://github.com/manthedan/sweet-spot/issues"
 
 [project.optional-dependencies]
-dev = ["mypy==1.14.1", "ruff==0.8.6", "types-PyYAML==6.0.12.20260518"]
+dev = ["mypy==1.14.1", "ruff==0.8.6", "moto[s3,sqs,batch,iam]>=5.0.20"]
 
 [project.scripts]
 sweetspot = "sweetspot.cli:main"
-sweetspot-scout = "sweetspot.scout:main"
-sweetspot-lane-manager = "sweetspot.lane_manager:main"
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]

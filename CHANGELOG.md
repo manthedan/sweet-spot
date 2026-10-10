@@ -1,104 +1,28 @@
 # Changelog
 
-All notable changes to this project are documented here. This project uses human-readable release notes; tag names should use the chosen public package/repo name plus a semantic version when releases begin.
+## 0.2.0 (unreleased): rewrite
 
-## Unreleased
+0.1 had grown to ~16k lines and 35 commands (setup wizard, guarded bootstrap apply, a lifecycle state machine, a
+planner that refused to plan without canaries). 0.2 keeps the parts that earned their place (the SQS lease +
+conditional S3 done-marker protocol, measured $/unit lane selection, the OpenTofu stack) and rebuilds the rest
+around one file format and nine commands.
 
-### Added
-
-- Contributor guide covering local development, release checks, dependency pins, and SweetSpot's trusted-workload boundary.
-- PyPI-oriented project metadata for repository URLs, keywords, classifiers, and SPDX license expression.
-- `enqueue-and-submit` command that waits for SQS visible-message depth before sizing/submitting a worker wave.
-- `repair-plan` command that combines finalizer task status with Batch job/log state to avoid repairing tasks still owned by active workers.
-- `estimate-runtime` command for canary-derived wall-time, timeout-risk, and compute-cost estimates.
-- `cleanup-stale-messages` command for dry-run/apply deletion of visible duplicate SQS messages whose done markers already exist.
-- README guidance for small idempotent chunks, canary sizing, safe repair planning, and stale-message cleanup.
-- Consistent `--profile`/`--region` options for AWS-touching CLI commands.
-- `sweetspot version` command for checking the installed package version.
-- `--queue-url` alias for worker-submission commands that previously exposed only `--sqs-queue-url`.
-- Short argparse help examples for high-traffic production workflow commands.
-- `sweetspot status` command for a one-shot AWS identity, queue-depth, DLQ-depth, and active-worker overview.
-- JSON `--config` / `SWEETSPOT_CONFIG` support for prepopulating common command defaults and required workflow flags.
-- `sweetspot scout` and `sweetspot lane-manager` subcommands, while preserving the standalone entry points.
-- Opt-in human-readable `sweetspot status --format table` output while keeping JSON as the default.
-- Clearer `sweetspot logs` aliases: `--max-events` for `--limit` and `--last` for `--tail`.
-- Opt-in `--format table` output for read-oriented operator commands: `jobs`, `describe-job`, `logs`, `watch-job`, `doctor`, and `dlq`.
-- `sweetspot finalize --dry-run` for previewing upload/READY targets while skipping S3 mutations.
-- Guarded `sweetspot cancel-jobs` command with dry-run default, `--apply`, and explicit `--terminate-running` for active Batch jobs.
-- Mixed-architecture cost guidance, including opt-in ARM/Graviton scouting docs, per-lane lane-manager instance type overrides, and a mixed x86/ARM lane example.
-- `sweetspot cancel-jobs --format table` plus `--sqs-queue-url` aliases/config defaults for enqueue workflows.
-- `sweetspot.job.v1` / `sweetspot.plan.v1` contract validation foundations with examples and stable planner reason codes.
-- Initial `sweetspot plan JOB_SPEC` command that validates the declarative job contract and emits JSON plan status/reason codes without mutating AWS resources.
-- `sweetspot scout --worker-memory` for memory-aware worker packing and cost estimates.
-- Machine-readable `sweetspot scout` reason codes for default throughput, unobserved replay, and omitted optional cost components.
-- Worker telemetry now records requested worker vCPU/memory, task-reported peak memory when available, and best-effort IMDS instance type/AZ fallback.
-- Scout observed-performance telemetry now exposes `ApproximateReceiveCount` replay lower bounds and warns when replay cost is lower-bound-only or only partially captured by discarded-compute summaries.
-- Optional OpenTofu ARM/Graviton Spot queue and worker job definition for canary-gated x86/ARM lane separation.
-- Worker telemetry now records best-effort EC2 Spot interruption and rebalance notices from IMDS when available.
-- Internal adaptive shard-sizing helper for growing canaries toward replay-safe task durations without agent-supplied shard sizes.
-- `sweetspot plan --canary-summary-jsonl` to embed adaptive shard-sizing decisions from local canary summaries in the Plan JSON envelope.
-- `sweetspot plan --input-manifest-jsonl` can combine a local logical-unit manifest copy with canary sizing to report adaptive production shard counts without mutating AWS resources.
-- Controller-owned adaptive canary task materialization via `sweetspot plan --out-canary-tasks-jsonl` and `sweetspot run --artifact-dir`, including geometric canary escalation before production shards are emitted.
-- Canary task artifacts now cover the built-in 1/2/4 vCPU resource lattice and paired x86/ARM candidates when ARM is explicitly allowed.
-- Planner resource selection from measured canary telemetry, including OOM/validation rejection, ARM compatibility/cost gating, and ready-plan execution settings when shard and resource calibration are both available.
-- `sweetspot repair RUN_ID` high-level wrapper that builds run-scoped repair plans by default and can enqueue repair tasks with guarded `--apply`.
-- `sweetspot plan --out-production-tasks-jsonl` for explicitly writing calibrated production `sweetspot.task.v1` shards as a local review/enqueue artifact.
-- Adaptive canary decisions now block production shard generation with `canary_validation_failed` when canaries fail framework/output validation.
-- Initial `sweetspot run JOB_SPEC` dry-run controller report that nests the planner output and can write local run-state/task artifacts.
-- `sweetspot run JOB_SPEC --apply` kickoff/resume controller: with calibrated production tasks and an artifact directory, it persists `run_state.json`, enqueues tasks once, submits an initial run-scoped Batch worker wave once, and resumes without re-enqueueing completed phases.
-- High-level `sweetspot cancel RUN_ID` wrapper for run-scoped Batch job cancellation with dry-run default and guarded `--apply`.
-- Run-centric `sweetspot status RUN_ID` summaries for local run/finalizer/repair artifacts, with Batch worker filtering scoped to the run by default.
-- Thin `sweetspot-run` agent skill for the simplified `plan`/`run`/`status`/`repair`/`cancel` workflow, with lower-level phase commands documented as advanced/operator controls.
-- Deployment registry preflight for Plan-authoritative `run --apply`, including digest-pinned image validation and remote manifest identity binding before mutation.
-- Bounded production worker reconciliation rounds after initial Plan-sized submission, with shared-queue-safe backlog accounting and durable pre-submit persistence for any dedicated-queue top-up workers.
-- Integrated production finalization for `sweetspot run --apply --finalize`, which streams done-marker validation over persisted production tasks, writes finalizer artifacts, and records complete/incomplete finalizer state in `run_state.json`.
-- Safe controller-owned canary apply: canary Plans can enqueue/submit workers only through deployment-registry `canary_routes` that isolate every resource candidate on its own SQS queue/job definition; missing routes fail closed.
-- `sweetspot run --apply --collect-canary-summaries` to gather controller canary summaries from S3, persist the measured summary JSONL, and write production Plan/task artifacts when calibration is ready.
-- Dedicated production reconcile/watch mode via `sweetspot run --apply --dedicated-run-queue --reconcile-until-drained`, which keeps observing run-scoped queue depth and Batch workers until drain or the configured round limit.
-- Shared Scout/Planner expected-cost model plus a Tiny Leela Stockfish 18 case study documenting the production lessons behind the controller workflow.
-- `sweetspot admin ...` aliases for advanced/operator commands such as enqueueing, worker submission, finalization, scouting, diagnostics, and cleanup.
-
-### Changed
-
-- Top-level `sweetspot --help` now presents the primary controller workflow (`plan`, `run`, `status`, `repair`, `cancel`) plus `admin`, while lower-level/operator commands are documented under `sweetspot admin ...`; direct legacy top-level forms remain accepted for compatibility.
-- README and bundled agent skills now demote lower-level enqueue/worker/finalize/scout/reference workflows as advanced/admin surfaces and point new runs to `sweetspot-run`.
-- Controller run-state, enqueue, and Batch worker helper logic moved into `sweetspot.run_state`, `sweetspot.enqueue_service`, and `sweetspot.batch_service` so CLI orchestration can continue thinning into services without changing JSON contracts.
-- `sweetspot scout` now emits JSON to stdout by default; human table output is opt-in with `--format table`.
-
-### Fixed
-
-- `sweetspot scout` now labels placement scores as configuration-scoped on per-pool rows instead of implying per-instance/AZ placement guarantees.
-- Operator-facing CLI failures for SQS batch sends, S3 bulk deletes, DLQ queue ARN lookup, and doctor validation now report clean errors instead of uncaught `RuntimeError` tracebacks.
-- `scripts/verify_release.sh` now works on systems that provide `python3` but not `python`, and reports missing release-check dependencies with install guidance.
-
-## sweetspot-v0.1.0 - 2026-06-23
-
-### Added
-
-- Atomic attempt/commit protocol with attempt-scoped output and summary artifacts.
-- Hardened task validation, reserved environment namespaces, S3 prefix allow-listing, and least-privilege infrastructure defaults.
-- Live worker observability: redacted stdout/stderr streaming, capped S3 attempt logs, job/log inspection commands, dashboards, and alarms.
-- Streaming finalization artifacts for large runs, repair-task generation, S3 listing indexes, and guarded/version-aware S3 prefix cleanup.
-- Reproducible deployment hardening: pinned dependencies, pinned GitHub Actions, committed OpenTofu provider lock, unprivileged worker container, SBOM/provenance build, and Trivy scan of the exact uploaded OCI artifact.
-- Measured cost optimization: worker telemetry, expected-total-cost Spot scouting, cost-aware lane ordering, and anonymized manifest/case-study templates.
-- Local `scripts/verify_release.sh` closeout script matching CI-critical checks.
-- Optional doctor validation for live AWS/Batch CloudWatch metric dimensions.
-
-### Changed
-
-- Renamed the public project, Python distribution, import package, schemas, environment variables, Docker worker identity, and CLI to SweetSpot / `sweetspot`.
-- Source SQS retention defaults to 13 days and DLQ retention to 14 days to avoid destructive retention shrinkage during upgrades.
-- Spot pool ranking now prefers expected total cost per unit over raw Spot price when telemetry/assumptions are available.
-- Legacy v1 done markers now require explicit migration mode; default worker/finalizer validation expects hash-bound v2 markers.
-- Lane placement-score gating now fails closed when `min_placement_score` is set and AWS returns no score, unless explicitly allowed per lane.
-
-### Fixed
-
-- Upgraded boto3/botocore locks so S3 `PutObject` supports `IfNoneMatch`, and added a contract test for the service model.
-- S3 conditional done-marker commits now retry transient 409 conflicts while treating 412 as an existing marker.
-- DLQ canary probes now generate valid task payloads with explicit done markers.
-- Runtime S3 prefix validation now matches OpenTofu IAM `${prefix}/*` object semantics.
-- Duplicate attempts that lose the done-marker race now persist corrected summaries with discarded compute telemetry.
-- Cost telemetry aggregation excludes commit-lost attempts from useful-throughput denominators.
-- Lane manager pre-counts active workers across all lanes before cost-ordered allocation to avoid oversubmission.
-- CI Trivy action pin updated to a commit whose internal `setup-trivy` dependency resolves to an existing pinned version.
+- Tasks are `{"id", "command", "inputs", ...}` with `{in}`/`{out}` placeholders: existing scripts run unchanged,
+  inputs are staged for them and everything they write to `{out}` is the output. No per-task S3 paths.
+- `sweetspot tasks` generates task files from a command template (`--inputs`, `--inputs-from`, `--count`, `--chunks`).
+- `sweetspot local` runs tasks on your machine with the same runner and commit protocol as the cloud.
+- `sweetspot submit` creates a run (its own SQS queue + DLQ, a registered job definition, one array job of
+  workers) and is the single command to resume, scale, or `--retry` it. Run state lives in S3, not on the
+  machine that submitted it.
+- `status` reports done/failing/queued/workers and the next command to run; `logs` shows every attempt of a task.
+- `finish` verifies every done marker, repairs interrupted promotions, publishes a deterministic `manifest.jsonl`
+  and a conditional `READY`, then releases queues and job definitions.
+- Outputs land at stable paths (`<prefix>/<run>/out/<task id>/`); duplicate attempts never mix files.
+- Workers renew a 5-minute lease instead of holding a long visibility timeout, hand tasks back on Spot interruption
+  notices or SIGTERM (exit 75, retried by Batch), keep one sweeper alive while work is in flight, and stop only on
+  repeated infrastructure errors, not on task failures.
+- Done markers record instance type, image, shape, units, elapsed time, peak RSS and input ETags; `scout --run`
+  turns them into $ per million units by instance type.
+- Removed: init/bootstrap/doctor, the planner and adaptive canary controller, lane-manager, monitor/explain/
+  postmortem/cleanup, the admin command family, the YAML setup bundle, agent skill files, redaction regexes.
+  The task and marker schemas are not compatible with 0.1.

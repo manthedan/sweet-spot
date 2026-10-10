@@ -1,59 +1,25 @@
-output "sqs_work_queue_url" {
-  value = aws_sqs_queue.work.url
+output "sweetspot_config" {
+  description = "Write with tofu output -raw sweetspot_config > sweetspot.json."
+  value = jsonencode({
+    region       = var.aws_region
+    prefix       = "s3://${var.bucket_name}/${local.runs_key}"
+    name         = var.project_name
+    job_role_arn = aws_iam_role.worker_task.arn
+    log_group    = aws_cloudwatch_log_group.batch.name
+    lanes = { for name, lane in var.lanes : name => {
+      job_queue      = aws_batch_job_queue.lane[name].arn
+      arch           = lane.arch
+      gpu            = lane.gpu
+      instance_types = lane.instance_types
+    } }
+    default_lane = var.default_lane
+  })
+  precondition {
+    condition     = contains(keys(var.lanes), var.default_lane)
+    error_message = "default_lane must name a configured lane."
+  }
 }
 
-output "sqs_dlq_url" {
-  value = aws_sqs_queue.dlq.url
-}
-
-output "batch_spot_queue" {
-  value = aws_batch_job_queue.spot.arn
-}
-
-output "batch_spot_x86_queue" {
-  value = aws_batch_job_queue.spot.arn
-}
-
-output "batch_spot_arm_queue" {
-  value = var.create_arm_spot_queue ? aws_batch_job_queue.spot_arm[0].arn : null
-}
-
-output "batch_ondemand_queue" {
-  value = var.create_ondemand_queue ? aws_batch_job_queue.ondemand[0].arn : null
-}
-
-output "worker_job_definition" {
-  value = aws_batch_job_definition.worker.arn
-}
-
-output "worker_x86_job_definition" {
-  value = aws_batch_job_definition.worker.arn
-}
-
-output "worker_arm_job_definition" {
-  value = var.create_arm_spot_queue ? aws_batch_job_definition.worker_arm[0].arn : null
-}
-
-output "worker_task_role_arn" {
-  value = aws_iam_role.worker_task.arn
-}
-
-output "cloudwatch_dashboard_name" {
-  value = var.create_observability ? aws_cloudwatch_dashboard.sweetspot[0].dashboard_name : null
-}
-
-output "cloudwatch_log_group" {
-  value = aws_cloudwatch_log_group.batch.name
-}
-
-output "batch_security_group_ids" {
-  value = local.security_group_ids
-}
-
-output "batch_launch_template_id" {
-  value = aws_launch_template.batch.id
-}
-
-output "monthly_budget_name" {
-  value = var.monthly_budget_limit_usd > 0 ? aws_budgets_budget.monthly[0].name : null
+output "operator_policy_arn" {
+  value = var.create_operator_policy ? aws_iam_policy.operator[0].arn : null
 }

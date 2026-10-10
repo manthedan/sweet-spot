@@ -1,26 +1,13 @@
-FROM python:3.11-slim@sha256:ae52c5bef62a6bdd42cd1e8dffef86b9cd284bde9427da79839de7a4b983e7ca
+# A minimal SweetSpot worker image: build your own FROM this, or copy the pip line into your image.
+# No ENTRYPOINT: the job definition runs `sweetspot worker`.
+FROM python:3.12-slim
 
-ARG APP_UID=10001
-ARG APP_GID=10001
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HOME=/home/sweetspot
+COPY pyproject.toml README.md LICENSE /src/
+COPY sweetspot /src/sweetspot
+RUN pip install --no-cache-dir /src && rm -rf /src
 
-RUN groupadd --gid "${APP_GID}" sweetspot \
-    && useradd --uid "${APP_UID}" --gid sweetspot --home-dir /home/sweetspot --no-create-home --shell /usr/sbin/nologin sweetspot \
-    && mkdir -p /home/sweetspot /work \
-    && chown -R sweetspot:sweetspot /home/sweetspot /work
-
-WORKDIR /app
-COPY pyproject.toml README.md requirements.lock /app/
-COPY sweetspot /app/sweetspot
-COPY examples /app/examples
-
-RUN python -m pip install --no-cache-dir --constraint /app/requirements.lock /app \
-    && python -m pip uninstall -y pip setuptools wheel
-
-USER sweetspot:sweetspot
-WORKDIR /work
-
-CMD ["sweetspot", "worker"]
+RUN useradd --uid 10001 --create-home sweetspot
+USER sweetspot
+WORKDIR /home/sweetspot

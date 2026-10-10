@@ -1,715 +1,317 @@
-#!/usr/bin/env python3
-"""Rank AWS Spot regions/instance pools for AWS Batch retryable CPU workers.
-
-This combines three signals:
-- EC2 Spot placement score for requested vCPU targets.
-- Recent Spot price history by instance type/AZ.
-- Optional observed throughput/retry/discard telemetry from worker summary JSON.
-
-Ranking uses expected total cost per useful unit: Spot compute plus replay,
-startup overhead, and caller-supplied non-compute costs.
-
-It does not submit jobs or mutate AWS resources.
-"""
+"""Spot compute estimates for a worker shape; throughput comes only from matching run telemetry."""
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import gzip
 import json
 import math
 import statistics
 import sys
-from collections import defaultdict
-from pathlib import Path
-from typing import Any, Iterable
-from urllib.parse import urlparse
+from datetime import datetime, timedelta, timezone
+from itertools import islice
+from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
+from .config import Config
+from .store import Store, join
 
-from .cost_model import expected_cost_per_1m_units
-
-X86_CPU_TYPES = [
-    # Include the smallest practical EC2 Spot shapes first.  For 2 GiB
-    # instances, Batch/ECS workers must reserve less than full host memory
-    # (for example 1536 MiB) because host memory is not fully schedulable.
-    "c7a.medium",
-    "c5.large",
-    "c5.xlarge",
-    "c5.2xlarge",
-    "c5.4xlarge",
-    "c5a.large",
-    "c5a.xlarge",
-    "c5a.2xlarge",
-    "c5a.4xlarge",
-    "c6i.large",
-    "c6i.xlarge",
-    "c6i.2xlarge",
-    "c6i.4xlarge",
-    "c6a.large",
-    "c6a.xlarge",
-    "c6a.2xlarge",
-    "c6a.4xlarge",
-    "c7i.large",
-    "c7i.xlarge",
-    "c7i.2xlarge",
-    "c7i.4xlarge",
-    "c7a.large",
-    "c7a.xlarge",
-    "c7a.2xlarge",
-    "c7a.4xlarge",
-    "c8i.large",
-    "c8i.xlarge",
-    "c8i.2xlarge",
-    "c8i.4xlarge",
-    "c8a.large",
-    "c8a.xlarge",
-    "c8a.2xlarge",
-    "c8a.4xlarge",
-    "m5.large",
-    "m5.xlarge",
-    "m5.2xlarge",
-    "m5.4xlarge",
-    "m5a.large",
-    "m5a.xlarge",
-    "m5a.2xlarge",
-    "m5a.4xlarge",
-    "m6i.large",
-    "m6i.xlarge",
-    "m6i.2xlarge",
-    "m6i.4xlarge",
-    "m6a.large",
-    "m6a.xlarge",
-    "m6a.2xlarge",
-    "m6a.4xlarge",
-    "m7i.large",
-    "m7i.xlarge",
-    "m7i.2xlarge",
-    "m7i.4xlarge",
-    "m7a.large",
-    "m7a.xlarge",
-    "m7a.2xlarge",
-    "m7a.4xlarge",
-    "m8i.large",
-    "m8i.xlarge",
-    "m8i.2xlarge",
-    "m8i.4xlarge",
-    "m8a.large",
-    "m8a.xlarge",
-    "m8a.2xlarge",
-    "m8a.4xlarge",
-]
-
-ARM_CPU_TYPES = [
-    # Keep Graviton medium shapes in the default ARM/mixed scout universe so
-    # canary-backed planning can discover cheap 1 vCPU lanes instead of
-    # defaulting to larger "safe" instances.
-    "c7g.medium",
-    "c6g.medium",
-    "c6g.large",
-    "c6g.xlarge",
-    "c6g.2xlarge",
-    "c6g.4xlarge",
-    "c7g.large",
-    "c7g.xlarge",
-    "c7g.2xlarge",
-    "c7g.4xlarge",
-    "c8g.large",
-    "c8g.xlarge",
-    "c8g.2xlarge",
-    "c8g.4xlarge",
-    "m6g.large",
-    "m6g.xlarge",
-    "m6g.2xlarge",
-    "m6g.4xlarge",
-    "m7g.large",
-    "m7g.xlarge",
-    "m7g.2xlarge",
-    "m7g.4xlarge",
-    "m8g.large",
-    "m8g.xlarge",
-    "m8g.2xlarge",
-    "m8g.4xlarge",
-]
-
-SMALLEST_CPU_TYPES = ["c7a.medium", "c7g.medium", "c6g.medium"]
-
-PRESETS = {
-    "smallest": SMALLEST_CPU_TYPES,
-    "x86": X86_CPU_TYPES,
-    "arm": ARM_CPU_TYPES,
-    "mixed": X86_CPU_TYPES + ARM_CPU_TYPES,
-}
-
-SCOUT_REASON_CODES: dict[str, str] = {
-    "cost_components_not_provided": "One or more optional non-compute cost components were left at zero and may be omitted from the estimate.",
-    "replay_fraction_lower_bound_only": "Receive-count telemetry proves at least one replay, but discarded compute was not observed; replay cost is a lower bound unless overridden.",
-    "replay_fraction_partially_observed": "Discarded compute telemetry was observed, but receive-count telemetry proves additional replay attempts may be missing; replay cost is a lower bound unless overridden.",
-    "replay_fraction_unobserved": "Replay/interruption overhead was not observed and defaults to zero unless explicitly overridden.",
-    "throughput_default_used": "No observed throughput summaries were provided, so default units/sec was used.",
-}
+Group = tuple[str, str, int, int, int, str]
 
 
-def parse_s3_uri(uri: str) -> tuple[str, str]:
-    p = urlparse(uri)
-    if p.scheme != "s3" or not p.netloc:
-        raise ValueError(f"not an s3 uri: {uri}")
-    return p.netloc, p.path.lstrip("/")
+def add_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--region")
+    p.add_argument("--instance-types", nargs="+", help="Space or comma separated EC2 types; defaults to configured lanes")
+    p.add_argument("--lane")
+    p.add_argument("--arch", choices=("x86_64", "arm64"))
+    p.add_argument("--vcpus", type=int, default=None, help="Worker vCPUs; defaults to run markers, otherwise 1")
+    p.add_argument("--memory", type=int, default=None, help="Worker memory in MiB; defaults to run markers, otherwise 1536")
+    p.add_argument("--gpus", type=int, default=None, help="Worker GPUs; defaults to run markers, otherwise 0")
+    p.add_argument("--instance-memory-reserve-mib", type=int, default=512, help="Estimated OS/ECS headroom per host; 512 MiB is conservative for small instances")
+    p.add_argument("--hours", type=float, default=24)
+    p.add_argument("--run", help="Use this run's measured throughput, separately for each image and shape")
+    p.add_argument("--max-markers", type=int, default=2000)
+    p.add_argument("--by-az", action="store_true", help="Show each priced AZ in the human table; JSON always includes every AZ")
+    p.add_argument("--json", action="store_true")
 
 
-def chunks(xs: list[str], n: int) -> Iterable[list[str]]:
-    for i in range(0, len(xs), n):
-        yield xs[i : i + n]
+def _arch(value: str) -> str:
+    return {"aarch64": "arm64", "amd64": "x86_64"}.get(value, value)
 
 
-def pct(values: list[float], q: float) -> float:
-    if not values:
-        return math.nan
-    values = sorted(values)
-    idx = min(len(values) - 1, max(0, round((len(values) - 1) * q)))
-    return values[idx]
-
-
-def nonnegative_int(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None:
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
+    return float(value)
+
+
+def _shape(record: dict[str, Any]) -> tuple[int, int, int] | None:
+    w = record.get("worker")
+    if not isinstance(w, dict):
         return None
-    if not math.isfinite(parsed) or parsed < 0:
+    cpu, mem, gpu = _number(w.get("vcpus")), _number(w.get("memory_mib")), _number(w.get("gpus", 0))
+    if not cpu or not mem or gpu is None or not all(value.is_integer() for value in (cpu, mem, gpu)):
         return None
-    return int(parsed)
+    return int(cpu), int(mem), int(gpu)
 
 
-def auto_regions(session: boto3.Session, home_region: str) -> list[str]:
-    ec2 = session.client("ec2", region_name=home_region)
-    regs = ec2.describe_regions(AllRegions=True)["Regions"]
-    return sorted(r["RegionName"] for r in regs if r.get("OptInStatus") in (None, "opt-in-not-required", "opted-in"))
+def _group(record: dict[str, Any]) -> Group | None:
+    shape = _shape(record)
+    if shape is None:
+        return None
+    w = record["worker"]
+    kind, arch, image = w.get("instance_type"), w.get("arch"), w.get("image")
+    if not isinstance(kind, str) or not kind or not isinstance(arch, str) or not isinstance(image, str) or not image:
+        return None
+    if _arch(arch) not in ("x86_64", "arm64"):
+        return None
+    return kind, _arch(arch), *shape, image
 
 
-def latest_spot_prices(ec2, instance_types: list[str], start: dt.datetime, end: dt.datetime) -> dict[tuple[str, str], float]:
-    latest: dict[tuple[str, str], tuple[float, dt.datetime]] = {}
-    # API accepts up to many types, but chunk to survive region-specific unsupported new families.
-    for part in chunks(instance_types, 20):
+def observations(store: Store, prefix: str, limit: int, *, types: set[str] | None = None, arch: str | None = None, lane: str | None = None) -> tuple[dict[Group, dict[str, Any]], dict[str, Any]]:
+    """Sample markers in listing order; replay covers attempts for those same sampled task IDs.
+
+    Missing/best-effort summaries and tasks with no marker make replay a lower bound. Never use host cpus
+    as the worker allocation, or pool measurements from different images or worker shapes.
+    """
+    groups: dict[Group, dict[str, Any]] = {}
+    shapes: set[tuple[int, int, int]] = set()
+    sampled: list[str] = []
+    skipped = 0
+    filtered = 0
+
+    def selected(record: dict[str, Any]) -> bool:
+        w = record.get("worker")
+        if not isinstance(w, dict):
+            return types is None and arch is None and lane is None
+        # Older markers lack lane; type/arch remain usable, but cannot distinguish shared lanes.
+        kind, observed_arch = w.get("instance_type"), w.get("arch")
+        return (types is None or isinstance(kind, str) and kind in types) and (arch is None or isinstance(observed_arch, str) and _arch(observed_arch) == arch) and (lane is None or w.get("lane") in (None, "", lane))
+
+    def read(uri: str) -> dict[str, Any] | None:
+        nonlocal skipped
         try:
-            paginator = ec2.get_paginator("describe_spot_price_history")
-            for page in paginator.paginate(
-                InstanceTypes=part,
-                ProductDescriptions=["Linux/UNIX"],
-                StartTime=start,
-                EndTime=end,
-                PaginationConfig={"MaxItems": 1200},
-            ):
-                for x in page.get("SpotPriceHistory", []):
-                    key = (x["InstanceType"], x["AvailabilityZone"])
-                    val = (float(x["SpotPrice"]), x["Timestamp"])
-                    if key not in latest or val[1] > latest[key][1]:
-                        latest[key] = val
-        except ClientError as exc:
-            # Some newer families are not in all regions yet; try individual fallbacks.
-            if exc.response.get("Error", {}).get("Code") not in {"InvalidParameterValue", "InvalidInstanceType"}:
-                raise
-            for it in part:
-                try:
-                    for page in ec2.get_paginator("describe_spot_price_history").paginate(
-                        InstanceTypes=[it],
-                        ProductDescriptions=["Linux/UNIX"],
-                        StartTime=start,
-                        EndTime=end,
-                        PaginationConfig={"MaxItems": 200},
-                    ):
-                        for x in page.get("SpotPriceHistory", []):
-                            key = (x["InstanceType"], x["AvailabilityZone"])
-                            val = (float(x["SpotPrice"]), x["Timestamp"])
-                            if key not in latest or val[1] > latest[key][1]:
-                                latest[key] = val
-                except ClientError:
+            data = store.get(uri)
+            obj = json.loads(data) if data is not None else None
+            if isinstance(obj, dict):
+                return obj
+        except (ValueError, UnicodeError):
+            pass
+        skipped += 1
+        return None
+
+    def bucket(key: Group) -> dict[str, Any]:
+        return groups.setdefault(key, {"rates": [], "committed_seconds": 0.0, "discarded_seconds": 0.0})
+
+    markers = (uri for uri, _, _ in store.list(join(prefix, "done") + "/") if uri.endswith(".json"))
+    count = 0
+    for uri in islice(markers, limit):
+        count += 1
+        marker = read(uri)
+        if marker is None:
+            continue
+        # Derive the directory from the marker's key, never an unchecked task_id inside JSON.
+        sampled.append(uri.rsplit("/", 1)[-1][:-5])
+        if not selected(marker):
+            filtered += 1
+            continue
+        shape = _shape(marker)
+        if shape is not None:
+            shapes.add(shape)
+        key, elapsed, units = _group(marker), _number(marker.get("elapsed")), _number(marker.get("units"))
+        if key is None or not elapsed:
+            skipped += 1
+            continue
+        group = bucket(key)
+        group["committed_seconds"] += elapsed
+        if units is not None:
+            group["rates"].append(units / elapsed)
+
+    for task_id in sampled:
+        for uri, _, _ in store.list(join(prefix, "attempts", task_id) + "/"):
+            if not uri.endswith("/summary.json"):
+                continue
+            summary = read(uri)
+            if summary is None or summary.get("outcome") not in {"duplicate", "failed", "interrupted"}:
+                continue
+            if not selected(summary):
+                filtered += 1
+                continue
+            key, elapsed = _group(summary), _number(summary.get("elapsed"))
+            if key is None or elapsed is None:
+                skipped += 1
+                continue
+            bucket(key)["discarded_seconds"] += elapsed
+    return groups, {
+        "markers_sampled": count,
+        "marker_limit_reached": count == limit,
+        "skipped_records": skipped,
+        "filtered_records": filtered,
+        "replay_scope": "attempt summaries for sampled completed tasks; observed lower bound",
+        "shapes": [{"vcpus": cpu, "memory_mib": mem, "gpus": gpu} for cpu, mem, gpu in sorted(shapes)],
+    }
+
+
+def capacity(ec2: Any, types: list[str], hours: float) -> tuple[dict[str, Any], dict[tuple[str, str], dict[str, Any]]]:
+    specs: dict[str, Any] = {}
+    prices: dict[tuple[str, str], dict[str, Any]] = {}
+    now = datetime.now(timezone.utc)
+    for offset in range(0, len(types), 100):
+        part = types[offset : offset + 100]
+        for page in ec2.get_paginator("describe_instance_types").paginate(InstanceTypes=part):
+            for spec in page.get("InstanceTypes", []):
+                specs[spec["InstanceType"]] = spec
+        for page in ec2.get_paginator("describe_spot_price_history").paginate(
+            InstanceTypes=part,
+            ProductDescriptions=["Linux/UNIX"],
+            StartTime=now - timedelta(hours=hours),
+            EndTime=now,
+        ):
+            for price in page.get("SpotPriceHistory", []):
+                key = price["InstanceType"], price["AvailabilityZone"]
+                if key not in prices or price["Timestamp"] > prices[key]["Timestamp"]:
+                    prices[key] = price
+    return specs, prices
+
+
+def run(args: argparse.Namespace, cfg: Config | None, store: Store, session: Any) -> int:
+    region = args.region or (cfg.region if cfg else None)
+    if not region or (args.run or args.lane) and cfg is None:
+        print("scout: supply --region or config; --run and --lane require config", file=sys.stderr)
+        return 2
+    if (
+        any(value is not None and value <= 0 for value in (args.vcpus, args.memory))
+        or args.gpus is not None
+        and args.gpus < 0
+        or args.instance_memory_reserve_mib < 0
+        or not 0 < args.hours <= 90 * 24
+        or args.max_markers <= 0
+    ):
+        print("scout: positive vCPUs/memory/marker limit, nonnegative GPUs/reserve, and --hours in (0, 2160] required", file=sys.stderr)
+        return 2
+    lanes = [cfg.lane(args.lane)] if args.lane and cfg else list(cfg.lanes.values()) if cfg else []
+    lanes = [lane for lane in lanes if not args.arch or lane.arch == args.arch]
+    allowed = {kind for lane in lanes for kind in lane.instance_types}
+    types = {kind for token in (args.instance_types or []) for kind in token.split(",") if kind} or allowed
+    if args.lane:
+        types &= allowed
+    if not types:
+        print("scout: no instance types match; supply --instance-types or configured lanes", file=sys.stderr)
+        return 2
+    selected_arch = args.arch or (cfg.lane(args.lane).arch if args.lane and cfg else None)
+    groups, sampling = observations(store, cfg.run_prefix(args.run), args.max_markers, types=types, arch=selected_arch, lane=args.lane) if args.run and cfg else ({}, {})
+    shapes = sampling.get("shapes", [])
+    vcpus, memory_mib, gpus = args.vcpus, args.memory, args.gpus
+    if vcpus is None or memory_mib is None or gpus is None:
+        candidates = [shape for shape in shapes if all(value is None or shape[field] == value for field, value in (("vcpus", vcpus), ("memory_mib", memory_mib), ("gpus", gpus)))] if len(shapes) > 1 else shapes
+        if len(shapes) > 1 and len(candidates) != 1:
+            choices = ", ".join(f"{shape['vcpus']} vCPU / {shape['memory_mib']} MiB / {shape['gpus']} GPU" for shape in shapes)
+            print(f"scout: sampled matching markers have multiple worker shapes: {choices}; specify --vcpus and --memory and --gpus", file=sys.stderr)
+            return 2
+        default_shape = candidates[0] if candidates else {"vcpus": 1, "memory_mib": 1536, "gpus": 0}
+        vcpus = vcpus if vcpus is not None else default_shape["vcpus"]
+        memory_mib = memory_mib if memory_mib is not None else default_shape["memory_mib"]
+        gpus = gpus if gpus is not None else default_shape["gpus"]
+    specs, prices = capacity(session.client("ec2", region_name=region), sorted(types), args.hours)
+    rows = []
+    for (kind, az), price in prices.items():
+        spec = specs.get(kind)
+        if spec is None:
+            continue
+        cpus, memory = spec["VCpuInfo"]["DefaultVCpus"], spec["MemoryInfo"]["SizeInMiB"]
+        host_gpus = sum(gpu["Count"] for gpu in spec.get("GpuInfo", {}).get("Gpus", []))
+        arches = [_arch(a) for a in spec["ProcessorInfo"]["SupportedArchitectures"]]
+        for arch in arches:
+            if arch not in ("x86_64", "arm64") or args.arch and arch != args.arch:
+                continue
+            if args.lane and cfg and arch != cfg.lane(args.lane).arch:
+                continue
+            packing = min(cpus // vcpus, max(0, memory - args.instance_memory_reserve_mib) // memory_mib)
+            if gpus:
+                packing = min(packing, host_gpus // gpus)
+                if not packing:
                     continue
-    return {k: v[0] for k, v in latest.items()}
-
-
-def placement_scores(ec2_home, regions: list[str], instance_types: list[str], target_vcpus: list[int]) -> dict[int, dict[str, int]]:
-    out: dict[int, dict[str, int]] = {cap: {} for cap in target_vcpus}
-    for cap in target_vcpus:
-        for region_chunk in chunks(regions, 10):
-            try:
-                resp = ec2_home.get_spot_placement_scores(
-                    InstanceTypes=instance_types,
-                    TargetCapacity=cap,
-                    TargetCapacityUnitType="vcpu",
-                    RegionNames=region_chunk,
+            hourly = float(price["SpotPrice"])
+            matches: list[tuple[Group | None, dict[str, Any] | None]] = [(key, g) for key, g in groups.items() if key[:5] == (kind, arch, vcpus, memory_mib, gpus) and g["rates"]]
+            for key, group in matches or [(None, None)]:
+                rate = statistics.median(group["rates"]) if group else None
+                replay = group["discarded_seconds"] / group["committed_seconds"] if group else None
+                worker_hour = hourly / packing if packing else None
+                rows.append(
+                    {
+                        "instance_type": kind,
+                        "az": az,
+                        "arch": arch,
+                        "image": key[5] if key else None,
+                        "vcpus": vcpus,
+                        "memory_mib": memory_mib,
+                        "gpus": gpus,
+                        "host_vcpus": cpus,
+                        "host_memory_mib": memory,
+                        "host_gpus": host_gpus,
+                        "packed_workers": packing,
+                        "spot_hour_usd": hourly,
+                        "price_timestamp": price["Timestamp"].isoformat(),
+                        "vcpu_hour_usd": hourly / cpus,
+                        "worker_hour_usd": worker_hour,
+                        "observations": len(group["rates"]) if group else 0,
+                        "units_per_second_per_worker": rate,
+                        "replay_fraction": replay,
+                        "committed_seconds": group["committed_seconds"] if group else None,
+                        "discarded_seconds": group["discarded_seconds"] if group else None,
+                        "usd_per_1m_units": worker_hour * 1e6 * (1 + replay) / (rate * 3600) if worker_hour is not None and rate and replay is not None else None,
+                    }
                 )
-                for row in resp.get("SpotPlacementScores", []):
-                    out[cap][row["Region"]] = row["Score"]
-            except ClientError as exc:
-                print(f"WARN placement score failed cap={cap} regions={region_chunk}: {exc.response.get('Error', {}).get('Code')}: {exc.response.get('Error', {}).get('Message')}", file=sys.stderr)
-    return out
 
+    def ranking(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (row["usd_per_1m_units"] is None, row["usd_per_1m_units"] or 0, row["worker_hour_usd"] is None, row["worker_hour_usd"] or 0, row["instance_type"], row["az"], row["image"] or "")
 
-def s3_get_text(s3, uri: str) -> str:
-    bucket, key = parse_s3_uri(uri)
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    body = obj["Body"].read()
-    if key.endswith(".gz"):
-        body = gzip.decompress(body)
-    return body.decode("utf-8")
-
-
-def _looks_like_summary_path(path: str) -> bool:
-    return path.endswith(".summary.json") or path.endswith("/summary.json")
-
-
-def iter_summary_jsons(session: boto3.Session, refs: list[str], max_files: int) -> Iterable[dict[str, Any]]:
-    seen = 0
-    s3_clients: dict[str, Any] = {}
-    for ref in refs:
-        if seen >= max_files:
-            return
-        if ref.startswith("s3://"):
-            bucket, prefix = parse_s3_uri(ref)
-            s3 = s3_clients.setdefault(bucket, session.client("s3"))
-            paginator = s3.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    if not _looks_like_summary_path(key):
-                        continue
-                    try:
-                        yield json.loads(s3_get_text(s3, f"s3://{bucket}/{key}"))
-                        seen += 1
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"WARN failed summary {key}: {exc}", file=sys.stderr)
-                    if seen >= max_files:
-                        return
-        else:
-            p = Path(ref)
-            paths = [p] if p.is_file() else sorted(path for path in p.rglob("*.json") if _looks_like_summary_path(path.as_posix()))
-            for path in paths:
-                if seen >= max_files:
-                    return
-                try:
-                    yield json.loads(path.read_text())
-                    seen += 1
-                except Exception as exc:  # noqa: BLE001
-                    print(f"WARN failed summary {path}: {exc}", file=sys.stderr)
-
-
-def observed_perf(session: boto3.Session, refs: list[str], max_files: int) -> dict[str, Any]:
-    by_type: dict[str, list[float]] = defaultdict(list)
-    all_vals: list[float] = []
-    attempts = 0
-    retry_attempts = 0
-    receive_count_observed_attempts = 0
-    max_receive_count_by_task: dict[str, int] = {}
-    discarded_compute_attempts_by_task: dict[str, int] = defaultdict(int)
-    useful_compute = 0.0
-    discarded_compute = 0.0
-    discarded_compute_observed_attempts = 0
-    bytes_transferred = 0.0
-    for js in iter_summary_jsons(session, refs, max_files):
-        attempts += 1
-        telemetry_raw = js.get("telemetry")
-        telemetry: dict[str, Any] = telemetry_raw if isinstance(telemetry_raw, dict) else {}
-        returncode = js.get("returncode")
-        successful_useful_attempt = returncode in (None, 0) and not js.get("timed_out") and not js.get("framework_error") and js.get("commit_status") != "lost"
-        lps = js.get("units_per_s") or js.get("completed_units_per_s") or js.get("labels_per_s") or telemetry.get("units_per_second")
-        completed_units = telemetry.get("completed_units")
-        useful_sec = telemetry.get("useful_compute_seconds")
-        if (not isinstance(lps, (int, float)) or lps <= 0) and isinstance(completed_units, (int, float)) and isinstance(useful_sec, (int, float)) and useful_sec > 0:
-            lps = float(completed_units) / float(useful_sec)
-        if successful_useful_attempt and isinstance(lps, (int, float)) and lps > 0:
-            all_vals.append(float(lps))
-            inst = telemetry.get("instance_type") or ((js.get("worker_metadata") or {}).get("ec2") or {}).get("instanceType")
-            if inst:
-                by_type[str(inst)].append(float(lps))
-        task_identity = str(js.get("task_hash") or js.get("task_id") or js.get("done_s3") or js.get("summary_s3") or f"unknown-attempt-{attempts}")
-        receive_count = nonnegative_int(telemetry.get("receive_count"))
-        receive_count_replayed = False
-        if receive_count is not None and receive_count >= 1:
-            receive_count_observed_attempts += 1
-            receive_count_replayed = receive_count > 1
-            max_receive_count_by_task[task_identity] = max(receive_count, max_receive_count_by_task.get(task_identity, 0))
-        if telemetry.get("retry") or receive_count_replayed:
-            retry_attempts += 1
-        if successful_useful_attempt and isinstance(useful_sec, (int, float)):
-            useful_compute += max(0.0, float(useful_sec))
-        discarded = telemetry.get("discarded_compute_seconds")
-        if isinstance(discarded, (int, float)):
-            discarded_nonnegative = max(0.0, float(discarded))
-            discarded_compute += discarded_nonnegative
-            if discarded_nonnegative > 0:
-                discarded_compute_observed_attempts += 1
-                discarded_compute_attempts_by_task[task_identity] += 1
-        transferred = telemetry.get("bytes_transferred")
-        if isinstance(transferred, (int, float)):
-            bytes_transferred += max(0.0, float(transferred))
-    observed_replay_fraction = discarded_compute / useful_compute if useful_compute > 0 else 0.0
-    receive_count_replay_lower_bound = sum(max(0, count - 1) for count in max_receive_count_by_task.values())
-    receive_count_missing_discarded_attempts = sum(max(0, max(0, receive_count - 1) - discarded_compute_attempts_by_task.get(task_identity, 0)) for task_identity, receive_count in max_receive_count_by_task.items())
-    replay_observation_status = "unobserved"
-    if attempts:
-        if receive_count_missing_discarded_attempts > 0:
-            replay_observation_status = "discarded_compute_partial_receive_count_lower_bound" if discarded_compute > 0 else "receive_count_lower_bound_only"
-        elif discarded_compute > 0:
-            replay_observation_status = "discarded_compute_observed"
-        else:
-            replay_observation_status = "no_replay_observed"
-    return {
-        "global_median_units_per_s": statistics.median(all_vals) if all_vals else None,
-        "by_instance_type": {k: {"n": len(v), "median_units_per_s": statistics.median(v)} for k, v in sorted(by_type.items())},
-        "count": len(all_vals),
-        "attempt_count": attempts,
-        "retry_fraction": retry_attempts / attempts if attempts else 0.0,
-        "receive_count_observed_attempts": receive_count_observed_attempts,
-        "receive_count_replay_lower_bound": receive_count_replay_lower_bound,
-        "receive_count_replay_lower_bound_fraction": receive_count_replay_lower_bound / attempts if attempts else 0.0,
-        "receive_count_missing_discarded_attempts": receive_count_missing_discarded_attempts,
-        "replay_observation_status": replay_observation_status,
-        "discarded_compute_observed_attempts": discarded_compute_observed_attempts,
-        "discarded_compute_seconds": discarded_compute,
-        "useful_compute_seconds": useful_compute,
-        "observed_replay_fraction": observed_replay_fraction,
-        "bytes_transferred": bytes_transferred,
-    }
-
-
-def omitted_cost_components(args: argparse.Namespace) -> list[str]:
-    out = []
-    if args.extra_cost_per_1m_units == 0:
-        out.append("extra_external_costs")
-    if args.cross_region_gb_per_1m_units == 0:
-        out.append("cross_region_transfer")
-    if args.nat_gb_per_1m_units == 0:
-        out.append("nat_or_private_link_data_processing")
-    if args.cloudwatch_log_gb_per_1m_units == 0:
-        out.append("cloudwatch_log_ingest")
-    if args.s3_storage_gb_month_per_1m_units == 0:
-        out.append("s3_storage")
-    return out
-
-
-def scout_reasons(args: argparse.Namespace, obs: dict[str, Any]) -> list[dict[str, Any]]:
-    reasons: list[dict[str, Any]] = []
-    if not obs.get("count"):
-        reasons.append(
-            {
-                "code": "throughput_default_used",
-                "severity": "warning",
-                "message": SCOUT_REASON_CODES["throughput_default_used"],
-            }
-        )
-    if args.expected_replay_fraction is None and not obs.get("useful_compute_seconds"):
-        reasons.append(
-            {
-                "code": "replay_fraction_unobserved",
-                "severity": "warning",
-                "message": SCOUT_REASON_CODES["replay_fraction_unobserved"],
-            }
-        )
-    if args.expected_replay_fraction is None:
-        if obs.get("replay_observation_status") == "receive_count_lower_bound_only":
-            reasons.append(
-                {
-                    "code": "replay_fraction_lower_bound_only",
-                    "severity": "warning",
-                    "message": SCOUT_REASON_CODES["replay_fraction_lower_bound_only"],
-                    "receive_count_replay_lower_bound": obs.get("receive_count_replay_lower_bound"),
-                }
-            )
-        elif obs.get("replay_observation_status") == "discarded_compute_partial_receive_count_lower_bound":
-            reasons.append(
-                {
-                    "code": "replay_fraction_partially_observed",
-                    "severity": "warning",
-                    "message": SCOUT_REASON_CODES["replay_fraction_partially_observed"],
-                    "discarded_compute_observed_attempts": obs.get("discarded_compute_observed_attempts"),
-                    "receive_count_missing_discarded_attempts": obs.get("receive_count_missing_discarded_attempts"),
-                    "receive_count_replay_lower_bound": obs.get("receive_count_replay_lower_bound"),
-                }
-            )
-    omitted = omitted_cost_components(args)
-    if omitted:
-        reasons.append(
-            {
-                "code": "cost_components_not_provided",
-                "severity": "info",
-                "message": SCOUT_REASON_CODES["cost_components_not_provided"],
-                "components": omitted,
-            }
-        )
-    return reasons
-
-
-def noncompute_cost_per_1m_units(args: argparse.Namespace, *, bucket_local: bool | None) -> float:
-    transfer_gb = max(0.0, args.cross_region_gb_per_1m_units)
-    if bucket_local is True:
-        transfer_gb = 0.0
-    return (
-        max(0.0, args.extra_cost_per_1m_units)
-        + transfer_gb * max(0.0, args.cross_region_cost_per_gb)
-        + max(0.0, args.nat_gb_per_1m_units) * max(0.0, args.nat_cost_per_gb)
-        + max(0.0, args.cloudwatch_log_gb_per_1m_units) * max(0.0, args.cloudwatch_log_cost_per_gb)
-        + max(0.0, args.s3_storage_gb_month_per_1m_units) * max(0.0, args.s3_storage_cost_per_gb_month)
-    )
-
-
-def instance_vcpus(ec2, instance_types: list[str]) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for part in chunks(instance_types, 100):
-        try:
-            resp = ec2.describe_instance_types(InstanceTypes=part)
-            for it in resp.get("InstanceTypes", []):
-                out[it["InstanceType"]] = int(it["VCpuInfo"]["DefaultVCpus"])
-        except ClientError:
-            for name in part:
-                try:
-                    resp = ec2.describe_instance_types(InstanceTypes=[name])
-                    for it in resp.get("InstanceTypes", []):
-                        out[it["InstanceType"]] = int(it["VCpuInfo"]["DefaultVCpus"])
-                except ClientError:
-                    continue
-    return out
-
-
-def instance_memory_mib(ec2, instance_types: list[str]) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for part in chunks(instance_types, 100):
-        try:
-            resp = ec2.describe_instance_types(InstanceTypes=part)
-            for it in resp.get("InstanceTypes", []):
-                out[it["InstanceType"]] = int(it["MemoryInfo"]["SizeInMiB"])
-        except ClientError:
-            for name in part:
-                try:
-                    resp = ec2.describe_instance_types(InstanceTypes=[name])
-                    for it in resp.get("InstanceTypes", []):
-                        out[it["InstanceType"]] = int(it["MemoryInfo"]["SizeInMiB"])
-                except ClientError:
-                    continue
-    return out
-
-
-def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
-    ap = argparse.ArgumentParser(prog=prog, description=__doc__)
-    ap.add_argument("--profile", default=None)
-    ap.add_argument("--home-region", default="us-west-2", help="Endpoint used for DescribeRegions and placement score calls")
-    ap.add_argument("--regions", nargs="*", help="Regions to compare; default is all opted-in regions")
-    ap.add_argument("--preset", choices=sorted(PRESETS), default="x86")
-    ap.add_argument("--instance-types", nargs="*", help="Override preset instance types")
-    ap.add_argument("--target-vcpus", nargs="+", type=int, default=[256, 512])
-    ap.add_argument("--hours", type=int, default=8)
-    ap.add_argument("--bucket", default="", help="Optional canonical data bucket for locality annotation")
-    ap.add_argument("--worker-vcpus", type=int, default=2)
-    ap.add_argument("--worker-memory", "--worker-memory-mib", dest="worker_memory_mib", type=int, default=0, help="Optional worker memory request in MiB for memory-aware instance packing")
-    ap.add_argument("--instance-memory-reserve-mib", type=int, default=512, help="Conservative per-instance memory reserve subtracted before Batch worker packing")
-    ap.add_argument("--default-units-per-s", type=float, default=27.0, help="Fallback units/sec for one worker job")
-    ap.add_argument("--observed-summaries", nargs="*", default=[], help="Local dirs/files or s3:// prefixes containing *.summary.json or attempt-scoped */summary.json files")
-    ap.add_argument("--max-observed-files", type=int, default=5000)
-    ap.add_argument("--top-instance-rows", type=int, default=20)
-    ap.add_argument("--expected-replay-fraction", type=float, default=None, help="Override observed discarded/useful compute fraction for retries/interruption replay")
-    ap.add_argument("--startup-overhead-seconds", type=float, default=0.0, help="Expected worker startup/queue overhead amortized per task")
-    ap.add_argument("--useful-task-seconds", type=float, default=3600.0, help="Expected useful task duration used to amortize startup overhead")
-    ap.add_argument("--extra-cost-per-1m-units", type=float, default=0.0, help="Known extra non-compute cost per 1M useful units")
-    ap.add_argument("--cross-region-gb-per-1m-units", type=float, default=0.0)
-    ap.add_argument("--cross-region-cost-per-gb", type=float, default=0.02)
-    ap.add_argument("--nat-gb-per-1m-units", type=float, default=0.0)
-    ap.add_argument("--nat-cost-per-gb", type=float, default=0.045)
-    ap.add_argument("--cloudwatch-log-gb-per-1m-units", type=float, default=0.0)
-    ap.add_argument("--cloudwatch-log-cost-per-gb", type=float, default=0.50)
-    ap.add_argument("--s3-storage-gb-month-per-1m-units", type=float, default=0.0)
-    ap.add_argument("--s3-storage-cost-per-gb-month", type=float, default=0.023)
-    ap.add_argument("--format", choices=["json", "table"], default="json", help="Output format; JSON stdout is the default for agent workflows")
-    ap.add_argument("--json-out", type=Path, help="Optional path to also write the JSON report")
-    args = ap.parse_args(argv)
-    if args.worker_vcpus <= 0:
-        ap.error("--worker-vcpus must be greater than 0")
-    if args.worker_memory_mib < 0:
-        ap.error("--worker-memory must be greater than or equal to 0")
-    if args.instance_memory_reserve_mib < 0:
-        ap.error("--instance-memory-reserve-mib must be greater than or equal to 0")
-
-    session = boto3.Session(profile_name=args.profile)
-    regions = args.regions or auto_regions(session, args.home_region)
-    instance_types = args.instance_types or PRESETS[args.preset]
-    now = dt.datetime.now(dt.timezone.utc)
-    start = now - dt.timedelta(hours=args.hours)
-    ec2_home = session.client("ec2", region_name=args.home_region)
-
-    bucket_region = None
-    if args.bucket:
-        try:
-            loc = session.client("s3", region_name=args.home_region).get_bucket_location(Bucket=args.bucket).get("LocationConstraint")
-            bucket_region = loc or "us-east-1"
-        except Exception as exc:  # noqa: BLE001
-            print(f"WARN bucket location failed: {exc}", file=sys.stderr)
-
-    scores = placement_scores(ec2_home, regions, instance_types, args.target_vcpus)
-    obs = observed_perf(session, args.observed_summaries, args.max_observed_files) if args.observed_summaries else {"count": 0, "by_instance_type": {}, "global_median_units_per_s": None}
-    fallback_lps = obs.get("global_median_units_per_s") or args.default_units_per_s
-    replay_fraction = args.expected_replay_fraction if args.expected_replay_fraction is not None else float(obs.get("observed_replay_fraction") or 0.0)
-
-    region_rows = []
-    instance_rows = []
-    for region in regions:
-        ec2 = session.client("ec2", region_name=region)
-        try:
-            price_map = latest_spot_prices(ec2, instance_types, start, now)
-            priced_instance_types = sorted({it for it, _az in price_map})
-            vcpu_map = instance_vcpus(ec2, priced_instance_types)
-            memory_map = instance_memory_mib(ec2, priced_instance_types) if args.worker_memory_mib > 0 else {}
-        except Exception as exc:  # noqa: BLE001
-            region_rows.append({"region": region, "ok": False, "error": repr(exc)})
-            continue
-        if not price_map:
-            region_rows.append({"region": region, "ok": False, "error": "no spot price history"})
-            continue
-        prices = list(price_map.values())
-        per_vcpu = [p / max(1, vcpu_map.get(it, 2)) for (it, _az), p in price_map.items()]
-        cap0 = args.target_vcpus[-1]
-        score = scores.get(cap0, {}).get(region)
-        same_bucket = bucket_region == region if bucket_region else None
-        row = {
-            "region": region,
-            "ok": True,
-            "bucket_local": same_bucket,
-            "placement_scores": {str(cap): scores.get(cap, {}).get(region) for cap in args.target_vcpus},
-            "pools": len(price_map),
-            "min_per_vcpu": min(per_vcpu),
-            "p25_per_vcpu": pct(per_vcpu, 0.25),
-            "median_per_vcpu": statistics.median(per_vcpu),
-            "min_hourly": min(prices),
-            "median_hourly": statistics.median(prices),
-            "noncompute_cost_per_1m_units": noncompute_cost_per_1m_units(args, bucket_local=same_bucket),
-        }
-        region_rows.append(row)
-        for (it, az), price in price_map.items():
-            vcpus = vcpu_map.get(it)
-            if not vcpus:
-                continue
-            obs_it = (obs.get("by_instance_type") or {}).get(it) or {}
-            lps = obs_it.get("median_units_per_s") or fallback_lps
-            vcpu_fit_workers = vcpus // args.worker_vcpus
-            if vcpu_fit_workers <= 0:
-                continue
-            memory_mib = memory_map.get(it)
-            if args.worker_memory_mib > 0 and memory_mib is None:
-                continue
-            memory_available_mib = max(0, memory_mib - args.instance_memory_reserve_mib) if memory_mib is not None else None
-            memory_fit_workers = memory_available_mib // args.worker_memory_mib if memory_available_mib is not None and args.worker_memory_mib > 0 else None
-            packed_workers = min(vcpu_fit_workers, memory_fit_workers) if memory_fit_workers is not None else vcpu_fit_workers
-            if packed_workers <= 0:
-                continue
-            packing_limiter = "memory" if memory_fit_workers is not None and memory_fit_workers < vcpu_fit_workers else "vcpu"
-            units_per_hour = lps * packed_workers * 3600.0
-            compute_cost_per_1m = (price / units_per_hour) * 1_000_000.0 if units_per_hour > 0 else math.nan
-            noncompute_per_1m = noncompute_cost_per_1m_units(args, bucket_local=same_bucket)
-            total_cost_per_1m = expected_cost_per_1m_units(
-                hourly_price=price,
-                units_per_hour=units_per_hour,
-                replay_fraction=replay_fraction,
-                startup_overhead_seconds=args.startup_overhead_seconds,
-                useful_task_seconds=args.useful_task_seconds,
-                noncompute_per_1m=noncompute_per_1m,
-            )
-            instance_rows.append(
-                {
-                    "region": region,
-                    "az": az,
-                    "instance_type": it,
-                    "vcpus": vcpus,
-                    "memory_mib": memory_mib,
-                    "memory_available_mib": memory_available_mib,
-                    "spot_hourly": price,
-                    "spot_per_vcpu": price / vcpus,
-                    "configuration_placement_score": score,
-                    "placement_score_scope": "region_instance_type_configuration",
-                    "bucket_local": same_bucket,
-                    "packed_workers": packed_workers,
-                    "vcpu_fit_workers": vcpu_fit_workers,
-                    "memory_fit_workers": memory_fit_workers,
-                    "packing_limiter": packing_limiter,
-                    "units_per_s_per_worker": lps,
-                    "observed_n": obs_it.get("n", 0),
-                    "estimated_compute_cost_per_1m_units": compute_cost_per_1m,
-                    "expected_total_cost_per_1m_units": total_cost_per_1m,
-                    "noncompute_cost_per_1m_units": noncompute_per_1m,
-                    "expected_replay_fraction": replay_fraction,
-                }
-            )
-
-    ok_regions = [r for r in region_rows if r.get("ok")]
-    cap0 = args.target_vcpus[-1]
-
-    def region_placement_score(row: dict[str, Any]) -> float:
-        scores = row.get("placement_scores")
-        if not isinstance(scores, dict):
-            return -1.0
-        return float(scores.get(str(cap0)) or -1)
-
-    ok_regions.sort(key=lambda r: (-region_placement_score(r), r["median_per_vcpu"], not bool(r.get("bucket_local"))))
-    instance_rows.sort(key=lambda r: (r["expected_total_cost_per_1m_units"], -(r.get("configuration_placement_score") or -1), not bool(r.get("bucket_local"))))
-
+    rows.sort(key=ranking)
+    notes = [
+        "Estimates: latest Linux/UNIX Spot prices, full worker packing, steady-state compute only.",
+        "Excludes startup, idle capacity, storage, network and logs; AZ capacity is not guaranteed.",
+        "Throughput is the median task units/elapsed for the exact type, architecture, worker shape and image.",
+        "Replay is an observed lower bound: best-effort summaries and tasks without done markers can be missing.",
+    ]
     report = {
-        "schema": "sweetspot.scout.v1",
-        "checked_at": now.isoformat(),
-        "reasons": scout_reasons(args, obs),
-        "home_region": args.home_region,
-        "bucket": args.bucket,
-        "bucket_region": bucket_region,
-        "preset": args.preset,
-        "instance_types": instance_types,
-        "target_vcpus": args.target_vcpus,
-        "worker_vcpus": args.worker_vcpus,
-        "worker_memory_mib": args.worker_memory_mib,
+        "estimate": True,
+        "region": region,
+        "run": args.run,
         "instance_memory_reserve_mib": args.instance_memory_reserve_mib,
-        "observed_perf": obs,
-        "cost_model": {
-            "expected_replay_fraction": replay_fraction,
-            "startup_overhead_seconds": args.startup_overhead_seconds,
-            "useful_task_seconds": args.useful_task_seconds,
-            "extra_cost_per_1m_units": args.extra_cost_per_1m_units,
-            "cross_region_gb_per_1m_units": args.cross_region_gb_per_1m_units,
-            "cross_region_cost_per_gb": args.cross_region_cost_per_gb,
-            "nat_gb_per_1m_units": args.nat_gb_per_1m_units,
-            "nat_cost_per_gb": args.nat_cost_per_gb,
-            "cloudwatch_log_gb_per_1m_units": args.cloudwatch_log_gb_per_1m_units,
-            "cloudwatch_log_cost_per_gb": args.cloudwatch_log_cost_per_gb,
-            "s3_storage_gb_month_per_1m_units": args.s3_storage_gb_month_per_1m_units,
-            "s3_storage_cost_per_gb_month": args.s3_storage_cost_per_gb_month,
-            "omitted_cost_components": omitted_cost_components(args),
-        },
-        "regions": region_rows,
-        "top_instance_pools": instance_rows[: max(0, args.top_instance_rows)],
+        "notes": notes,
+        "sampling": sampling,
+        "unpriced_instance_types": sorted(types - {key[0] for key in prices}),
+        "rows": rows,
     }
-    report_json = json.dumps(report, indent=2, sort_keys=True) + "\n"
-    if args.json_out:
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(report_json)
+    if args.json:
+        print(json.dumps(report, indent=2, allow_nan=False))
+    else:
+        table_rows = rows
+        if not args.by_az:
+            pools: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
+            for row in rows:
+                pools.setdefault((row["instance_type"], row["arch"], row["image"]), []).append(row)
+            table_rows = sorted([{**min(pool, key=lambda row: (row["spot_hour_usd"], row["az"])), "azs_priced": len({row["az"] for row in pool})} for pool in pools.values()], key=ranking)
+        print(f"Spot compute estimates ({region}); worker {vcpus} vCPU / {memory_mib} MiB / {gpus} GPU; host reserve {args.instance_memory_reserve_mib} MiB")
+        az_heading = "AZ" if args.by_az else "CHEAPEST AZ"
+        count_heading = "" if args.by_az else f" {'AZS':>3}"
+        print(f"{'TYPE':15} {az_heading:16}{count_heading} {'ARCH':7} {'PACK':>4} {'$/vCPU-h':>9} {'$/worker-h':>10} {'units/s':>9} {'replay':>8} {'$/1M':>10} {'N':>5} IMAGE")
+        for row in table_rows:
 
-    if args.format == "json":
-        print(report_json, end="")
-        return 0
+            def fmt(field: str) -> str:
+                value = row[field]
+                return "-" if value is None else f"{value:.4g}"
 
-    print(f"checked_at: {now.isoformat()}")
-    print(f"bucket_region: {bucket_region}")
-    print(f"preset: {args.preset}  target_vcpus: {args.target_vcpus}  observed_summaries: {obs.get('count', 0)}")
-    print("\nREGION RANK")
-    print("region           local score  pools  min$/vcpu med$/vcpu")
-    for r in ok_regions[:20]:
-        placement_scores_obj = r.get("placement_scores")
-        score = placement_scores_obj.get(str(cap0)) if isinstance(placement_scores_obj, dict) else None
-        print(f"{r['region']:15s} {str(r.get('bucket_local')):5s} {str(score):>5s} {r['pools']:6d}  ${r['min_per_vcpu']:.4f}   ${r['median_per_vcpu']:.4f}")
-    print("\nTOP INSTANCE POOLS BY EXPECTED TOTAL $/1M UNITS")
-    print("region           az              type          cfg_score  $/hr    vcpu memAvail workers limit  units/s compute$/1M total$/1M")
-    for r in instance_rows[: args.top_instance_rows]:
-        print(
-            f"{r['region']:15s} {r['az']:15s} {r['instance_type']:13s} {str(r.get('configuration_placement_score')):>9s}  ${r['spot_hourly']:.4f} {r['vcpus']:5d} {str(r.get('memory_available_mib')):>8s} {r['packed_workers']:7d} {r['packing_limiter']:6s} {r['units_per_s_per_worker']:8.2f} ${r['estimated_compute_cost_per_1m_units']:.3f} ${r['expected_total_cost_per_1m_units']:.3f}"
-        )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+            count = "" if args.by_az else f" {row['azs_priced']:3}"
+            print(
+                f"{row['instance_type']:15} {row['az']:16}{count} {row['arch']:7} {row['packed_workers']:4} "
+                f"{fmt('vcpu_hour_usd'):>9} {fmt('worker_hour_usd'):>10} {fmt('units_per_second_per_worker'):>9} "
+                f"{fmt('replay_fraction'):>8} {fmt('usd_per_1m_units'):>10} {row['observations']:5} {row['image'] or '-'}"
+            )
+        if not rows:
+            print("No matching Spot pools found.")
+        if report["unpriced_instance_types"]:
+            print("No price: " + ", ".join(report["unpriced_instance_types"]))
+        for note in notes[1:]:
+            print(note)
+        if sampling:
+            print(f"Sampled {sampling['markers_sampled']} markers (limit {args.max_markers}); skipped {sampling['skipped_records']} records.")
+    return 0 if rows else 1

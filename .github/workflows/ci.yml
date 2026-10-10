@@ -22,68 +22,30 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install package and dev tools
-        run: python -m pip install --constraint requirements-dev.lock -e '.[dev]'
-      - name: Format check
-        run: python -m ruff format --check .
-      - name: Lint
-        run: python -m ruff check .
-      - name: Type check
-        run: python -m mypy sweetspot
-      - name: Unit tests
-        run: python -m unittest discover -s tests -v
+      - run: python -m pip install --constraint requirements-dev.lock -e '.[dev]'
+      - run: python -m ruff format --check .
+      - run: python -m ruff check .
+      - run: python -m mypy sweetspot
+      - run: python -m unittest discover -s tests -t . -v
+      - run: python -m unittest discover -s examples/stockfish -v
 
   opentofu:
-    name: opentofu
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/opentofu
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
         with:
           tofu_version: 1.12.0
-      - name: Format check
-        working-directory: infra/opentofu
-        run: tofu fmt -check -recursive .
-      - name: Init with committed provider lock
-        working-directory: infra/opentofu
-        run: tofu init -backend=false -input=false -lockfile=readonly -no-color
-      - name: Validate
-        working-directory: infra/opentofu
-        run: tofu validate -no-color
-      - name: Verify provider lock unchanged
-        run: git diff --exit-code -- infra/opentofu/.terraform.lock.hcl
+      - run: tofu fmt -check -recursive .
+      - run: tofu init -backend=false -input=false -lockfile=readonly -no-color
+      - run: tofu validate -no-color
 
   container:
-    name: container-build-sbom-scan
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build attested OCI image artifact
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: docker/Dockerfile.worker
-          tags: sweetspot-worker:ci
-          outputs: type=oci,dest=/tmp/sweetspot-worker.oci,tar=false
-          push: false
-          sbom: true
-          provenance: mode=max
-      - name: Scan attested OCI image artifact
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0; includes setup-trivy pinned to v0.2.6
-        with:
-          scan-type: image
-          input: /tmp/sweetspot-worker.oci
-          format: table
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-        continue-on-error: true
-      - name: Upload attested OCI image artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sweetspot-worker-oci
-          path: /tmp/sweetspot-worker.oci
-          if-no-files-found: error
+      - run: docker build -f docker/Dockerfile.worker -t sweetspot-worker:ci .
+      - run: docker run --rm sweetspot-worker:ci sweetspot --version

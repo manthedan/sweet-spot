@@ -56,3 +56,6 @@ vendor/
 coverage/
 .cache/
 tmp/
+.sol/
+sweetspot-local/
+sweetspot.json
