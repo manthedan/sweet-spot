@@ -3644,7 +3644,7 @@ class LifecycleExplainPostmortemTests(unittest.TestCase):
     def test_tiny_leela_like_from_state_drives_lifecycle_closeout_commands(self) -> None:
         class FakeSTS:
             def get_caller_identity(self):
-                return {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/sweetspot-operator", "UserId": "AIDATINY"}
+                return {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/sweetspot-operator", "UserId": "AIDAEXAMPLE"}
 
         class FakeSQS:
             def get_queue_attributes(self, **kwargs):

@@ -7,7 +7,7 @@ This is a real operator case study from the Tiny Leela Stockfish 18 root-labelin
 - Project: Tiny Leela chess training data pipeline.
 - Job: root-position Stockfish 18 labels for a 10M-position supervised dataset sample.
 - Run ID: `sweetspot-stockfish-root-10m-d10-mpv2-20260624`.
-- Output prefix: `s3://example-sweetspot-bucket/sweetspot_stockfish_root_10m_d10_mpv2_20260624`.
+- Output prefix: `s3://<results-bucket>/sweetspot_stockfish_root_10m_d10_mpv2_20260624`.
 - Worker image: digest-pinned SweetSpot/Tiny-Leela Stockfish worker image in ECR.
 - Worker command: SQS task worker invoking the Tiny Leela Stockfish labeling script.
 - AWS region: `us-west-2`.
